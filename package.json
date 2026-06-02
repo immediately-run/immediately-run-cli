@@ -1,0 +1,48 @@
+{
+  "name": "@immediately-run/cli",
+  "version": "0.1.0",
+  "description": "Command-line tools for immediately.run. Currently: build a pre-cached repository zip (with a contribute manifest sidecar) for fast, rate-limit-free loading.",
+  "type": "module",
+  "license": "MIT",
+  "author": "immediately.run",
+  "homepage": "https://github.com/immediately-run/cli#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/immediately-run/cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/immediately-run/cli/issues"
+  },
+  "keywords": [
+    "immediately.run",
+    "cli",
+    "cache",
+    "zip",
+    "github"
+  ],
+  "bin": {
+    "immediately-run": "./dist/cli.js"
+  },
+  "exports": {
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
