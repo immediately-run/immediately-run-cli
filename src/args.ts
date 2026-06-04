@@ -15,7 +15,7 @@ export const flagValue = (
   name: string,
 ): string | undefined => (typeof flags[name] === 'string' ? flags[name] : undefined);
 
-const BOOLEAN_FLAGS = new Set(['help', 'h']);
+const BOOLEAN_FLAGS = new Set(['help', 'h', 'open']);
 
 export const parseArgs = (argv: string[]): ParsedArgs => {
   const positionals: string[] = [];

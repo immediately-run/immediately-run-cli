@@ -8,9 +8,13 @@
 
 import { parseArgs } from './args.js';
 import { runCacheZip } from './commands/cacheZip.js';
+import { runDev } from './commands/dev.js';
 
-const COMMANDS: Record<string, (args: ReturnType<typeof parseArgs>) => number> = {
+// Handlers may be synchronous (cache-zip) or long-running async (dev, which
+// resolves only on shutdown).
+const COMMANDS: Record<string, (args: ReturnType<typeof parseArgs>) => number | Promise<number>> = {
   'cache-zip': runCacheZip,
+  dev: runDev,
 };
 
 const USAGE = `immediately-run — command-line tools for immediately.run
@@ -19,10 +23,11 @@ Usage: immediately-run <command> [options]
 
 Commands:
   cache-zip   Build a cached repository zip (with a contribute manifest sidecar)
+  dev         Serve the current project to hosted immediately.run over localhost
 
 Run 'immediately-run <command> --help' for command-specific options.`;
 
-const main = (): number => {
+const main = async (): Promise<number> => {
   const [command, ...rest] = process.argv.slice(2);
   if (!command || command === '--help' || command === '-h' || command === 'help') {
     console.log(USAGE);
@@ -34,12 +39,13 @@ const main = (): number => {
     console.error(USAGE);
     return 1;
   }
-  return handler(parseArgs(rest));
+  return await handler(parseArgs(rest));
 };
 
-try {
-  process.exit(main());
-} catch (err) {
-  console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
-  process.exit(1);
-}
+main().then(
+  (code) => process.exit(code),
+  (err) => {
+    console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  },
+);

@@ -1,0 +1,112 @@
+/*
+ * `immediately-run dev` — serve the current project's working tree to hosted
+ * immediately.run over localhost, and print/open the deep link that mounts it
+ * as a `local` provider source (LOCAL_DEVELOPMENT_SPEC §6.3/§6.4/§10).
+ *
+ * Nothing is committed or pushed: the page reads the live working tree
+ * (uncommitted edits included) and hot-updates on every save via the /watch
+ * SSE stream. Agent-facing: runs non-interactively and prints the URL on a
+ * single parseable line.
+ */
+
+import { existsSync, statSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
+import { spawn } from 'node:child_process';
+import { basename, resolve } from 'node:path';
+
+import { startDevServer } from '../devServer.js';
+import { flagValue, type ParsedArgs } from '../args.js';
+
+export const DEV_USAGE = `Usage: immediately-run dev [repo-path] [options]
+
+Serve the project's working tree to hosted immediately.run over localhost and
+print the deep link that loads it (no commit, no push). Chrome/Firefox only;
+keep this process running while the page is open.
+
+Arguments:
+  repo-path                 Path to the project directory (default: cwd)
+
+Options:
+  --port <n>                Port to listen on (127.0.0.1 only; default: 7700)
+  --origin <url>            Allowed browser origin and deep-link base
+                            (default: https://immediately.run; use e.g.
+                            http://localhost:3000 against a local site build)
+  --open                    Open the deep link in the default browser
+  -h, --help                Show this help`;
+
+export const DEFAULT_PORT = 7700;
+export const DEFAULT_ORIGIN = 'https://immediately.run';
+
+// The URL path segments only admit [a-zA-Z0-9-_] (immediately-run-sdk
+// urlUtils PATH_SEGMENTS), so the project name must be sanitized to that set.
+export const sanitizeProjectName = (name: string): string => {
+  const cleaned = name
+    .replace(/[^a-zA-Z0-9-_]+/g, '-')
+    .replace(/-{2,}/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return cleaned || 'project';
+};
+
+// The connection locator rides the URL fragment — never sent to any server —
+// because the path charset can't carry it (LOCAL_DEVELOPMENT_SPEC §6.4).
+export const buildDeepLink = (origin: string, projectName: string, port: number, token: string): string =>
+  `${origin.replace(/\/+$/, '')}/edit/local/${projectName}/${projectName}/live` +
+  `#ir-endpoint=${encodeURIComponent(`http://127.0.0.1:${port}`)}&ir-token=${encodeURIComponent(token)}`;
+
+const openInBrowser = (url: string): void => {
+  const [cmd, args] =
+    process.platform === 'darwin'
+      ? ['open', [url] as string[]]
+      : process.platform === 'win32'
+        ? ['cmd', ['/c', 'start', '', url] as string[]]
+        : ['xdg-open', [url] as string[]];
+  try {
+    spawn(cmd, args, { stdio: 'ignore', detached: true }).unref();
+  } catch {
+    /* best effort */
+  }
+};
+
+export const runDev = async (args: ParsedArgs): Promise<number> => {
+  if (args.flags.help || args.flags.h) {
+    console.log(DEV_USAGE);
+    return 0;
+  }
+
+  const root = resolve(args.positionals[0] ?? process.cwd());
+  if (!existsSync(root) || !statSync(root).isDirectory()) {
+    throw new Error(`${root} is not a directory`);
+  }
+
+  const portFlag = flagValue(args.flags, 'port');
+  const port = portFlag === undefined ? DEFAULT_PORT : Number(portFlag);
+  if (!Number.isInteger(port) || port < 0 || port > 65535) {
+    throw new Error(`Invalid --port: ${portFlag}`);
+  }
+  const origin = flagValue(args.flags, 'origin') ?? DEFAULT_ORIGIN;
+
+  // Per-session secret: any web page can fetch('http://127.0.0.1:…'), so every
+  // request must present this token (spec §8).
+  const token = randomBytes(24).toString('base64url');
+
+  const handle = await startDevServer({ root, origin, token, port });
+  const url = buildDeepLink(origin, sanitizeProjectName(basename(root)), handle.port, token);
+
+  console.log(`Serving ${root} (read-only) on http://127.0.0.1:${handle.port}`);
+  console.log(`Allowed origin: ${origin}`);
+  console.log(`immediately.run dev URL: ${url}`);
+  console.log('Press Ctrl-C to stop. Keep this running while the page is open.');
+
+  if (args.flags.open) {
+    openInBrowser(url);
+  }
+
+  // Run until interrupted; close the server cleanly on SIGINT/SIGTERM.
+  return await new Promise<number>((resolveExit) => {
+    const shutdown = () => {
+      void handle.close().finally(() => resolveExit(0));
+    };
+    process.once('SIGINT', shutdown);
+    process.once('SIGTERM', shutdown);
+  });
+};
