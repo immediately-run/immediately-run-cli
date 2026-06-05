@@ -1,6 +1,6 @@
 {
   "name": "@immediately-run/cli",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Command-line tools for immediately.run. Currently: build a pre-cached repository zip (with a contribute manifest sidecar) for fast, rate-limit-free loading.",
   "type": "module",
   "license": "MIT",
@@ -45,5 +45,8 @@
   },
   "publishConfig": {
     "access": "public"
+  },
+  "dependencies": {
+    "@msgpack/msgpack": "^3.1.3"
   }
 }

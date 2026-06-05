@@ -22,6 +22,7 @@ import {
   MANIFEST_SIDECAR_ENTRY,
   type RepoManifest,
 } from '../manifest.js';
+import { DEFAULT_CDN_ROOT, fetchLockset, type DepMap } from '../lockset.js';
 import {
   COMMIT_HASH_RE,
   currentBranch,
@@ -52,6 +53,9 @@ Options:
   --default-branch <name>   Repository default branch
   --out <path>              Output zip path
                             (default: <repo>/public/cached_repositories/<owner>/<repo>/<ref>.zip)
+  --no-lockset              Skip embedding the resolved-dependency lockset
+  --cdn-root <url>          Module CDN root for lockset resolution
+                            (default: ${DEFAULT_CDN_ROOT})
   -h, --help                Show this help`;
 
 export interface CacheZipOptions {
@@ -61,6 +65,11 @@ export interface CacheZipOptions {
   ref?: string;
   defaultBranch?: string;
   out?: string;
+  // Lockset embedding (PRETRANSPILED_ARTIFACTS_SPEC §7 step 2). On by default;
+  // any failure to produce one is non-fatal — the zip ships without it and the
+  // runtime resolves dependencies live, exactly as before.
+  lockset?: boolean;
+  cdnRoot?: string;
 }
 
 export interface CacheZipResult {
@@ -71,9 +80,61 @@ export interface CacheZipResult {
   refKind: RepoManifest['refKind'];
   commitSha: string;
   entryCount: number;
+  // Human-readable lockset outcome for the summary line: "<n> packages" or
+  // "omitted (<reason>)".
+  locksetSummary: string;
 }
 
-export const buildCacheZip = (opts: CacheZipOptions): CacheZipResult => {
+// Dependencies as committed at HEAD — the lockset must correspond to the tree
+// the zip carries (git archive HEAD), not the working directory.
+const headDependencies = (repo: string): { deps: DepMap; reason?: string } => {
+  let raw: string;
+  try {
+    raw = git(repo, ['show', 'HEAD:package.json']);
+  } catch {
+    return { deps: {}, reason: 'no package.json at HEAD' };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { deps: {}, reason: 'package.json at HEAD is not valid JSON' };
+  }
+  const deps = (parsed as { dependencies?: unknown }).dependencies;
+  if (!deps || typeof deps !== 'object' || Array.isArray(deps)) {
+    return { deps: {}, reason: 'package.json has no dependencies' };
+  }
+  for (const [name, range] of Object.entries(deps)) {
+    if (typeof range !== 'string') {
+      return { deps: {}, reason: `dependency ${name} has a non-string version` };
+    }
+  }
+  return { deps: deps as DepMap };
+};
+
+const resolveLockset = async (
+  repo: string,
+  opts: CacheZipOptions,
+): Promise<{ lockset?: RepoManifest['lockset']; summary: string }> => {
+  if (opts.lockset === false) {
+    return { summary: 'omitted (--no-lockset)' };
+  }
+  const { deps, reason } = headDependencies(repo);
+  if (reason) {
+    return { summary: `omitted (${reason})` };
+  }
+  try {
+    const lockset = await fetchLockset(deps, opts.cdnRoot);
+    return { lockset, summary: `${lockset.resolved.length} packages` };
+  } catch (err) {
+    // Never fail the zip build over the lockset (spec §7): warn and omit.
+    const message = err instanceof Error ? err.message : String(err);
+    console.warn(`Warning: lockset omitted (${message})`);
+    return { summary: `omitted (${message})` };
+  }
+};
+
+export const buildCacheZip = async (opts: CacheZipOptions): Promise<CacheZipResult> => {
   const repo = resolve(opts.repoPath);
   if (!isGitRepo(repo)) {
     throw new Error(`${repo} is not a git repository (no .git directory)`);
@@ -103,6 +164,7 @@ export const buildCacheZip = (opts: CacheZipOptions): CacheZipResult => {
   const treeSha = headTreeSha(repo);
   const defaultBranch = opts.defaultBranch || defaultBranchOf(repo, ref);
   const entries = treeEntries(repo);
+  const { lockset, summary: locksetSummary } = await resolveLockset(repo, opts);
 
   const manifest: RepoManifest = {
     schemaVersion: MANIFEST_SCHEMA_VERSION,
@@ -118,6 +180,7 @@ export const buildCacheZip = (opts: CacheZipOptions): CacheZipResult => {
     defaultBranch,
     truncated: false,
     entries,
+    ...(lockset ? { lockset } : {}),
   };
 
   const outputPath = opts.out
@@ -148,26 +211,30 @@ export const buildCacheZip = (opts: CacheZipOptions): CacheZipResult => {
     refKind: manifest.refKind,
     commitSha,
     entryCount: entries.length,
+    locksetSummary,
   };
 };
 
-export const runCacheZip = (args: ParsedArgs): number => {
+export const runCacheZip = async (args: ParsedArgs): Promise<number> => {
   if (args.flags.help || args.flags.h) {
     console.log(CACHE_ZIP_USAGE);
     return 0;
   }
-  const result = buildCacheZip({
+  const result = await buildCacheZip({
     repoPath: args.positionals[0] ?? process.cwd(),
     owner: flagValue(args.flags, 'owner'),
     repository: flagValue(args.flags, 'repo'),
     ref: flagValue(args.flags, 'ref'),
     defaultBranch: flagValue(args.flags, 'default-branch'),
     out: flagValue(args.flags, 'out'),
+    lockset: args.flags['no-lockset'] ? false : undefined,
+    cdnRoot: flagValue(args.flags, 'cdn-root'),
   });
   console.log(`Wrote ${result.outputPath}`);
   console.log(`  owner/repo:    ${result.owner}/${result.repository}`);
   console.log(`  ref:           ${result.ref} (${result.refKind})`);
   console.log(`  commit:        ${result.commitSha}`);
   console.log(`  tracked files: ${result.entryCount}`);
+  console.log(`  lockset:       ${result.locksetSummary}`);
   return 0;
 };

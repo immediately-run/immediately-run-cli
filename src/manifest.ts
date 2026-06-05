@@ -8,6 +8,10 @@
  * which is exactly what the contribute diff compares the working tree against.
  */
 
+import type { LocksetSection } from './lockset.js';
+
+export type { LocksetSection, ResolvedDependency, DepMap } from './lockset.js';
+
 export const MANIFEST_SCHEMA_VERSION = 1;
 
 // Stored without a leading slash — zip entries are root-relative. Mirrors
@@ -41,4 +45,9 @@ export interface RepoManifest {
   defaultBranch: string;
   truncated: boolean;
   entries: ManifestEntry[];
+  // Optional resolved-dependency lockset (PRETRANSPILED_ARTIFACTS_SPEC §4.3).
+  // Additive + ignorable by old readers; never bumps schemaVersion (the client
+  // hard-rejects unknown versions, so a bump would invalid-zip every deployed
+  // client — see CONTRIBUTE_SPEC §14).
+  lockset?: LocksetSection;
 }
