@@ -200,20 +200,16 @@ test('repo without package.json omits the lockset gracefully', async () => {
 });
 
 // --- CDN replication lag does not break the locking mechanism ----------------
-// These two tests together prove the guarantee: with the SDK declared
-// resolveFromRegistry, the lockset resolves even while the SDK version 500s on
-// the CDN (it's stripped before the query); without the opt-in, the same lag
-// would omit the lockset (the control case — proves the guard actually bites).
+// The SDK is self-hosted and resolved IMPLICITLY (no opt-in field), so it is
+// always stripped from the dep_tree query — the lockset resolves even while the
+// SDK version 500s on the CDN, with or without the legacy resolveFromRegistry
+// field. The control proves it's the SDK strip (not blanket lag tolerance):
+// lagging a NON-self-hosted dep still omits the lockset.
 
 const SDK = '@immediately-run/sdk';
 
-test('lockset resolves despite SDK CDN lag when the SDK is resolveFromRegistry', async () => {
-  const root = makeRepo(
-    JSON.stringify({
-      dependencies: { react: '^19.0.0', [SDK]: '^0.2.7' },
-      'immediately.run': { resolveFromRegistry: [SDK] },
-    }),
-  );
+test('lockset resolves despite SDK CDN lag — implicit, no opt-in field needed', async () => {
+  const root = makeRepo(JSON.stringify({ dependencies: { react: '^19.0.0', [SDK]: '0.2.8' } }));
   try {
     // The CDN has NOT replicated the SDK version: any dep_tree mentioning it 500s.
     failIfPayloadIncludes = SDK;
@@ -230,12 +226,30 @@ test('lockset resolves despite SDK CDN lag when the SDK is resolveFromRegistry',
   }
 });
 
-test('control: same SDK lag DOES omit the lockset without the resolveFromRegistry opt-in', async () => {
-  const root = makeRepo(JSON.stringify({ dependencies: { react: '^19.0.0', [SDK]: '^0.2.7' } }));
+test('still strips the SDK even with the legacy resolveFromRegistry field present', async () => {
+  const root = makeRepo(
+    JSON.stringify({
+      dependencies: { react: '^19.0.0', [SDK]: '0.2.8' },
+      'immediately.run': { resolveFromRegistry: [SDK] },
+    }),
+  );
   try {
     failIfPayloadIncludes = SDK;
     const result = await buildCacheZip(zipOpts(root));
-    // Without the opt-in the SDK is in the dep_tree request, which 500s → omitted.
+    assert.equal(result.locksetSummary, `${RESOLVED.length} packages`);
+    assert.equal(sidecarOf(result.outputPath).lockset.dependencies[SDK], undefined);
+  } finally {
+    failIfPayloadIncludes = undefined;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('control: lagging a NON-self-hosted dep still omits the lockset', async () => {
+  const root = makeRepo(JSON.stringify({ dependencies: { react: '^19.0.0', zod: '^3.0.0' } }));
+  try {
+    // zod is a normal CDN dep — not stripped — so its lag omits the lockset.
+    failIfPayloadIncludes = 'zod';
+    const result = await buildCacheZip(zipOpts(root));
     assert.match(result.locksetSummary, /^omitted \(/);
     assert.equal(sidecarOf(result.outputPath).lockset, undefined);
   } finally {

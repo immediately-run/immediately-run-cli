@@ -76,23 +76,30 @@ const augmentReactDependencies = (dependencies: DepMap): DepMap => {
 const sortDepMap = (deps: DepMap): DepMap =>
   Object.fromEntries(Object.entries(deps).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
 
+// Modules the runtime ALWAYS resolves from a self-hosted versioned origin, not
+// the sandpack CDN (sandbox `SELF_HOST_BASES`). Resolution is implicit, so these
+// are stripped from the lockset's `/dep_tree/` input unconditionally — keep in
+// sync with the sandbox. (`@immediately-run/sdk` is fetched from gh-pages
+// `/v/<version>/`.)
+const SELF_HOSTED_MODULES = ['@immediately-run/sdk'];
+
 /**
- * Modules an app resolves from a self-hosted/registry source at its pinned
- * version (its package.json `immediately.run`.`resolveFromRegistry`) are NOT
- * resolved via the sandpack CDN — so they must be stripped from the dep map
- * *before* the `/dep_tree/` query. This is what makes the lockset robust to
- * npm→CDN replication lag for those modules (notably `@immediately-run/sdk`):
- * a freshly published version that has not yet replicated would otherwise 500
- * the whole `/dep_tree/` request. Stripping mirrors the runtime's
- * `loadNodeModules`, so the runtime's echo comparison still matches.
+ * Modules the runtime resolves from a self-hosted origin (not the sandpack CDN)
+ * are stripped from the dep map *before* the `/dep_tree/` query. This makes the
+ * lockset robust to npm→CDN replication lag for those modules (notably
+ * `@immediately-run/sdk`): a freshly published version that has not yet
+ * replicated would otherwise 500 the whole request. Stripping mirrors the
+ * runtime's `loadNodeModules`, so the runtime's echo comparison still matches.
  *
- * `registryResolved` defaults to none, preserving the prior behaviour exactly.
+ * `SELF_HOSTED_MODULES` are always stripped (implicit resolution); the
+ * `registryResolved` param adds any extra names (e.g. a legacy opt-in field) and
+ * defaults to none.
  */
 export const computeInputDepMap = (
   pkgDependencies: DepMap,
   registryResolved: readonly string[] = [],
 ): DepMap => {
-  const skip = new Set(registryResolved);
+  const skip = new Set([...SELF_HOSTED_MODULES, ...registryResolved]);
   const selfHosted: DepMap = {};
   for (const [name, range] of Object.entries(pkgDependencies)) {
     if (!skip.has(name)) selfHosted[name] = range;
