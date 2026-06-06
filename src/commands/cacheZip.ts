@@ -85,31 +85,45 @@ export interface CacheZipResult {
   locksetSummary: string;
 }
 
+// Modules the app resolves from a self-hosted/registry source at its pinned
+// version (package.json `immediately.run`.`resolveFromRegistry`). They are
+// excluded from the CDN `/dep_tree/` lockset resolution — see
+// `computeInputDepMap` — so the lockset survives npm→CDN replication lag for
+// them (notably a freshly published `@immediately-run/sdk`).
+const headRegistryResolved = (parsed: unknown): string[] => {
+  const cfg = (parsed as Record<string, unknown> | null)?.['immediately.run'];
+  const list = (cfg as { resolveFromRegistry?: unknown } | undefined)?.resolveFromRegistry;
+  return Array.isArray(list) ? list.filter((m): m is string => typeof m === 'string') : [];
+};
+
 // Dependencies as committed at HEAD — the lockset must correspond to the tree
 // the zip carries (git archive HEAD), not the working directory.
-const headDependencies = (repo: string): { deps: DepMap; reason?: string } => {
+const headDependencies = (
+  repo: string,
+): { deps: DepMap; registryResolved: string[]; reason?: string } => {
   let raw: string;
   try {
     raw = git(repo, ['show', 'HEAD:package.json']);
   } catch {
-    return { deps: {}, reason: 'no package.json at HEAD' };
+    return { deps: {}, registryResolved: [], reason: 'no package.json at HEAD' };
   }
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch {
-    return { deps: {}, reason: 'package.json at HEAD is not valid JSON' };
+    return { deps: {}, registryResolved: [], reason: 'package.json at HEAD is not valid JSON' };
   }
+  const registryResolved = headRegistryResolved(parsed);
   const deps = (parsed as { dependencies?: unknown }).dependencies;
   if (!deps || typeof deps !== 'object' || Array.isArray(deps)) {
-    return { deps: {}, reason: 'package.json has no dependencies' };
+    return { deps: {}, registryResolved, reason: 'package.json has no dependencies' };
   }
   for (const [name, range] of Object.entries(deps)) {
     if (typeof range !== 'string') {
-      return { deps: {}, reason: `dependency ${name} has a non-string version` };
+      return { deps: {}, registryResolved, reason: `dependency ${name} has a non-string version` };
     }
   }
-  return { deps: deps as DepMap };
+  return { deps: deps as DepMap, registryResolved };
 };
 
 const resolveLockset = async (
@@ -119,12 +133,12 @@ const resolveLockset = async (
   if (opts.lockset === false) {
     return { summary: 'omitted (--no-lockset)' };
   }
-  const { deps, reason } = headDependencies(repo);
+  const { deps, registryResolved, reason } = headDependencies(repo);
   if (reason) {
     return { summary: `omitted (${reason})` };
   }
   try {
-    const lockset = await fetchLockset(deps, opts.cdnRoot);
+    const lockset = await fetchLockset(deps, opts.cdnRoot, registryResolved);
     return { lockset, summary: `${lockset.resolved.length} packages` };
   } catch (err) {
     // Never fail the zip build over the lockset (spec §7): warn and omit.

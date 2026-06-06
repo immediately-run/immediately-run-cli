@@ -76,11 +76,31 @@ const augmentReactDependencies = (dependencies: DepMap): DepMap => {
 const sortDepMap = (deps: DepMap): DepMap =>
   Object.fromEntries(Object.entries(deps).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
 
-export const computeInputDepMap = (pkgDependencies: DepMap): DepMap => {
-  const augmented = augmentReactDependencies(pkgDependencies);
+/**
+ * Modules an app resolves from a self-hosted/registry source at its pinned
+ * version (its package.json `immediately.run`.`resolveFromRegistry`) are NOT
+ * resolved via the sandpack CDN — so they must be stripped from the dep map
+ * *before* the `/dep_tree/` query. This is what makes the lockset robust to
+ * npm→CDN replication lag for those modules (notably `@immediately-run/sdk`):
+ * a freshly published version that has not yet replicated would otherwise 500
+ * the whole `/dep_tree/` request. Stripping mirrors the runtime's
+ * `loadNodeModules`, so the runtime's echo comparison still matches.
+ *
+ * `registryResolved` defaults to none, preserving the prior behaviour exactly.
+ */
+export const computeInputDepMap = (
+  pkgDependencies: DepMap,
+  registryResolved: readonly string[] = [],
+): DepMap => {
+  const skip = new Set(registryResolved);
+  const selfHosted: DepMap = {};
+  for (const [name, range] of Object.entries(pkgDependencies)) {
+    if (!skip.has(name)) selfHosted[name] = range;
+  }
+  const augmented = augmentReactDependencies(selfHosted);
   const filtered: DepMap = {};
   for (const [name, range] of Object.entries(augmented)) {
-    if (!isBuildDep(name)) filtered[name] = range;
+    if (!isBuildDep(name) && !skip.has(name)) filtered[name] = range;
   }
   return sortDepMap(filtered);
 };
@@ -100,8 +120,9 @@ const isResolvedDependency = (value: unknown): value is ResolvedDependency => {
 export const fetchLockset = async (
   pkgDependencies: DepMap,
   cdnRoot: string = DEFAULT_CDN_ROOT,
+  registryResolved: readonly string[] = [],
 ): Promise<LocksetSection> => {
-  const dependencies = computeInputDepMap(pkgDependencies);
+  const dependencies = computeInputDepMap(pkgDependencies, registryResolved);
   const base = cdnRoot.endsWith('/') ? cdnRoot : `${cdnRoot}/`;
   const url = `${base}dep_tree/${encodeDepTreePayload(dependencies)}`;
   const response = await fetch(url);

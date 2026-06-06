@@ -42,6 +42,20 @@ test('computeInputDepMap keeps an explicit react-refresh range', () => {
   assert.equal(result['react-refresh'], '^0.14.0');
 });
 
+test('computeInputDepMap strips registry-resolved modules from the CDN dep map', () => {
+  // The SDK is self-hosted (resolveFromRegistry), so it must NOT appear in the
+  // map sent to /dep_tree/ — that is what makes resolution survive the SDK's
+  // npm→CDN replication lag. Its own deps (react-error-boundary) are added by
+  // the react augmentation regardless and are unaffected.
+  const result = computeInputDepMap(
+    { react: '^19.0.0', '@immediately-run/sdk': '^0.2.7' },
+    ['@immediately-run/sdk'],
+  );
+  assert.equal(result['@immediately-run/sdk'], undefined);
+  assert.equal(result['react'], '^19.0.0');
+  assert.equal(result['react-error-boundary'], '^6.1.0');
+});
+
 test('encodeDepTreePayload matches the runtime payload format', () => {
   const deps = { react: '^18.2.0' };
   const decoded = Buffer.from(encodeDepTreePayload(deps), 'base64').toString();
@@ -59,12 +73,27 @@ let server;
 let cdnRoot;
 let lastPath;
 let nextStatus = 200;
+// Simulate npm→CDN replication lag: 500 any /dep_tree/ request whose decoded
+// payload mentions this substring (e.g. an SDK version not yet replicated),
+// while every other request resolves normally.
+let failIfPayloadIncludes;
+
+const decodeDepTreePath = (url) => {
+  const enc = decodeURIComponent(url.replace(/^\/dep_tree\//, ''));
+  try {
+    return Buffer.from(enc, 'base64').toString('utf8');
+  } catch {
+    return '';
+  }
+};
 
 before(async () => {
   server = createServer((req, res) => {
     lastPath = req.url;
-    if (nextStatus !== 200) {
-      res.writeHead(nextStatus);
+    const laggedOut =
+      failIfPayloadIncludes && decodeDepTreePath(req.url).includes(failIfPayloadIncludes);
+    if (nextStatus !== 200 || laggedOut) {
+      res.writeHead(laggedOut ? 500 : nextStatus);
       res.end();
       return;
     }
@@ -166,6 +195,51 @@ test('repo without package.json omits the lockset gracefully', async () => {
     assert.equal(result.locksetSummary, 'omitted (no package.json at HEAD)');
     assert.equal(sidecarOf(result.outputPath).lockset, undefined);
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// --- CDN replication lag does not break the locking mechanism ----------------
+// These two tests together prove the guarantee: with the SDK declared
+// resolveFromRegistry, the lockset resolves even while the SDK version 500s on
+// the CDN (it's stripped before the query); without the opt-in, the same lag
+// would omit the lockset (the control case — proves the guard actually bites).
+
+const SDK = '@immediately-run/sdk';
+
+test('lockset resolves despite SDK CDN lag when the SDK is resolveFromRegistry', async () => {
+  const root = makeRepo(
+    JSON.stringify({
+      dependencies: { react: '^19.0.0', [SDK]: '^0.2.7' },
+      'immediately.run': { resolveFromRegistry: [SDK] },
+    }),
+  );
+  try {
+    // The CDN has NOT replicated the SDK version: any dep_tree mentioning it 500s.
+    failIfPayloadIncludes = SDK;
+    const result = await buildCacheZip(zipOpts(root));
+    // Resolution still succeeded — the SDK never entered the dep_tree request.
+    assert.equal(result.locksetSummary, `${RESOLVED.length} packages`);
+    const sidecar = sidecarOf(result.outputPath);
+    assert.deepEqual(sidecar.lockset.resolved, RESOLVED);
+    assert.equal(sidecar.lockset.dependencies[SDK], undefined);
+    assert.ok(!decodeDepTreePath(lastPath).includes(SDK));
+  } finally {
+    failIfPayloadIncludes = undefined;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('control: same SDK lag DOES omit the lockset without the resolveFromRegistry opt-in', async () => {
+  const root = makeRepo(JSON.stringify({ dependencies: { react: '^19.0.0', [SDK]: '^0.2.7' } }));
+  try {
+    failIfPayloadIncludes = SDK;
+    const result = await buildCacheZip(zipOpts(root));
+    // Without the opt-in the SDK is in the dep_tree request, which 500s → omitted.
+    assert.match(result.locksetSummary, /^omitted \(/);
+    assert.equal(sidecarOf(result.outputPath).lockset, undefined);
+  } finally {
+    failIfPayloadIncludes = undefined;
     rmSync(root, { recursive: true, force: true });
   }
 });
