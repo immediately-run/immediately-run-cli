@@ -9,12 +9,14 @@
 import { parseArgs } from './args.js';
 import { runCacheZip } from './commands/cacheZip.js';
 import { runDev } from './commands/dev.js';
+import { runPinRelease } from './commands/pinRelease.js';
 
 // Handlers may be synchronous (cache-zip) or long-running async (dev, which
 // resolves only on shutdown).
 const COMMANDS: Record<string, (args: ReturnType<typeof parseArgs>) => number | Promise<number>> = {
   'cache-zip': runCacheZip,
   dev: runDev,
+  'pin-release': runPinRelease,
 };
 
 const USAGE = `immediately-run — command-line tools for immediately.run
@@ -24,6 +26,7 @@ Usage: immediately-run <command> [options]
 Commands:
   cache-zip   Build a cached repository zip (with a contribute manifest sidecar)
   dev         Serve the current project to hosted immediately.run over localhost
+  pin-release Resolve UI release authoring files into pinned lock artifacts
 
 Run 'immediately-run <command> --help' for command-specific options.`;
 
