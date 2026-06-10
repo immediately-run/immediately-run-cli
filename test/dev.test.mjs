@@ -7,8 +7,9 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import http from 'node:http';
 
-import { startDevServer, listWorkingTreeFiles, resolveSafe } from '../dist/devServer.js';
+import { startDevServer, listWorkingTreeFiles, resolveSafe, isAllowedHost } from '../dist/devServer.js';
 import { sanitizeProjectName, buildDeepLink } from '../dist/commands/dev.js';
 
 const ORIGIN = 'http://localhost:3000';
@@ -22,6 +23,22 @@ const authed = (path, init = {}) =>
   fetch(`${base}${path}`, {
     ...init,
     headers: { Authorization: `Bearer ${TOKEN}`, ...(init.headers ?? {}) },
+  });
+
+// Raw HTTP client so we can set the Host header (fetch/undici forbids it). Returns
+// { status, body }.
+const rawGet = (path, headers = {}) =>
+  new Promise((resolve, reject) => {
+    const req = http.request(
+      { host: '127.0.0.1', port: handle.port, path, method: 'GET', headers },
+      (res) => {
+        let body = '';
+        res.on('data', (c) => (body += c));
+        res.on('end', () => resolve({ status: res.statusCode, body }));
+      },
+    );
+    req.on('error', reject);
+    req.end();
   });
 
 before(async () => {
@@ -99,6 +116,48 @@ test('token via query param is accepted (EventSource cannot send headers)', asyn
 test('disallowed Origin → 403 even with a valid token', async () => {
   const res = await authed('/tree', { headers: { Origin: 'https://evil.example' } });
   assert.equal(res.status, 403);
+});
+
+test('LD-1: a rebound Host is rejected even with a valid token', async () => {
+  // DNS-rebinding: the socket is 127.0.0.1 but the browser sends the attacker's
+  // own (rebound) hostname. The token is presented, yet the request is refused.
+  const res = await rawGet('/tree', {
+    Authorization: `Bearer ${TOKEN}`,
+    Host: `attacker.example:${handle.port}`,
+  });
+  assert.equal(res.status, 403);
+  assert.match(res.body, /host not allowed/);
+});
+
+test('LD-1: a loopback Host on the wrong port is rejected', async () => {
+  const res = await rawGet('/tree', {
+    Authorization: `Bearer ${TOKEN}`,
+    Host: '127.0.0.1:1',
+  });
+  assert.equal(res.status, 403);
+});
+
+test('LD-1: localhost and 127.0.0.1 Host on the right port are accepted', async () => {
+  for (const name of ['localhost', '127.0.0.1']) {
+    const res = await rawGet('/tree', {
+      Authorization: `Bearer ${TOKEN}`,
+      Host: `${name}:${handle.port}`,
+    });
+    assert.equal(res.status, 200, `Host ${name} should be accepted`);
+  }
+});
+
+test('unit: isAllowedHost pins loopback names + the accepting port', () => {
+  assert.equal(isAllowedHost('localhost:5179', 5179), true);
+  assert.equal(isAllowedHost('127.0.0.1:5179', 5179), true);
+  assert.equal(isAllowedHost('[::1]:5179', 5179), true);
+  assert.equal(isAllowedHost('LocalHost:5179', 5179), true); // case-insensitive
+  assert.equal(isAllowedHost('localhost', 5179), true); // no port → host still pinned
+  assert.equal(isAllowedHost('attacker.example:5179', 5179), false);
+  assert.equal(isAllowedHost('127.0.0.1:9999', 5179), false); // wrong port
+  assert.equal(isAllowedHost('127.0.0.1.evil.com:5179', 5179), false);
+  assert.equal(isAllowedHost(undefined, 5179), false);
+  assert.equal(isAllowedHost('', 5179), false);
 });
 
 test('allowed Origin is echoed in CORS headers', async () => {

@@ -126,6 +126,39 @@ const isGitIgnored = (root: string, rel: string): boolean => {
 
 const CORS_MAX_AGE = '600';
 
+// LD-1 DNS-rebinding defense (LOCAL_DEVELOPMENT_SPEC §8). The server binds
+// 127.0.0.1, so the only legitimate `Host` names a loopback host. A malicious
+// page that rebinds its OWN DNS name to 127.0.0.1 reaches the socket but the
+// browser sends `Host: attacker.example` — reject it before the Origin/token
+// checks even run. Pinning the port to the accepting socket (`localPort`) also
+// refuses a Host that names the right loopback but the wrong port.
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
+
+export const isAllowedHost = (hostHeader: string | undefined, localPort: number): boolean => {
+  if (!hostHeader) return false; // HTTP/1.1 requires Host; a missing one is suspect.
+  let host = hostHeader;
+  let port: string | undefined;
+  if (hostHeader.startsWith('[')) {
+    // IPv6 literal: [::1] or [::1]:port
+    const end = hostHeader.indexOf(']');
+    if (end === -1) return false;
+    host = hostHeader.slice(1, end);
+    const rest = hostHeader.slice(end + 1);
+    if (rest.startsWith(':')) port = rest.slice(1);
+    else if (rest.length > 0) return false;
+  } else {
+    const colon = hostHeader.lastIndexOf(':');
+    if (colon !== -1) {
+      host = hostHeader.slice(0, colon);
+      port = hostHeader.slice(colon + 1);
+    }
+  }
+  if (!LOOPBACK_HOSTS.has(host.toLowerCase())) return false;
+  // A present port must match the accepting socket; absent port still pins host.
+  if (port !== undefined && port !== String(localPort)) return false;
+  return true;
+};
+
 const corsHeaders = (origin: string): Record<string, string> => ({
   'Access-Control-Allow-Origin': origin,
   Vary: 'Origin',
@@ -150,6 +183,13 @@ export const startDevServer = (opts: DevServerOptions): Promise<DevServerHandle>
   const server = http.createServer((req, res) => {
     const url = new URL(req.url ?? '/', 'http://127.0.0.1');
     const requestOrigin = req.headers.origin;
+
+    // LD-1: pin the Host to a loopback name on the accepting port BEFORE anything
+    // else (DNS-rebinding defense). Never echo CORS for a rejected host.
+    if (!isAllowedHost(req.headers.host, req.socket.localPort ?? opts.port)) {
+      sendJson(res, 403, { error: 'host not allowed' });
+      return;
+    }
 
     // Origin allowlist: browser requests always carry Origin — it must match
     // exactly. Token-bearing curl/agent requests carry none and are admitted
