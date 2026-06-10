@@ -10,7 +10,8 @@ import { join } from 'node:path';
 import http from 'node:http';
 
 import { startDevServer, listWorkingTreeFiles, resolveSafe, isAllowedHost } from '../dist/devServer.js';
-import { sanitizeProjectName, buildDeepLink } from '../dist/commands/dev.js';
+import { sanitizeProjectName, buildDeepLink, isRecognizedOrigin, runDev } from '../dist/commands/dev.js';
+import { stripRemoteCredentials } from '../dist/git.js';
 
 const ORIGIN = 'http://localhost:3000';
 const TOKEN = 'test-token-123';
@@ -245,4 +246,92 @@ test('unit: listWorkingTreeFiles on a non-git directory skips node_modules', () 
   } finally {
     rmSync(plain, { recursive: true, force: true });
   }
+});
+
+// --- LD-5: /blob enforces the .gitignore filter (no read-through of hidden paths) ---
+
+test('LD-5: /blob 404s a gitignored file even with a valid token', async () => {
+  // `ignored.txt` is gitignored (the before() fixture) and absent from /tree;
+  // /blob must answer the SAME 404 as a missing file — no existence oracle.
+  const res = await authed('/blob?path=%2Fignored.txt');
+  assert.equal(res.status, 404);
+});
+
+test('LD-5: /blob 404s a .git/ path', async () => {
+  const res = await authed(`/blob?path=${encodeURIComponent('/.git/config')}`);
+  assert.equal(res.status, 404);
+});
+
+test('LD-5: /blob 404s a node_modules path', async () => {
+  mkdirSync(join(root, 'node_modules', 'pkg'), { recursive: true });
+  writeFileSync(join(root, 'node_modules', 'pkg', 'index.js'), 'module.exports = {}\n');
+  const res = await authed(`/blob?path=${encodeURIComponent('/node_modules/pkg/index.js')}`);
+  assert.equal(res.status, 404);
+});
+
+// --- LD2-2: /meta.gitRemote is credential-stripped ---
+
+test('LD2-2: stripRemoteCredentials removes userinfo from a URL remote, leaves the rest', () => {
+  assert.equal(
+    stripRemoteCredentials('https://user:ghp_secret@github.com/o/r.git'),
+    'https://github.com/o/r.git',
+  );
+  // a lone token (bare username, no password) — the whole userinfo still goes.
+  assert.equal(
+    stripRemoteCredentials('https://ghp_tok@github.com/o/r.git'),
+    'https://github.com/o/r.git',
+  );
+  // scp-like form is not a URL; its bare username carries no secret → unchanged.
+  assert.equal(stripRemoteCredentials('git@github.com:o/r.git'), 'git@github.com:o/r.git');
+  // a credential-free https remote is unchanged.
+  assert.equal(stripRemoteCredentials('https://github.com/o/r.git'), 'https://github.com/o/r.git');
+});
+
+test('LD2-2: /meta.gitRemote never carries a credentialed remote across loopback', async () => {
+  execFileSync(
+    'git',
+    ['-C', root, 'remote', 'add', 'origin', 'https://user:ghp_secret@github.com/o/r.git'],
+    { stdio: 'pipe' },
+  );
+  const meta = await (await authed('/meta')).json();
+  assert.equal(meta.gitRemote, 'https://github.com/o/r.git');
+  assert.ok(!meta.gitRemote.includes('ghp_secret'));
+});
+
+// --- LD-3: --origin allowlist + --origin-unsafe escape ---
+
+test('LD-3: isRecognizedOrigin accepts immediately.run, loopback, and preview origins', () => {
+  for (const ok of [
+    'https://immediately.run',
+    'http://localhost:3000',
+    'http://127.0.0.1:5173',
+    'https://site.local.immediately.run',
+    'https://my-app--preview.web.app',
+    'https://my-app.firebaseapp.com',
+  ]) {
+    assert.equal(isRecognizedOrigin(ok), true, ok);
+  }
+});
+
+test('LD-3: isRecognizedOrigin refuses arbitrary or malformed origins', () => {
+  for (const bad of [
+    'https://evil.example',
+    'http://immediately.run.evil.com', // suffix-spoof
+    'https://immediately.run/path', // an Origin has no path
+    'https://user@immediately.run', // userinfo present
+    'http://github.com',
+    'not-a-url',
+  ]) {
+    assert.equal(isRecognizedOrigin(bad), false, bad);
+  }
+});
+
+test('LD-3: runDev refuses an unrecognized --origin unless --origin-unsafe is given', async () => {
+  // The check runs BEFORE the server starts, so this rejects without leaking a
+  // listener. (The allowed path would start a blocking server — covered by the
+  // pure isRecognizedOrigin test above.)
+  await assert.rejects(
+    runDev({ positionals: [root], flags: { origin: 'https://evil.example' } }),
+    /origin-unsafe/,
+  );
 });
