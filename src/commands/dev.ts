@@ -30,12 +30,44 @@ Options:
   --port <n>                Port to listen on (127.0.0.1 only; default: 7700)
   --origin <url>            Allowed browser origin and deep-link base
                             (default: https://immediately.run; use e.g.
-                            http://localhost:3000 against a local site build)
+                            http://localhost:3000 against a local site build).
+                            Only immediately.run, loopback, and preview origins
+                            are accepted without --origin-unsafe.
+  --origin-unsafe           Allow an --origin outside the recognized set
+                            (the per-session token still gates every request)
   --open                    Open the deep link in the default browser
   -h, --help                Show this help`;
 
 export const DEFAULT_PORT = 7700;
 export const DEFAULT_ORIGIN = 'https://immediately.run';
+
+// LD-3 (LOCAL_DEVELOPMENT_SPEC §8, decision §6a#24b): `--origin` must not let one
+// careless flag silently disable the Origin defense. These values are accepted
+// silently — the production origin, loopback origins (any port) for local site
+// builds, and the deployment's recognized self-host / Firebase preview patterns;
+// ANY other value is refused unless `--origin-unsafe` accompanies it. The
+// per-session token remains the backstop either way. Returns false for anything
+// that isn't a bare `scheme://host[:port]` origin (a path/query/userinfo means it
+// isn't an Origin a browser would ever send).
+export const isRecognizedOrigin = (origin: string): boolean => {
+  let u: URL;
+  try {
+    u = new URL(origin);
+  } catch {
+    return false;
+  }
+  if (u.username || u.password || u.search || u.hash) return false;
+  if (u.pathname !== '' && u.pathname !== '/') return false;
+  const host = u.hostname;
+  // Loopback site builds (http/https, any port).
+  if (host === 'localhost' || host === '127.0.0.1' || host === '::1') return true;
+  // Production + self-host/preview subdomains + Firebase preview channels (https).
+  if (u.protocol === 'https:') {
+    if (host === 'immediately.run' || host.endsWith('.immediately.run')) return true;
+    if (host.endsWith('.web.app') || host.endsWith('.firebaseapp.com')) return true;
+  }
+  return false;
+};
 
 // The URL path segments only admit [a-zA-Z0-9-_] (immediately-run-sdk
 // urlUtils PATH_SEGMENTS), so the project name must be sanitized to that set.
@@ -84,6 +116,14 @@ export const runDev = async (args: ParsedArgs): Promise<number> => {
     throw new Error(`Invalid --port: ${portFlag}`);
   }
   const origin = flagValue(args.flags, 'origin') ?? DEFAULT_ORIGIN;
+  // LD-3: refuse an unrecognized --origin unless --origin-unsafe is given too.
+  if (!isRecognizedOrigin(origin) && args.flags['origin-unsafe'] !== true) {
+    throw new Error(
+      `Refusing --origin ${origin}: not a recognized immediately.run, loopback, or ` +
+        `preview origin. Re-run with --origin-unsafe to allow it (the per-session ` +
+        `token still gates every request).`,
+    );
+  }
 
   // Per-session secret: any web page can fetch('http://127.0.0.1:…'), so every
   // request must present this token (spec §8).

@@ -18,6 +18,26 @@ export const git = (repo: string, args: string[]): string =>
 export const isGitRepo = (repo: string): boolean =>
   existsSync(join(repo, '.git'));
 
+// Strip embedded credentials from a git remote URL before it leaves loopback
+// (LOCAL_DEVELOPMENT_SPEC §6.3, LD2-2). A remote can carry a token in its
+// userinfo (`https://user:ghp_xxx@github.com/…`). Rule: if it parses as a URL
+// with a userinfo component, remove the ENTIRE userinfo (username AND password);
+// an scp-like `user@host:path` (no scheme → not a URL) carries only a bare
+// username — no secret — and passes through; anything else passes unchanged. The
+// raw string is never serialized onto a response.
+export const stripRemoteCredentials = (remote: string): string => {
+  let u: URL;
+  try {
+    u = new URL(remote);
+  } catch {
+    return remote; // scp-like or non-URL → no userinfo secret to strip
+  }
+  if (!u.username && !u.password) return remote;
+  u.password = '';
+  u.username = '';
+  return u.href;
+};
+
 // Accepts git@github.com:owner/repo(.git) and https://github.com/owner/repo(.git)
 export const parseOwnerRepo = (
   remoteUrl: string,

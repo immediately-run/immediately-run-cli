@@ -30,6 +30,7 @@ import {
   git,
   headCommitSha,
   isGitRepo,
+  stripRemoteCredentials,
 } from './git.js';
 
 export interface DevServerOptions {
@@ -120,6 +121,17 @@ const isGitIgnored = (root: string, rel: string): boolean => {
   } catch {
     return false;
   }
+};
+
+// A repo-relative path the `/tree` filter hides — VCS/dependency noise (`.git/`,
+// `node_modules`) plus anything `.gitignore`'d (`.env` the canonical example).
+// `/blob` must 404 these (LD-5) and `/watch` must not emit them: a token-holder
+// must not read through `/blob` what `/tree` omits. Single source for both paths.
+const isHiddenPath = (root: string, rel: string, inGitRepo: boolean): boolean => {
+  if (rel === '.git' || rel.startsWith('.git/')) return true;
+  if (rel.split('/').includes('node_modules')) return true;
+  if (inGitRepo && isGitIgnored(root, rel)) return true;
+  return false;
 };
 
 // --- request guard -----------------------------------------------------------
@@ -238,6 +250,14 @@ export const startDevServer = (opts: DevServerOptions): Promise<DevServerHandle>
         }
         case '/blob': {
           const abs = resolveSafe(root, url.searchParams.get('path'));
+          // LD-5: never serve a path `/tree` hides (`.gitignore`'d — e.g. `.env` —
+          // plus `.git/`, `node_modules`). Answer the SAME 404 as an absent file so
+          // a token-holder gets no existence oracle for hidden paths.
+          const rel = path.relative(root, abs).split(path.sep).join('/');
+          if (isHiddenPath(root, rel, inGitRepo)) {
+            sendJson(res, 404, { error: 'not found' }, cors);
+            return;
+          }
           let bytes: Buffer;
           try {
             bytes = readFileSync(abs);
@@ -252,7 +272,9 @@ export const startDevServer = (opts: DevServerOptions): Promise<DevServerHandle>
         case '/meta': {
           const meta: { gitRemote?: string; headSha?: string; defaultBranch?: string } = {};
           if (inGitRepo) {
-            try { meta.gitRemote = git(root, ['remote', 'get-url', 'origin']); } catch { /* no remote */ }
+            // LD2-2: credential-strip before it leaves loopback — a remote may
+            // embed a token in its userinfo; the raw string never crosses.
+            try { meta.gitRemote = stripRemoteCredentials(git(root, ['remote', 'get-url', 'origin'])); } catch { /* no remote */ }
             try { meta.headSha = headCommitSha(root); } catch { /* unborn HEAD */ }
             try { meta.defaultBranch = defaultBranchOf(root, 'main'); } catch { /* best effort */ }
           }
@@ -270,10 +292,8 @@ export const startDevServer = (opts: DevServerOptions): Promise<DevServerHandle>
           const watcher = fsWatch(root, { recursive: true }, (eventType, filename) => {
             if (!filename) return;
             const rel = String(filename).split(path.sep).join('/');
-            // Never emit VCS/dependency noise; gitignored files mirror /tree.
-            if (rel === '.git' || rel.startsWith('.git/')) return;
-            if (rel.split('/').includes('node_modules')) return;
-            if (inGitRepo && isGitIgnored(root, rel)) return;
+            // Never emit what /tree hides — VCS/dependency noise + gitignored files.
+            if (isHiddenPath(root, rel, inGitRepo)) return;
             res.write(`data: ${JSON.stringify({ eventType, path: `/${rel}` })}\n\n`);
           });
           const heartbeat = setInterval(() => res.write(': hb\n\n'), 30000);
