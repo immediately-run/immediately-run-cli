@@ -21,7 +21,7 @@
  */
 
 import * as http from 'node:http';
-import { watch as fsWatch, statSync, readFileSync, readdirSync } from 'node:fs';
+import { watch as fsWatch, statSync, createReadStream, readdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import * as path from 'node:path';
 
@@ -38,6 +38,10 @@ export interface DevServerOptions {
   origin: string; // allowed browser Origin (and deep-link base)
   token: string; // per-session bearer token
   port: number; // 0 = ephemeral (tests)
+  /** LD2-5 listing cap override (default {@link MAX_TREE_ENTRIES}); tests lower it. */
+  maxTreeEntries?: number;
+  /** LD2-5 single-blob cap override (default {@link MAX_BLOB_BYTES}); tests lower it. */
+  maxBlobBytes?: number;
 }
 
 export interface DevServerHandle {
@@ -51,6 +55,23 @@ export interface TreeFile {
   size: number;
   type: 'blob';
 }
+
+/** Provider-protocol version reported by `GET /health` (LOCAL_DEVELOPMENT_SPEC
+ *  §6.3, A3). Additive-only bumps, so the host can detect version skew. */
+export const DEV_PROTOCOL_VERSION = 1;
+
+// Size bounds (LD2-5, §6.3): advisory trust-boundary caps — some stated bound
+// must exist at this boundary even if a future flag raises them.
+/** `/tree` listing cap — beyond it the server answers an explicit error naming
+ *  the cap rather than silently truncating. */
+export const MAX_TREE_ENTRIES = 50_000;
+/** `/blob` single-file cap — beyond it the server answers 413. */
+export const MAX_BLOB_BYTES = 25 * 1024 * 1024;
+
+/** `/watch` coalescing window (LD2-4, §6.3): buffer fs events at least this long
+ *  before flushing, so a burst (npm install, branch switch) collapses to one
+ *  batch with at most one gitignore subprocess. */
+export const WATCH_COALESCE_MS = 50;
 
 // --- path scoping (after dev-fs resolveSafe) --------------------------------
 
@@ -92,7 +113,9 @@ const walkFiles = (root: string, dir = '', out: string[] = []): string[] => {
   return out;
 };
 
-export const listWorkingTreeFiles = (root: string): TreeFile[] => {
+// `cap` (LD2-5) stops collection one past the limit so the caller can detect an
+// overflow and answer an explicit error instead of silently truncating.
+export const listWorkingTreeFiles = (root: string, cap = MAX_TREE_ENTRIES): TreeFile[] => {
   const rels = isGitRepo(root) ? gitListFiles(root) : walkFiles(root);
   const files: TreeFile[] = [];
   for (const rel of new Set(rels)) {
@@ -102,6 +125,7 @@ export const listWorkingTreeFiles = (root: string): TreeFile[] => {
       const st = statSync(path.join(root, rel));
       if (!st.isFile()) continue;
       files.push({ path: '/' + rel.split(path.sep).join('/'), size: st.size, type: 'blob' });
+      if (files.length > cap) break; // overflow sentinel: cap+1 entries → 413
     } catch {
       /* deleted since listing */
     }
@@ -123,13 +147,37 @@ const isGitIgnored = (root: string, rel: string): boolean => {
   }
 };
 
+// LD2-4: the gitignore check for a WHOLE batch in a single `git check-ignore`
+// subprocess (NUL-delimited stdin/stdout), so a burst of events costs O(1) git
+// invocations regardless of event count — never one spawn per event. Returns the
+// subset of `rels` that git ignores. Fail-open (empty) on any error: a stray
+// gitignored path leaking onto /watch is informational (`/blob` still 404s it via
+// the per-request `isHiddenPath`), and the watcher must never wedge.
+const batchGitIgnored = (root: string, rels: readonly string[]): Set<string> => {
+  if (rels.length === 0) return new Set();
+  try {
+    const out = execFileSync('git', ['-C', root, 'check-ignore', '-z', '--stdin'], {
+      input: rels.join('\0') + '\0',
+      stdio: ['pipe', 'pipe', 'ignore'],
+    });
+    return new Set(out.toString('utf8').split('\0').filter(Boolean));
+  } catch {
+    // exit 1 = nothing ignored (no stdout); any other failure → fail-open.
+    return new Set();
+  }
+};
+
+// The cheap, subprocess-free half of `isHiddenPath`: VCS/dependency noise
+// (`.git/`, `node_modules`). Safe to run per-event on the /watch hot path.
+const isVcsNoise = (rel: string): boolean =>
+  rel === '.git' || rel.startsWith('.git/') || rel.split('/').includes('node_modules');
+
 // A repo-relative path the `/tree` filter hides — VCS/dependency noise (`.git/`,
 // `node_modules`) plus anything `.gitignore`'d (`.env` the canonical example).
 // `/blob` must 404 these (LD-5) and `/watch` must not emit them: a token-holder
 // must not read through `/blob` what `/tree` omits. Single source for both paths.
 const isHiddenPath = (root: string, rel: string, inGitRepo: boolean): boolean => {
-  if (rel === '.git' || rel.startsWith('.git/')) return true;
-  if (rel.split('/').includes('node_modules')) return true;
+  if (isVcsNoise(rel)) return true;
   if (inGitRepo && isGitIgnored(root, rel)) return true;
   return false;
 };
@@ -191,6 +239,8 @@ const sendJson = (
 export const startDevServer = (opts: DevServerOptions): Promise<DevServerHandle> => {
   const root = path.resolve(opts.root);
   const inGitRepo = isGitRepo(root);
+  const maxTreeEntries = opts.maxTreeEntries ?? MAX_TREE_ENTRIES;
+  const maxBlobBytes = opts.maxBlobBytes ?? MAX_BLOB_BYTES;
 
   const server = http.createServer((req, res) => {
     const url = new URL(req.url ?? '/', 'http://127.0.0.1');
@@ -244,8 +294,27 @@ export const startDevServer = (opts: DevServerOptions): Promise<DevServerHandle>
 
     try {
       switch (url.pathname) {
+        case '/health': {
+          // A3: token-gated liveness + provider-protocol version. The token check
+          // above already gates this route; reaching here means a valid token.
+          sendJson(res, 200, { ok: true, protocol: DEV_PROTOCOL_VERSION }, cors);
+          return;
+        }
         case '/tree': {
-          sendJson(res, 200, { ref: 'live', files: listWorkingTreeFiles(root) }, cors);
+          // LD2-5: cap the listing. `listWorkingTreeFiles` returns cap+1 on
+          // overflow → answer an explicit error naming the cap, never a silent
+          // truncation that would hide files from the in-browser tree.
+          const files = listWorkingTreeFiles(root, maxTreeEntries);
+          if (files.length > maxTreeEntries) {
+            sendJson(
+              res,
+              413,
+              { error: `working tree exceeds the ${maxTreeEntries}-entry listing cap`, cap: maxTreeEntries },
+              cors,
+            );
+            return;
+          }
+          sendJson(res, 200, { ref: 'live', files }, cors);
           return;
         }
         case '/blob': {
@@ -258,15 +327,36 @@ export const startDevServer = (opts: DevServerOptions): Promise<DevServerHandle>
             sendJson(res, 404, { error: 'not found' }, cors);
             return;
           }
-          let bytes: Buffer;
+          let st;
           try {
-            bytes = readFileSync(abs);
+            st = statSync(abs); // existence + size + type in one syscall
           } catch {
             sendJson(res, 404, { error: 'not found' }, cors);
             return;
           }
-          res.writeHead(200, { 'Content-Type': 'application/octet-stream', ...cors });
-          res.end(bytes);
+          if (!st.isFile()) {
+            sendJson(res, 404, { error: 'not found' }, cors);
+            return;
+          }
+          // LD2-5: cap single-file size (413). Large-but-allowed blobs are STREAMED
+          // (not buffered whole) so memory stays bounded regardless of file size.
+          if (st.size > maxBlobBytes) {
+            sendJson(
+              res,
+              413,
+              { error: `blob exceeds the ${maxBlobBytes}-byte cap`, cap: maxBlobBytes, size: st.size },
+              cors,
+            );
+            return;
+          }
+          res.writeHead(200, {
+            'Content-Type': 'application/octet-stream',
+            'Content-Length': String(st.size),
+            ...cors,
+          });
+          const stream = createReadStream(abs);
+          stream.on('error', () => res.destroy()); // existence was checked; rare
+          stream.pipe(res);
           return;
         }
         case '/meta': {
@@ -289,16 +379,38 @@ export const startDevServer = (opts: DevServerOptions): Promise<DevServerHandle>
             ...cors,
           });
           res.write('retry: 1000\n\n');
+          // LD2-4: coalesce bursts. Buffer events (rel → latest eventType) and
+          // flush on a ≥WATCH_COALESCE_MS timer; the cheap VCS-noise filter runs
+          // per event (no subprocess), but the gitignore check runs at most ONCE
+          // per batch (a single `git check-ignore`), bounding subprocess spawns to
+          // O(1) per window regardless of how many events the burst delivered.
+          const pending = new Map<string, string>();
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          const flush = () => {
+            timer = undefined;
+            if (pending.size === 0) return;
+            const batch = [...pending];
+            pending.clear();
+            const rels = batch.map(([rel]) => rel);
+            const ignored = inGitRepo ? batchGitIgnored(root, rels) : new Set<string>();
+            for (const [rel, eventType] of batch) {
+              if (ignored.has(rel)) continue;
+              res.write(`data: ${JSON.stringify({ eventType, path: `/${rel}` })}\n\n`);
+            }
+          };
           const watcher = fsWatch(root, { recursive: true }, (eventType, filename) => {
             if (!filename) return;
             const rel = String(filename).split(path.sep).join('/');
-            // Never emit what /tree hides — VCS/dependency noise + gitignored files.
-            if (isHiddenPath(root, rel, inGitRepo)) return;
-            res.write(`data: ${JSON.stringify({ eventType, path: `/${rel}` })}\n\n`);
+            // Cheap, subprocess-free drop of VCS/dependency noise on the hot path;
+            // the gitignore check is deferred to the once-per-batch flush.
+            if (isVcsNoise(rel)) return;
+            pending.set(rel, eventType); // last write per path wins
+            if (!timer) timer = setTimeout(flush, WATCH_COALESCE_MS);
           });
           const heartbeat = setInterval(() => res.write(': hb\n\n'), 30000);
           req.on('close', () => {
             clearInterval(heartbeat);
+            if (timer) clearTimeout(timer);
             watcher.close();
           });
           return;

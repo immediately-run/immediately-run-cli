@@ -9,8 +9,8 @@
  * single parseable line.
  */
 
-import { existsSync, statSync } from 'node:fs';
-import { randomBytes } from 'node:crypto';
+import { existsSync, realpathSync, statSync } from 'node:fs';
+import { createHash, randomBytes } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { basename, resolve } from 'node:path';
 
@@ -36,6 +36,8 @@ Options:
   --origin-unsafe           Allow an --origin outside the recognized set
                             (the per-session token still gates every request)
   --open                    Open the deep link in the default browser
+  --json                    Print one machine-readable JSON line to stdout
+                            ({ url, endpoint, token, port }); diagnostics → stderr
   -h, --help                Show this help`;
 
 export const DEFAULT_PORT = 7700;
@@ -79,10 +81,29 @@ export const sanitizeProjectName = (name: string): string => {
   return cleaned || 'project';
 };
 
+// The per-checkout disambiguator (LD2-1, LOCAL_DEVELOPMENT_SPEC §6.2, decision
+// #23): the first 8 lowercase-hex chars of SHA-256 over the project root's
+// RESOLVED real path. The CoW overlay/journal identity the host keys on is
+// `local/<name>-<hash8>/<name>/live`, so:
+//  - the SAME checkout (same realpath) always yields the same hash ⇒ the same
+//    overlay reattaches across server restarts / new tokens / new ports;
+//  - two same-named checkouts at DIFFERENT paths get distinct hashes ⇒ distinct
+//    overlays, never cross-contaminating each other's in-browser edits.
+// Baking it into the deep-link namespace means the host needs no disk-path
+// knowledge — it just keys on the namespace segment it already parses.
+export const realpathHash8 = (root: string): string =>
+  createHash('sha256').update(realpathSync(root)).digest('hex').slice(0, 8);
+
 // The connection locator rides the URL fragment — never sent to any server —
 // because the path charset can't carry it (LOCAL_DEVELOPMENT_SPEC §6.4).
-export const buildDeepLink = (origin: string, projectName: string, port: number, token: string): string =>
-  `${origin.replace(/\/+$/, '')}/edit/local/${projectName}/${projectName}/live` +
+export const buildDeepLink = (
+  origin: string,
+  namespace: string,
+  repository: string,
+  port: number,
+  token: string,
+): string =>
+  `${origin.replace(/\/+$/, '')}/edit/local/${namespace}/${repository}/live` +
   `#ir-endpoint=${encodeURIComponent(`http://127.0.0.1:${port}`)}&ir-token=${encodeURIComponent(token)}`;
 
 const openInBrowser = (url: string): void => {
@@ -130,12 +151,26 @@ export const runDev = async (args: ParsedArgs): Promise<number> => {
   const token = randomBytes(24).toString('base64url');
 
   const handle = await startDevServer({ root, origin, token, port });
-  const url = buildDeepLink(origin, sanitizeProjectName(basename(root)), handle.port, token);
+  const projectName = sanitizeProjectName(basename(root));
+  // LD2-1: the namespace carries the realpath disambiguator; repository stays the
+  // bare project name (`local/<name>-<hash8>/<name>/live`).
+  const namespace = `${projectName}-${realpathHash8(root)}`;
+  const endpoint = `http://127.0.0.1:${handle.port}`;
+  const url = buildDeepLink(origin, namespace, projectName, handle.port, token);
 
-  console.log(`Serving ${root} (read-only) on http://127.0.0.1:${handle.port}`);
-  console.log(`Allowed origin: ${origin}`);
-  console.log(`immediately.run dev URL: ${url}`);
-  console.log('Press Ctrl-C to stop. Keep this running while the page is open.');
+  if (args.flags.json === true) {
+    // A3 (§10): exactly one JSON line on stdout once listening; everything else
+    // (so an agent can parse stdout without scraping prose) goes to stderr.
+    process.stdout.write(
+      JSON.stringify({ url, endpoint, token, port: handle.port }) + '\n',
+    );
+    console.error(`Serving ${root} (read-only) on ${endpoint} for ${origin}. Ctrl-C to stop.`);
+  } else {
+    console.log(`Serving ${root} (read-only) on ${endpoint}`);
+    console.log(`Allowed origin: ${origin}`);
+    console.log(`immediately.run dev URL: ${url}`);
+    console.log('Press Ctrl-C to stop. Keep this running while the page is open.');
+  }
 
   if (args.flags.open) {
     openInBrowser(url);
