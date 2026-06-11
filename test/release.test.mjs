@@ -16,6 +16,7 @@ import {
   serializeIndex,
   buildIndex,
   sha256Hex,
+  firstPartyStripWarnings,
 } from '../dist/release.js';
 import { runPinRelease } from '../dist/commands/pinRelease.js';
 
@@ -28,6 +29,36 @@ test('parseBindingId + appKey strip ref/commit to the repo scope', () => {
   const b = parseBindingId('github:immediately-run/space-manager@main');
   assert.equal(appKey(b), 'github:immediately-run/space-manager');
   assert.equal(b.ref, 'main');
+});
+
+// §5 step-3a lint (UI_RELEASES_SPEC §6.1b). The shipped first-party-only set is
+// empty (R3-33d), so the manifest is injected here to exercise the lint.
+test('firstPartyStripWarnings warns when a repoint strips first-party-only caps', () => {
+  const flattened = {
+    'monaco-2026-06': {
+      'task.edit-file': 'github:fork/elsewhere@main', // repoint OFF the build default
+      'panel.files': 'github:immediately-run/file-explorer@v2', // same scope, commit pin
+    },
+  };
+  const buildDefaults = {
+    'task.edit-file': { repo: 'github:immediately-run/editor', firstPartyOnlyCaps: ['editor:write'] },
+    'panel.files': { repo: 'github:immediately-run/file-explorer', firstPartyOnlyCaps: ['x:fp'] },
+  };
+  const warnings = firstPartyStripWarnings(flattened, buildDefaults);
+  // Only the repoint OFF the build-default scope warns; the same-scope commit pin does not.
+  assert.equal(warnings.length, 1);
+  assert.deepEqual(warnings[0], {
+    release: 'monaco-2026-06',
+    region: 'task.edit-file',
+    strippedCaps: ['editor:write'],
+    fromRepo: 'github:immediately-run/editor',
+    toRepo: 'github:fork/elsewhere',
+  });
+});
+
+test('firstPartyStripWarnings is vacuous with the empty (shipped) manifest', () => {
+  const flattened = { r: { 'task.edit-file': 'github:fork/x@main' } };
+  assert.deepEqual(firstPartyStripWarnings(flattened, {}), []);
 });
 
 test('flattenAuthoring: overlay wins per region', () => {
