@@ -3,15 +3,30 @@
 // ships. Uses node:test — no test-framework dependency.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import http from 'node:http';
 
-import { startDevServer, listWorkingTreeFiles, resolveSafe, isAllowedHost } from '../dist/devServer.js';
-import { sanitizeProjectName, buildDeepLink, isRecognizedOrigin, runDev } from '../dist/commands/dev.js';
+import {
+  startDevServer,
+  listWorkingTreeFiles,
+  resolveSafe,
+  isAllowedHost,
+  DEV_PROTOCOL_VERSION,
+} from '../dist/devServer.js';
+import {
+  sanitizeProjectName,
+  buildDeepLink,
+  realpathHash8,
+  isRecognizedOrigin,
+  runDev,
+} from '../dist/commands/dev.js';
 import { stripRemoteCredentials } from '../dist/git.js';
+
+const CLI_ENTRY = fileURLToPath(new URL('../dist/cli.js', import.meta.url));
 
 const ORIGIN = 'http://localhost:3000';
 const TOKEN = 'test-token-123';
@@ -222,12 +237,163 @@ test('unit: sanitizeProjectName maps to the URL charset', () => {
   assert.equal(sanitizeProjectName('...'), 'project');
 });
 
-test('unit: buildDeepLink shape', () => {
-  const url = buildDeepLink('http://localhost:3000/', 'proj', 7700, 'tok');
+test('unit: buildDeepLink shape (namespace carries the §6.2 disambiguator)', () => {
+  const url = buildDeepLink('http://localhost:3000/', 'proj-abcd1234', 'proj', 7700, 'tok');
   assert.equal(
     url,
-    'http://localhost:3000/edit/local/proj/proj/live#ir-endpoint=http%3A%2F%2F127.0.0.1%3A7700&ir-token=tok',
+    'http://localhost:3000/edit/local/proj-abcd1234/proj/live#ir-endpoint=http%3A%2F%2F127.0.0.1%3A7700&ir-token=tok',
   );
+});
+
+// --- LD2-1: realpath-hash cowName disambiguator (the §6.2 exit criterion) ---
+
+test('LD2-1: two same-named checkouts get distinct overlay identities; same realpath is stable', () => {
+  // Two checkouts that share the basename `my-app` at DIFFERENT paths.
+  const a = mkdtempSync(join(tmpdir(), 'ir-cow-a-'));
+  const b = mkdtempSync(join(tmpdir(), 'ir-cow-b-'));
+  try {
+    mkdirSync(join(a, 'my-app'));
+    mkdirSync(join(b, 'my-app'));
+    const ha = realpathHash8(join(a, 'my-app'));
+    const hb = realpathHash8(join(b, 'my-app'));
+    assert.match(ha, /^[0-9a-f]{8}$/);
+    // Distinct checkouts → distinct hash → distinct namespace → distinct overlay
+    // (the cross-checkout contamination LD2-1 closes).
+    assert.notEqual(ha, hb);
+    // Reconnect semantics: the SAME realpath always yields the SAME hash, so the
+    // overlay + journal reattach across server restarts / new tokens / new ports.
+    assert.equal(realpathHash8(join(a, 'my-app')), ha);
+    // The host keys on the namespace segment, which now differs for the two:
+    const nsA = `my-app-${ha}`;
+    const nsB = `my-app-${hb}`;
+    assert.notEqual(
+      buildDeepLink('https://immediately.run', nsA, 'my-app', 1, 't'),
+      buildDeepLink('https://immediately.run', nsB, 'my-app', 1, 't'),
+    );
+  } finally {
+    rmSync(a, { recursive: true, force: true });
+    rmSync(b, { recursive: true, force: true });
+  }
+});
+
+// --- A3: token-gated /health (liveness + protocol version) ---
+
+test('A3: /health is token-gated and reports the protocol version', async () => {
+  assert.equal((await fetch(`${base}/health`)).status, 403); // no token → gated
+  const res = await authed('/health');
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), { ok: true, protocol: DEV_PROTOCOL_VERSION });
+});
+
+// --- LD2-5: /tree and /blob size bounds ---
+
+test('LD2-5: /tree answers an explicit 413 naming the cap (no silent truncation)', async () => {
+  // A tiny server with a 1-entry cap over the multi-file fixture overflows.
+  const capped = await startDevServer({ root, origin: ORIGIN, token: TOKEN, port: 0, maxTreeEntries: 1 });
+  try {
+    const res = await fetch(`http://127.0.0.1:${capped.port}/tree`, {
+      headers: { Authorization: `Bearer ${TOKEN}` },
+    });
+    assert.equal(res.status, 413);
+    const body = await res.json();
+    assert.equal(body.cap, 1);
+    assert.match(body.error, /1-entry/);
+  } finally {
+    await capped.close();
+  }
+});
+
+test('LD2-5: /blob answers 413 for a file over the size cap, 200 under it', async () => {
+  const capped = await startDevServer({ root, origin: ORIGIN, token: TOKEN, port: 0, maxBlobBytes: 8 });
+  try {
+    const get = (p) =>
+      fetch(`http://127.0.0.1:${capped.port}/blob?path=${encodeURIComponent(p)}`, {
+        headers: { Authorization: `Bearer ${TOKEN}` },
+      });
+    // committed.txt is 'committed contents\n' (19 bytes) > 8 → 413.
+    const tooBig = await get('/committed.txt');
+    assert.equal(tooBig.status, 413);
+    const body = await tooBig.json();
+    assert.equal(body.cap, 8);
+    assert.ok(body.size > 8);
+    // A small file under the cap still serves.
+    writeFileSync(join(root, 'tiny.txt'), 'hi');
+    const ok = await get('/tiny.txt');
+    assert.equal(ok.status, 200);
+    assert.equal(await ok.text(), 'hi');
+  } finally {
+    await capped.close();
+  }
+});
+
+// --- LD2-4: watch-event coalescing (the burst load test) ---
+
+test('LD2-4: a burst of writes is coalesced and never wedges the loop', async () => {
+  const res = await fetch(`${base}/watch?token=${TOKEN}`);
+  assert.equal(res.status, 200);
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  const events = [];
+  const collect = (async () => {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) return;
+      buffer += decoder.decode(value, { stream: true });
+      let m;
+      while ((m = buffer.match(/data: (.*)\n\n/))) {
+        events.push(JSON.parse(m[1]));
+        buffer = buffer.slice(m.index + m[0].length);
+      }
+    }
+  })();
+  void collect;
+
+  await new Promise((r) => setTimeout(r, 200)); // let fs.watch attach
+  // Burst: 25 rapid writes to the SAME path, all within one coalescing window.
+  for (let i = 0; i < 25; i++) {
+    writeFileSync(join(root, 'src', 'uncommitted.ts'), `export const x = ${i};\n`);
+  }
+  await new Promise((r) => setTimeout(r, 300)); // > the coalescing window
+
+  // The loop is alive — the server still answers (a per-event blocking subprocess
+  // would have wedged it).
+  assert.equal((await authed('/health')).status, 200);
+  // Coalesced: 25 writes to one path collapse to a handful of events, not 25.
+  const mine = events.filter((e) => e.path === '/src/uncommitted.ts');
+  assert.ok(mine.length >= 1, 'the change must still be delivered');
+  assert.ok(mine.length <= 5, `coalesced (got ${mine.length} events for 25 writes)`);
+  await reader.cancel();
+});
+
+// --- A3: machine-readable `dev --json` output ---
+
+test('A3: dev --json prints exactly one JSON line { url, endpoint, token, port }', async () => {
+  const proc = spawn(
+    process.execPath,
+    [CLI_ENTRY, 'dev', root, '--json', '--port', '0', '--origin', ORIGIN],
+    { stdio: ['ignore', 'pipe', 'ignore'] },
+  );
+  try {
+    const line = await new Promise((resolve, reject) => {
+      let out = '';
+      proc.stdout.on('data', (c) => {
+        out += c;
+        const nl = out.indexOf('\n');
+        if (nl !== -1) resolve(out.slice(0, nl));
+      });
+      proc.on('error', reject);
+      setTimeout(() => reject(new Error('no JSON line on stdout within 8s')), 8000);
+    });
+    const obj = JSON.parse(line); // must be valid JSON, not prose
+    assert.match(obj.url, /\/edit\/local\/[^/]+-[0-9a-f]{8}\//); // disambiguated namespace
+    assert.match(obj.endpoint, /^http:\/\/127\.0\.0\.1:\d+$/);
+    assert.equal(typeof obj.token, 'string');
+    assert.ok(obj.token.length > 0);
+    assert.equal(typeof obj.port, 'number');
+  } finally {
+    proc.kill('SIGINT');
+  }
 });
 
 test('unit: resolveSafe jails paths to the root', () => {
