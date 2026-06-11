@@ -20,14 +20,22 @@ import { join, resolve } from 'node:path';
 import { flagValue, type ParsedArgs } from '../args.js';
 import {
   buildIndex,
+  firstPartyStripWarnings,
   flattenAuthoring,
   parseBindingId,
   resolveLock,
   serializeIndex,
   serializeLock,
+  type BuildDefaultRef,
   type ReleaseAuthoring,
   type ReleaseLock,
 } from '../release.js';
+
+/** The host's build-default manifest for the §6.1b strip lint (region → repo scope
+ *  + first-party-only ceiling). Empty today: the registry's first-party-only set is
+ *  empty as of R3-33d, so the lint is vacuous until site-main exports this (or a
+ *  capability becomes first-party-only again). Wiring it from the host is a follow-on. */
+const HOST_BUILD_DEFAULTS: Record<string, BuildDefaultRef> = {};
 
 export const PIN_RELEASE_USAGE = `Usage: immediately-run pin-release [options]
 
@@ -120,6 +128,23 @@ export const runPinRelease = async (args: ParsedArgs): Promise<number> => {
     return 1;
   }
   const flattened = validateAuthoring(authoring);
+
+  // §5 step-3a lint (UI_RELEASES_SPEC §6.1b): warn (non-blocking) when a repoint
+  // will strip first-party-only caps at resolution. The host build-default manifest
+  // is empty today (the registry's first-party-only set is empty as of R3-33d), so
+  // this is vacuous until that manifest is exported from site-main / a cap is
+  // first-party-only again — but the lint runs in BOTH modes so the warning lands
+  // the moment it has something to say.
+  for (const w of firstPartyStripWarnings(
+    Object.fromEntries(flattened),
+    HOST_BUILD_DEFAULTS,
+  )) {
+    console.warn(
+      `pin-release lint: release "${w.release}" region "${w.region}" repoints ` +
+        `${w.fromRepo} → ${w.toRepo}; first-party-only caps will be STRIPPED at ` +
+        `resolution (§6.1b): ${w.strippedCaps.join(', ')}`,
+    );
+  }
 
   if (check) return runCheck(dir, authoring);
 

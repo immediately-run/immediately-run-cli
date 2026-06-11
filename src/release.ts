@@ -131,6 +131,68 @@ export const flattenAuthoring = (
   return { ...base.apps, ...authoring.apps };
 };
 
+// ── §5 step-3a publish-time lint (UI_RELEASES_SPEC §6.1b) ───────────────────
+//
+// Warn (never block) when a release entry repoints a region OFF its build-default
+// repo scope whose ceiling carries first-party-only capabilities — those caps are
+// STRIPPED at resolution (host §6.1b), so the region runs with reduced powers and
+// the author should know. The build-default repo + first-party-only ceiling live
+// in the host (`immediately-run-site-main`), so the CLI takes them as an injected
+// manifest. Empty manifest ⇒ no warnings — the shipped registry's first-party-only
+// set is empty as of R3-33d, so this is vacuous until a cap is first-party-only
+// again (or the host exports its manifest to the CLI). Pure + unit-tested.
+
+/** A region's build-default reference, for the strip lint. */
+export interface BuildDefaultRef {
+  /** Repo SCOPE (`provider:namespace/repository`) of the region's build default. */
+  repo: string;
+  /** The first-party-only capabilities in the region's build-default ceiling. */
+  firstPartyOnlyCaps: string[];
+}
+
+/** One lint warning: a repoint that will strip first-party-only caps at resolve. */
+export interface StripWarning {
+  release: string;
+  region: string;
+  strippedCaps: string[];
+  fromRepo: string;
+  toRepo: string;
+}
+
+/**
+ * The §6.1b strip warnings for a set of flattened releases (`release id → region →
+ * binding id`), given the host's build-default manifest. A warning fires when an
+ * entry repoints a region (different repo SCOPE) whose build-default ceiling has
+ * first-party-only caps. Pure.
+ */
+export const firstPartyStripWarnings = (
+  flattened: Record<string, Record<string, string>>,
+  buildDefaults: Record<string, BuildDefaultRef>,
+): StripWarning[] => {
+  const warnings: StripWarning[] = [];
+  for (const [release, regions] of Object.entries(flattened)) {
+    for (const [region, id] of Object.entries(regions)) {
+      const def = buildDefaults[region];
+      if (!def || def.firstPartyOnlyCaps.length === 0) continue;
+      let toRepo: string;
+      try {
+        toRepo = appKey(parseBindingId(id));
+      } catch {
+        continue; // unparseable ids are caught by the structural validator
+      }
+      if (toRepo === def.repo) continue; // same repo scope → not a repoint, no strip
+      warnings.push({
+        release,
+        region,
+        strippedCaps: [...def.firstPartyOnlyCaps],
+        fromRepo: def.repo,
+        toRepo,
+      });
+    }
+  }
+  return warnings;
+};
+
 /** Resolve a single mutable ref to an immutable commit via `git ls-remote`. */
 export const resolveRemoteCommit = (binding: BindingId): string => {
   if (binding.commit) return binding.commit.toLowerCase();
