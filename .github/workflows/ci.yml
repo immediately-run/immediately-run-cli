@@ -1,0 +1,55 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+jobs:
+  build-test-publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # for pushing the release tag
+      id-token: write   # for npm trusted publishing (OIDC)
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+          package-manager-cache: false  # never use caching in release builds
+      # Trusted publishing requires npm >= 11.5.1
+      - run: npm install -g npm@latest
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+
+      # Tag the release (guarded): a tag only when v<version> doesn't already exist.
+      - name: Tag the release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          TAG="v$VERSION"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::notice::tag ${TAG} already exists — skipping."
+          else
+            git tag -a "${TAG}" -m "@immediately-run/cli ${VERSION}"
+            git push origin "refs/tags/${TAG}"
+          fi
+
+      - name: Publish to npm via trusted publishing (skip if version already published)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          # setup-node's registry-url writes an .npmrc that binds npm to NODE_AUTH_TOKEN.
+          # Clearing it forces npm to use OIDC trusted publishing instead of (empty) token
+          # auth, which otherwise fails with ENEEDAUTH.
+          NODE_AUTH_TOKEN: ""
+        run: |
+          PKG_NAME=$(node -p "require('./package.json').name")
+          PKG_VER=$(node -p "require('./package.json').version")
+          if npm view "$PKG_NAME@$PKG_VER" version >/dev/null 2>&1; then
+            echo "::notice::$PKG_NAME@$PKG_VER already published — skipping."
+            exit 0
+          fi
+          npm publish --access public
