@@ -61,3 +61,34 @@ API.
 
 Requires the `git` and `zip` binaries on `PATH` (both present on GitHub-hosted
 runners).
+
+## `preauth`
+
+Apply an **M1 pre-authorization policy** to an app from the terminal (operator /
+CI), so a later headless / `immediately-run dev` / CI run boots with **no consent
+prompt** (UI_AS_APPS_SPEC §8.15 M1 / §8.9). It is a thin token-authenticated HTTP
+client of the backend `POST /api/v1/preauth` executor, which runs the **same**
+§8.9 target check + grant-mint path the in-browser surface uses — the CLI holds no
+credentials and no grant logic of its own.
+
+```bash
+# pre-grant net:fetch + a host for an app, for the signed-in user behind <idToken>
+npx @immediately-run/cli preauth github__acme__headless-runner \
+  --capabilities net:fetch \
+  --net-fetch https://api.example.com \
+  --token "$IMMEDIATELY_RUN_ID_TOKEN"
+
+# or drive it from a policy file: { appKey?, capabilities[], mounts?, netFetchHosts? }
+npx @immediately-run/cli preauth github__acme__headless-runner --policy preauth.json
+```
+
+The ID token may be passed with `--token` or the `IMMEDIATELY_RUN_ID_TOKEN`
+environment variable. The endpoint is `https://immediately.run` by default
+(`--origin` to override; non-immediately.run/loopback/preview origins need
+`--origin-unsafe`).
+
+**Security:** an over-broad (broad-elevated) or unknown capability makes the
+backend refuse the **whole** policy (HTTP 422) and mint **nothing** — the command
+prints each `{capability, reason}` and **exits non-zero**, so a CI step fails on a
+bad policy. Exit codes: `0` applied · `1` refused / mint failed · `2` usage/auth
+error · `3` rate-limited / server / network.
