@@ -23,6 +23,7 @@ import {
   type RepoManifest,
 } from '../manifest.js';
 import { DEFAULT_CDN_ROOT, fetchLockset, type DepMap } from '../lockset.js';
+import { emitArtifacts, type ArtifactEmission } from '../artifacts.js';
 import {
   COMMIT_HASH_RE,
   currentBranch,
@@ -53,6 +54,7 @@ Options:
   --default-branch <name>   Repository default branch
   --out <path>              Output zip path
                             (default: <repo>/public/cached_repositories/<owner>/<repo>/<ref>.zip)
+  --no-artifacts            Skip emitting pre-transpiled artifacts (source-only zip)
   --no-lockset              Skip embedding the resolved-dependency lockset
   --cdn-root <url>          Module CDN root for lockset resolution
                             (default: ${DEFAULT_CDN_ROOT})
@@ -65,6 +67,10 @@ export interface CacheZipOptions {
   ref?: string;
   defaultBranch?: string;
   out?: string;
+  // Pre-transpiled artifact emission (PRETRANSPILED_ARTIFACTS_SPEC §7 step 1). On
+  // by default; per-file transform failures are non-fatal (omit + warn), and the
+  // runtime falls back to live transpile for anything absent.
+  artifacts?: boolean;
   // Lockset embedding (PRETRANSPILED_ARTIFACTS_SPEC §7 step 2). On by default;
   // any failure to produce one is non-fatal — the zip ships without it and the
   // runtime resolves dependencies live, exactly as before.
@@ -80,6 +86,9 @@ export interface CacheZipResult {
   refKind: RepoManifest['refKind'];
   commitSha: string;
   entryCount: number;
+  // Human-readable artifact outcome for the summary line: "<n> files (<k> skipped),
+  // <bytes>" or "omitted (--no-artifacts)".
+  artifactsSummary: string;
   // Human-readable lockset outcome for the summary line: "<n> packages" or
   // "omitted (<reason>)".
   locksetSummary: string;
@@ -202,17 +211,40 @@ export const buildCacheZip = async (opts: CacheZipOptions): Promise<CacheZipResu
     : resolve(repo, 'public', 'cached_repositories', owner, repository, `${ref}.zip`);
   mkdirSync(dirname(outputPath), { recursive: true });
 
-  // 1) git archive: a ZIP whose contents are exactly the tracked tree at HEAD.
-  rmSync(outputPath, { force: true });
-  execFileSync('git', ['-C', repo, 'archive', '--format=zip', '-o', outputPath, 'HEAD']);
+  // 2) Pre-transpiled artifacts (PRETRANSPILED_ARTIFACTS_SPEC §7 step 1) — on by
+  //    default, opt out with --no-artifacts. Per-file failures are already
+  //    omitted-with-warning inside emitArtifacts; the whole step never fails the
+  //    build (the runtime falls back to live transpile for anything absent).
+  let artifactsSummary = 'omitted (--no-artifacts)';
+  let emission: ArtifactEmission | undefined;
+  if (opts.artifacts !== false) {
+    emission = await emitArtifacts(repo, entries);
+    const skip = emission.skipped.length ? ` (${emission.skipped.length} skipped)` : '';
+    artifactsSummary = `${emission.transpiledCount} files${skip}, ${formatBytes(
+      emission.sourceBytes,
+    )} → ${formatBytes(emission.artifactBytes)}`;
+  }
 
-  // 2) Append the manifest sidecar at .tinkerable/contribute-manifest.json.
+  // 3) Append the sidecar (+ artifacts) under .tinkerable/ in one zip call, with
+  //    paths passed sorted so the appended set is reproducible run-to-run.
   const staging = mkdtempSync(join(tmpdir(), 'cache-zip-'));
   try {
-    const sidecarPath = join(staging, MANIFEST_SIDECAR_ENTRY);
-    mkdirSync(dirname(sidecarPath), { recursive: true });
-    writeFileSync(sidecarPath, JSON.stringify(manifest, null, 2));
-    execFileSync('zip', ['-q', '-X', outputPath, MANIFEST_SIDECAR_ENTRY], { cwd: staging });
+    const stagedPaths: string[] = [];
+    const stage = (relPath: string, content: string) => {
+      const full = join(staging, relPath);
+      mkdirSync(dirname(full), { recursive: true });
+      writeFileSync(full, content);
+      stagedPaths.push(relPath);
+    };
+    stage(MANIFEST_SIDECAR_ENTRY, JSON.stringify(manifest, null, 2));
+    if (emission) {
+      stage('.tinkerable/artifacts/index.json', JSON.stringify(emission.index, null, 2));
+      for (const [out, content] of emission.files) {
+        stage(`.tinkerable/artifacts/${out}`, content);
+      }
+    }
+    stagedPaths.sort();
+    execFileSync('zip', ['-q', '-X', outputPath, ...stagedPaths], { cwd: staging });
   } finally {
     rmSync(staging, { recursive: true, force: true });
   }
@@ -225,9 +257,13 @@ export const buildCacheZip = async (opts: CacheZipOptions): Promise<CacheZipResu
     refKind: manifest.refKind,
     commitSha,
     entryCount: entries.length,
+    artifactsSummary,
     locksetSummary,
   };
 };
+
+const formatBytes = (n: number): string =>
+  n < 1024 ? `${n} B` : `${(n / 1024).toFixed(1)} KB`;
 
 export const runCacheZip = async (args: ParsedArgs): Promise<number> => {
   if (args.flags.help || args.flags.h) {
@@ -241,6 +277,7 @@ export const runCacheZip = async (args: ParsedArgs): Promise<number> => {
     ref: flagValue(args.flags, 'ref'),
     defaultBranch: flagValue(args.flags, 'default-branch'),
     out: flagValue(args.flags, 'out'),
+    artifacts: args.flags['no-artifacts'] ? false : undefined,
     lockset: args.flags['no-lockset'] ? false : undefined,
     cdnRoot: flagValue(args.flags, 'cdn-root'),
   });
@@ -249,6 +286,7 @@ export const runCacheZip = async (args: ParsedArgs): Promise<number> => {
   console.log(`  ref:           ${result.ref} (${result.refKind})`);
   console.log(`  commit:        ${result.commitSha}`);
   console.log(`  tracked files: ${result.entryCount}`);
+  console.log(`  artifacts:     ${result.artifactsSummary}`);
   console.log(`  lockset:       ${result.locksetSummary}`);
   return 0;
 };
