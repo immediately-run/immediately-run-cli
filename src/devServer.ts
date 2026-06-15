@@ -31,6 +31,7 @@
  */
 
 import * as http from 'node:http';
+import { Readable } from 'node:stream';
 import { watch as fsWatch, statSync, createReadStream, readdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import * as path from 'node:path';
@@ -43,6 +44,13 @@ import {
   stripRemoteCredentials,
 } from './git.js';
 import type { AgentBridge } from './bridge.js';
+import {
+  type LlmUpstream,
+  resolveUpstreamTarget,
+  buildUpstreamHeaders,
+  DEFAULT_LLM_BODY_BYTES,
+  LLM_ROUTE_PREFIX,
+} from './llmProxy.js';
 
 export interface DevServerOptions {
   root: string; // absolute project root
@@ -61,6 +69,15 @@ export interface DevServerOptions {
    * stays GET-only and read-only exactly as before.
    */
   bridge?: AgentBridge;
+  /**
+   * R3-77 / P3-75. When present, the server exposes the authenticated
+   * `POST /llm/...` proxy route behind the *same* T25 guard chain, forwarding to
+   * the SINGLE configured upstream (`llm.baseUrl`) with the user's key injected
+   * server-side. Not an open relay — the target is pinned to that origin
+   * (`resolveUpstreamTarget`). Reuses this server scaffold; it does not stand up
+   * a second one. Absent means `/llm` does not exist and POST stays refused.
+   */
+  llm?: LlmUpstream;
 }
 
 /** `/agent/result` + `/agent/catalog` body cap — bridge payloads are small JSON;
@@ -287,6 +304,28 @@ const readJsonBody = (
     req.on('error', () => resolve({ ok: false, status: 400, error: 'request stream error' }));
   });
 
+// Read a capped RAW request body (bytes, not parsed) for the `/llm` proxy — the
+// body is forwarded verbatim to the upstream, so it must not be re-serialized.
+const readRawBody = (
+  req: http.IncomingMessage,
+  cap: number,
+): Promise<{ ok: true; value: Buffer } | { ok: false; status: number; error: string }> =>
+  new Promise((resolve) => {
+    let size = 0;
+    const chunks: Buffer[] = [];
+    req.on('data', (c: Buffer) => {
+      size += c.length;
+      if (size > cap) {
+        resolve({ ok: false, status: 413, error: `body exceeds the ${cap}-byte cap` });
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on('end', () => resolve({ ok: true, value: Buffer.concat(chunks) }));
+    req.on('error', () => resolve({ ok: false, status: 400, error: 'request stream error' }));
+  });
+
 // --- server -------------------------------------------------------------------
 
 export const startDevServer = (opts: DevServerOptions): Promise<DevServerHandle> => {
@@ -320,11 +359,12 @@ export const startDevServer = (opts: DevServerOptions): Promise<DevServerHandle>
     // for public→private fetches; answer both in one response. The bridge POSTs
     // (R3-76) send a JSON body, so advertise POST + Content-Type only when the
     // bridge is enabled — a read-only server stays strictly GET-only.
+    const authedPost = !!opts.bridge || !!opts.llm; // any POST-accepting feature on?
     if (req.method === 'OPTIONS') {
       res.writeHead(204, {
         ...cors,
-        'Access-Control-Allow-Methods': opts.bridge ? 'GET, POST, OPTIONS' : 'GET, OPTIONS',
-        'Access-Control-Allow-Headers': opts.bridge ? 'Authorization, Content-Type' : 'Authorization',
+        'Access-Control-Allow-Methods': authedPost ? 'GET, POST, OPTIONS' : 'GET, OPTIONS',
+        'Access-Control-Allow-Headers': authedPost ? 'Authorization, Content-Type' : 'Authorization',
         'Access-Control-Allow-Private-Network': 'true',
         'Access-Control-Max-Age': CORS_MAX_AGE,
       });
@@ -332,13 +372,17 @@ export const startDevServer = (opts: DevServerOptions): Promise<DevServerHandle>
       return;
     }
 
-    // POST is admitted only for the authenticated bridge routes, and only when
-    // the bridge is enabled. Everything else stays GET-only (read-only stance).
+    // POST is admitted only for the authenticated bridge / llm routes, and only
+    // when that feature is enabled. Everything else stays GET-only (read-only).
     const isBridgePost =
       req.method === 'POST' &&
       !!opts.bridge &&
       (url.pathname === '/agent/result' || url.pathname === '/agent/catalog');
-    if (req.method !== 'GET' && !isBridgePost) {
+    const isLlmPost =
+      req.method === 'POST' &&
+      !!opts.llm &&
+      (url.pathname === LLM_ROUTE_PREFIX || url.pathname.startsWith(LLM_ROUTE_PREFIX + '/'));
+    if (req.method !== 'GET' && !isBridgePost && !isLlmPost) {
       sendJson(res, 405, { error: 'method not allowed' }, cors);
       return;
     }
@@ -393,6 +437,56 @@ export const startDevServer = (opts: DevServerOptions): Promise<DevServerHandle>
         }
         bridge.setCatalog(entries as Parameters<AgentBridge['setCatalog']>[0]);
         sendJson(res, 200, { ok: true, count: entries.length }, cors);
+      });
+      return;
+    }
+
+    // R3-77 `/llm` proxy (LLM_AND_AGENTS_SPEC §2.4, D3). Sits BEHIND the same
+    // Host → Origin → token guard as the bridge (so only the kernel connects).
+    // Pins the target to the configured upstream (not an open relay), injects the
+    // user's key server-side, and streams the response back. The key is never
+    // read from, nor echoed to, the caller.
+    if (isLlmPost && opts.llm) {
+      const llm = opts.llm;
+      const target = resolveUpstreamTarget(llm.baseUrl, url.pathname, url.search);
+      if (!target.ok) {
+        sendJson(res, 403, { error: target.reason }, cors);
+        return;
+      }
+      const cap = llm.maxBodyBytes ?? DEFAULT_LLM_BODY_BYTES;
+      void readRawBody(req, cap).then(async (parsed) => {
+        if (!parsed.ok) {
+          sendJson(res, parsed.status, { error: parsed.error }, cors);
+          return;
+        }
+        const headers = buildUpstreamHeaders(req.headers, llm);
+        const doFetch = llm.fetchImpl ?? fetch;
+        let upstream: Response;
+        try {
+          upstream = await doFetch(target.url, {
+            method: 'POST',
+            headers,
+            body: parsed.value.length > 0 ? parsed.value : undefined,
+            // Never chase a redirect to another origin with the key attached —
+            // hand the 3xx back instead (keeps the pin; mirrors the bridge stance).
+            redirect: 'manual',
+          });
+        } catch {
+          sendJson(res, 502, { error: 'upstream unreachable' }, cors);
+          return;
+        }
+        // Stream the upstream response straight back. Pass the content-type
+        // through (SSE token streams included); strip nothing INTO the caller
+        // except the upstream's own bytes — the injected auth was request-only.
+        const out: Record<string, string> = { ...cors };
+        const ct = upstream.headers.get('content-type');
+        if (ct) out['Content-Type'] = ct;
+        res.writeHead(upstream.status, out);
+        if (upstream.body) {
+          Readable.fromWeb(upstream.body as Parameters<typeof Readable.fromWeb>[0]).pipe(res);
+        } else {
+          res.end();
+        }
       });
       return;
     }
