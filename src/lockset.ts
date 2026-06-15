@@ -11,16 +11,19 @@
  */
 
 import { decode as decodeMsgPack } from '@msgpack/msgpack';
+import { computeInputDepMap, type DepMap } from '@immediately-run/transpiler';
+
+// `computeInputDepMap` is the single source of truth in @immediately-run/transpiler
+// (PRETRANSPILED_ARTIFACTS_SPEC §4.4) — re-export it so the runtime's input DepMap
+// derivation (react-preset augment → filter build deps → strip self-hosted → sort)
+// lives in exactly one place, shared with the sandbox bundler.
+export { computeInputDepMap, type DepMap };
 
 // Mirrors sandbox/src/bundler/module-registry/module-cdn.ts (CDN_ROOT,
 // CDN_VERSION). Drift is safe — the runtime checks `cdnVersion` and falls back
-// to live resolution on mismatch — but wasteful; keep in sync. Phase 03 of the
-// plan moves this into the shared @immediately-run/transpiler package.
+// to live resolution on mismatch — but wasteful; keep in sync.
 export const DEFAULT_CDN_ROOT = 'https://sandpack-cdn-staging.blazingly.io/';
 export const LOCKSET_CDN_VERSION = 5;
-
-// dependency name => version range, same shape the runtime uses.
-export type DepMap = Record<string, string>;
 
 // One entry of the CDN's resolved flat dependency list: name / exact version /
 // depth. Field names are the CDN wire format, embedded verbatim.
@@ -40,77 +43,6 @@ export interface LocksetSection {
   // Verbatim /dep_tree response.
   resolved: ResolvedDependency[];
 }
-
-// --- input DepMap derivation -------------------------------------------------
-// Replicates the runtime's `loadNodeModules` derivation for the react preset
-// (the v1 default): ReactPreset.augmentDependencies, then filterBuildDeps,
-// then key-sort. Ported from:
-//   sandbox/src/bundler/presets/react/ReactPreset.ts
-//   sandbox/src/bundler/module-registry/build-dep.ts
-// Divergence (e.g. a repo running the solid preset, or a runtime-side change
-// to these lists) makes the runtime's echo comparison fail → live resolution,
-// never a wrong lockset.
-
-const BUILD_DEPS = new Set(['parcel', 'parcel-bundler', 'vite', '@babel/core', 'react-scripts']);
-const BUILD_DEP_REGEXES = [
-  /babel-plugin.*/,
-  /@babel\/plugin.*/,
-  /babel-preset.*/,
-  /@babel\/preset.*/,
-  /.*parcel-plugin.*/,
-];
-
-const isBuildDep = (name: string): boolean =>
-  BUILD_DEPS.has(name) || BUILD_DEP_REGEXES.some((re) => re.test(name));
-
-const augmentReactDependencies = (dependencies: DepMap): DepMap => {
-  const augmented: DepMap = { ...dependencies };
-  if (!augmented['react-refresh']) {
-    augmented['react-refresh'] = '^0.11.0';
-  }
-  augmented['core-js'] = '3.22.7';
-  augmented['react-error-boundary'] = '^6.1.0';
-  return augmented;
-};
-
-const sortDepMap = (deps: DepMap): DepMap =>
-  Object.fromEntries(Object.entries(deps).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
-
-// Modules the runtime ALWAYS resolves from a self-hosted versioned origin, not
-// the sandpack CDN (sandbox `SELF_HOST_BASES`). Resolution is implicit, so these
-// are stripped from the lockset's `/dep_tree/` input unconditionally — keep in
-// sync with the sandbox. (`@immediately-run/sdk` is fetched from gh-pages
-// `/v/<version>/`.)
-const SELF_HOSTED_MODULES = ['@immediately-run/sdk'];
-
-/**
- * Modules the runtime resolves from a self-hosted origin (not the sandpack CDN)
- * are stripped from the dep map *before* the `/dep_tree/` query. This makes the
- * lockset robust to npm→CDN replication lag for those modules (notably
- * `@immediately-run/sdk`): a freshly published version that has not yet
- * replicated would otherwise 500 the whole request. Stripping mirrors the
- * runtime's `loadNodeModules`, so the runtime's echo comparison still matches.
- *
- * `SELF_HOSTED_MODULES` are always stripped (implicit resolution); the
- * `registryResolved` param adds any extra names (e.g. a legacy opt-in field) and
- * defaults to none.
- */
-export const computeInputDepMap = (
-  pkgDependencies: DepMap,
-  registryResolved: readonly string[] = [],
-): DepMap => {
-  const skip = new Set([...SELF_HOSTED_MODULES, ...registryResolved]);
-  const selfHosted: DepMap = {};
-  for (const [name, range] of Object.entries(pkgDependencies)) {
-    if (!skip.has(name)) selfHosted[name] = range;
-  }
-  const augmented = augmentReactDependencies(selfHosted);
-  const filtered: DepMap = {};
-  for (const [name, range] of Object.entries(augmented)) {
-    if (!isBuildDep(name) && !skip.has(name)) filtered[name] = range;
-  }
-  return sortDepMap(filtered);
-};
 
 // --- CDN request -------------------------------------------------------------
 
