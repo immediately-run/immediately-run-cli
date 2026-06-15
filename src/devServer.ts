@@ -9,7 +9,17 @@
  *   GET  /watch         → SSE stream of { eventType, path }
  *   OPTIONS *           → CORS + Private Network Access preflight
  *
- * Read-only by construction: no write route exists. Security (spec §8): binds
+ * With an {@link DevServerOptions.bridge} attached (R3-76 /
+ * LOCAL_DEV_AUTHED_SERVER_SPEC §2.1) the server additionally exposes the
+ * authenticated agent-bridge endpoints — all behind the SAME guard chain:
+ *
+ *   GET  /agent/pending → SSE stream of { callId, tool, params } (host pulls)
+ *   POST /agent/result  → { callId, result | error }            (host posts)
+ *   POST /agent/catalog → grant-filtered catalog the host publishes
+ *
+ * Read-only by construction unless the bridge is attached (then only the three
+ * routes above accept POST/SSE, never a relaxation of the guards). Security
+ * (spec §8 / LOCAL_DEV_AUTHED_SERVER_SPEC §4): binds
  * 127.0.0.1 only, requires a per-session bearer token on every request
  * (`Authorization: Bearer …`, or `?token=` for EventSource, which cannot send
  * headers), enforces an Origin allowlist when the request carries an Origin
@@ -32,6 +42,7 @@ import {
   isGitRepo,
   stripRemoteCredentials,
 } from './git.js';
+import type { AgentBridge } from './bridge.js';
 
 export interface DevServerOptions {
   root: string; // absolute project root
@@ -42,7 +53,19 @@ export interface DevServerOptions {
   maxTreeEntries?: number;
   /** LD2-5 single-blob cap override (default {@link MAX_BLOB_BYTES}); tests lower it. */
   maxBlobBytes?: number;
+  /**
+   * R3-76 / LOCAL_DEV_AUTHED_SERVER_SPEC §2.1. When present, the server exposes
+   * the authenticated agent-bridge endpoints (`GET /agent/pending` SSE,
+   * `POST /agent/result`, `POST /agent/catalog`) behind the *same* T25 hardening
+   * — additive, not a relaxation of the read-only stance. Absent ⇒ the server
+   * stays GET-only and read-only exactly as before.
+   */
+  bridge?: AgentBridge;
 }
+
+/** `/agent/result` + `/agent/catalog` body cap — bridge payloads are small JSON;
+ *  a stated bound must exist at this trust boundary (cf. LD2-5). */
+export const MAX_BRIDGE_BODY_BYTES = 4 * 1024 * 1024;
 
 export interface DevServerHandle {
   server: http.Server;
@@ -234,6 +257,36 @@ const sendJson = (
   res.end(JSON.stringify(body));
 };
 
+// Read a capped JSON request body for the authenticated bridge POSTs. Rejects
+// (resolves to a typed error) past the byte cap so a hostile body can't grow
+// memory unbounded; the Host/Origin/token guard has already run.
+const readJsonBody = (
+  req: http.IncomingMessage,
+  cap: number,
+): Promise<{ ok: true; value: unknown } | { ok: false; status: number; error: string }> =>
+  new Promise((resolve) => {
+    let size = 0;
+    const chunks: Buffer[] = [];
+    req.on('data', (c: Buffer) => {
+      size += c.length;
+      if (size > cap) {
+        resolve({ ok: false, status: 413, error: `body exceeds the ${cap}-byte cap` });
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on('end', () => {
+      if (chunks.length === 0) return resolve({ ok: true, value: undefined });
+      try {
+        resolve({ ok: true, value: JSON.parse(Buffer.concat(chunks).toString('utf8')) });
+      } catch {
+        resolve({ ok: false, status: 400, error: 'invalid JSON body' });
+      }
+    });
+    req.on('error', () => resolve({ ok: false, status: 400, error: 'request stream error' }));
+  });
+
 // --- server -------------------------------------------------------------------
 
 export const startDevServer = (opts: DevServerOptions): Promise<DevServerHandle> => {
@@ -264,12 +317,14 @@ export const startDevServer = (opts: DevServerOptions): Promise<DevServerHandle>
 
     // CORS + Private Network Access preflight (spec §8). Chrome preflights the
     // Authorization-carrying GETs and adds Access-Control-Request-Private-Network
-    // for public→private fetches; answer both in one response.
+    // for public→private fetches; answer both in one response. The bridge POSTs
+    // (R3-76) send a JSON body, so advertise POST + Content-Type only when the
+    // bridge is enabled — a read-only server stays strictly GET-only.
     if (req.method === 'OPTIONS') {
       res.writeHead(204, {
         ...cors,
-        'Access-Control-Allow-Methods': 'GET, OPTIONS',
-        'Access-Control-Allow-Headers': 'Authorization',
+        'Access-Control-Allow-Methods': opts.bridge ? 'GET, POST, OPTIONS' : 'GET, OPTIONS',
+        'Access-Control-Allow-Headers': opts.bridge ? 'Authorization, Content-Type' : 'Authorization',
         'Access-Control-Allow-Private-Network': 'true',
         'Access-Control-Max-Age': CORS_MAX_AGE,
       });
@@ -277,7 +332,13 @@ export const startDevServer = (opts: DevServerOptions): Promise<DevServerHandle>
       return;
     }
 
-    if (req.method !== 'GET') {
+    // POST is admitted only for the authenticated bridge routes, and only when
+    // the bridge is enabled. Everything else stays GET-only (read-only stance).
+    const isBridgePost =
+      req.method === 'POST' &&
+      !!opts.bridge &&
+      (url.pathname === '/agent/result' || url.pathname === '/agent/catalog');
+    if (req.method !== 'GET' && !isBridgePost) {
       sendJson(res, 405, { error: 'method not allowed' }, cors);
       return;
     }
@@ -289,6 +350,50 @@ export const startDevServer = (opts: DevServerOptions): Promise<DevServerHandle>
       bearer === `Bearer ${opts.token}` || url.searchParams.get('token') === opts.token;
     if (!tokenOk) {
       sendJson(res, 403, { error: 'missing or invalid token' }, cors);
+      return;
+    }
+
+    // R3-76 authenticated bridge POSTs (LOCAL_DEV_AUTHED_SERVER_SPEC §2.1). These
+    // sit BEHIND the Host → Origin → token guard above (so only the kernel
+    // connects; a drive-by/opaque-origin `Origin: null` is already refused) and
+    // relay to the in-memory bridge — additive, never a relaxation.
+    if (isBridgePost && opts.bridge) {
+      const bridge = opts.bridge;
+      void readJsonBody(req, MAX_BRIDGE_BODY_BYTES).then((parsed) => {
+        if (!parsed.ok) {
+          sendJson(res, parsed.status, { error: parsed.error }, cors);
+          return;
+        }
+        if (url.pathname === '/agent/result') {
+          // The browser host posts the gated invoke() outcome for a callId.
+          const body = (parsed.value ?? {}) as { callId?: unknown; result?: unknown; error?: unknown };
+          const payload =
+            body.error !== undefined
+              ? { error: body.error as { code: string; message: string } }
+              : { result: body.result };
+          const matched = bridge.resolveCall(body.callId, payload);
+          if (!matched) {
+            sendJson(res, 404, { error: 'unknown or expired callId' }, cors);
+            return;
+          }
+          sendJson(res, 200, { ok: true }, cors);
+          return;
+        }
+        // /agent/catalog — the host publishes its grant-filtered catalog; accept
+        // either a bare array or { catalog: [...] }.
+        const v = parsed.value as unknown;
+        const entries = Array.isArray(v)
+          ? v
+          : Array.isArray((v as { catalog?: unknown })?.catalog)
+            ? (v as { catalog: unknown[] }).catalog
+            : undefined;
+        if (!entries) {
+          sendJson(res, 400, { error: 'expected a catalog array' }, cors);
+          return;
+        }
+        bridge.setCatalog(entries as Parameters<AgentBridge['setCatalog']>[0]);
+        sendJson(res, 200, { ok: true, count: entries.length }, cors);
+      });
       return;
     }
 
@@ -369,6 +474,31 @@ export const startDevServer = (opts: DevServerOptions): Promise<DevServerHandle>
             try { meta.defaultBranch = defaultBranchOf(root, 'main'); } catch { /* best effort */ }
           }
           sendJson(res, 200, meta, cors);
+          return;
+        }
+        case '/agent/pending': {
+          // R3-76: the browser host kernel connects OUT here and pulls queued
+          // tool calls as SSE. Token + Host + Origin already checked above, so
+          // only the kernel reaches this stream. 404 unless the bridge is on.
+          if (!opts.bridge) {
+            sendJson(res, 404, { error: 'not found' }, cors);
+            return;
+          }
+          res.writeHead(200, {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            Connection: 'keep-alive',
+            ...cors,
+          });
+          res.write('retry: 1000\n\n');
+          const unsubscribe = opts.bridge.subscribe((call) => {
+            res.write(`data: ${JSON.stringify(call)}\n\n`);
+          });
+          const heartbeat = setInterval(() => res.write(': hb\n\n'), 30000);
+          req.on('close', () => {
+            clearInterval(heartbeat);
+            unsubscribe();
+          });
           return;
         }
         case '/watch': {
