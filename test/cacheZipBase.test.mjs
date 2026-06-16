@@ -1,5 +1,5 @@
 // Regression test for the cache-zip git-archive base (the bug the G2-3 artifacts
-// refactor introduced: the zip carried only the .tinkerable/ sidecar, none of the
+// refactor introduced: the zip carried only the .immediately.run/ sidecar, none of the
 // tracked repo files, so every blob failed the host's verifyZipBlobs). Runs against
 // the compiled dist/ (`npm test` builds first). Uses node:test.
 import { test } from 'node:test';
@@ -56,7 +56,7 @@ test('cache-zip includes the tracked tree at HEAD (git archive base), not just t
     assert.ok(names.includes('index.tsx'), 'index.tsx present');
     assert.ok(names.includes('src/App.tsx'), 'src/App.tsx present');
     assert.ok(names.includes('package.json'), 'package.json present');
-    assert.ok(names.includes('.tinkerable/contribute-manifest.json'), 'sidecar present');
+    assert.ok(names.includes('.immediately.run/contribute-manifest.json'), 'sidecar present');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -76,7 +76,7 @@ test("every sidecar blob entry's bytes are in the zip and hash-match (verifyZipB
       lockset: false,
     });
     const sidecar = JSON.parse(
-      execFileSync('unzip', ['-p', outputPath, '.tinkerable/contribute-manifest.json'], { encoding: 'utf8' }),
+      execFileSync('unzip', ['-p', outputPath, '.immediately.run/contribute-manifest.json'], { encoding: 'utf8' }),
     );
     const blobs = sidecar.entries.filter((e) => e.type === 'blob');
     assert.ok(blobs.length >= 3);

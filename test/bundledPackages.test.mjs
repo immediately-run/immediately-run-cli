@@ -120,13 +120,13 @@ test('--bundle-packages bundles the closure content + an index into the zip', as
     const result = await buildCacheZip(zipOpts(root, { bundlePackages: true }));
     assert.match(result.bundledPackagesSummary, /^2 packages, /);
     const names = entryNames(result.outputPath);
-    assert.ok(names.includes('.tinkerable/packages/index.json'));
+    assert.ok(names.includes('.immediately.run/packages/index.json'));
     for (const { n, v } of RESOLVED) {
-      assert.ok(names.includes(`.tinkerable/packages/${bundledPackageFilename(n, v)}.msgpack`));
+      assert.ok(names.includes(`.immediately.run/packages/${bundledPackageFilename(n, v)}.msgpack`));
     }
     // Index keys the entries by the CDN key + the in-zip path.
     const index = JSON.parse(
-      execFileSync('unzip', ['-p', result.outputPath, '.tinkerable/packages/index.json'], {
+      execFileSync('unzip', ['-p', result.outputPath, '.immediately.run/packages/index.json'], {
         encoding: 'utf8',
       }),
     );
@@ -144,7 +144,7 @@ test('without --bundle-packages no packages are bundled (default off)', async ()
   try {
     const result = await buildCacheZip(zipOpts(root));
     assert.equal(result.bundledPackagesSummary, 'omitted (not requested)');
-    assert.ok(!entryNames(result.outputPath).some((n) => n.startsWith('.tinkerable/packages/')));
+    assert.ok(!entryNames(result.outputPath).some((n) => n.startsWith('.immediately.run/packages/')));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

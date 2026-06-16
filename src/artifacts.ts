@@ -4,7 +4,7 @@
  *
  * After the archive + sidecar, transpile every covered tracked source through
  * @immediately-run/transpiler — the SAME code the sandbox babel-worker runs live
- * — and embed the outputs under `.tinkerable/artifacts/` with an index. A clean
+ * — and embed the outputs under `.immediately.run/artifacts/` with an index. A clean
  * cached boot can then seed `/transpiled` from these instead of running babel
  * (§5.1). Byte-identity with the live transpile is what makes that safe (§4.4);
  * it holds because this is literally the same package, exercised over the same
@@ -42,7 +42,7 @@ const APP_ROOT = '/app';
 export interface ArtifactIndexFileEntry {
   /** git blob SHA — must equal the manifest entry's `sha` (§4.2). */
   srcSha: string;
-  /** Output path relative to `.tinkerable/artifacts/` (`transpiled/<path>.js`). */
+  /** Output path relative to `.immediately.run/artifacts/` (`transpiled/<path>.js`). */
   out: string;
   /** Raw dependency specifiers, as the chain reports them. */
   deps: string[];
@@ -61,7 +61,7 @@ export interface ArtifactIndex {
 
 export interface ArtifactEmission {
   index: ArtifactIndex;
-  /** Output files keyed by path relative to `.tinkerable/artifacts/`. */
+  /** Output files keyed by path relative to `.immediately.run/artifacts/`. */
   files: Map<string, string>;
   transpiledCount: number;
   skipped: { path: string; reason: string }[];
@@ -70,10 +70,10 @@ export interface ArtifactEmission {
 }
 
 // `node_modules/` is never covered (the runtime transpiles it live & compact),
-// and `.tinkerable/` is our own infrastructure — exclude both, mirroring §7.
+// and `.immediately.run/` is our own infrastructure — exclude both, mirroring §7.
 const isExcluded = (relPath: string): boolean =>
-  relPath === '.tinkerable' ||
-  relPath.startsWith('.tinkerable/') ||
+  relPath === '.immediately.run' ||
+  relPath.startsWith('.immediately.run/') ||
   relPath.split('/').includes('node_modules');
 
 // Exact blob bytes (NOT the trimmed `git()` helper): the runtime transpiles the
