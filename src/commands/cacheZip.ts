@@ -254,6 +254,16 @@ export const buildCacheZip = async (opts: CacheZipOptions): Promise<CacheZipResu
     : resolve(repo, 'public', 'cached_repositories', owner, repository, `${ref}.zip`);
   mkdirSync(dirname(outputPath), { recursive: true });
 
+  // 1) git archive: a ZIP whose contents are exactly the tracked tree at HEAD. The
+  //    .tinkerable/ sidecar (+ artifacts/packages) is appended onto THIS base below.
+  //    Without it the zip carries only the sidecar and every tracked blob fails the
+  //    host's verifyZipBlobs (REPO_LIFECYCLE_SPEC §3.4) → the zip is rejected and the
+  //    runtime falls back to the REST loader. (This step was dropped in the G2-3
+  //    artifacts refactor — `git log -S "git archive" cacheZip.ts` → e7c9c21 — and is
+  //    restored here; covered by the regression test below.)
+  rmSync(outputPath, { force: true });
+  execFileSync('git', ['-C', repo, 'archive', '--format=zip', '-o', outputPath, 'HEAD']);
+
   // 2) Pre-transpiled artifacts (PRETRANSPILED_ARTIFACTS_SPEC §7 step 1) — on by
   //    default, opt out with --no-artifacts. Per-file failures are already
   //    omitted-with-warning inside emitArtifacts; the whole step never fails the
