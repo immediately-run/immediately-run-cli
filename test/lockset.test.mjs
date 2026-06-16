@@ -121,7 +121,7 @@ const makeRepo = (pkgJson) => {
 
 const sidecarOf = (zipPath) =>
   JSON.parse(
-    execFileSync('unzip', ['-p', zipPath, '.tinkerable/contribute-manifest.json'], {
+    execFileSync('unzip', ['-p', zipPath, '.immediately.run/contribute-manifest.json'], {
       encoding: 'utf8',
     }),
   );

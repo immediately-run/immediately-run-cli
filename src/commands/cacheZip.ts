@@ -5,7 +5,7 @@
  *
  * The ZIP contains the tracked files at HEAD (via `git archive`, so its contents
  * match the git tree exactly) plus a manifest sidecar at
- * `.tinkerable/contribute-manifest.json`. The client reads that sidecar so
+ * `.immediately.run/contribute-manifest.json`. The client reads that sidecar so
  * contributions work offline without a lazy REST fetch.
  *
  * Designed to run both locally (git inference) and in CI (explicit flags from
@@ -255,7 +255,7 @@ export const buildCacheZip = async (opts: CacheZipOptions): Promise<CacheZipResu
   mkdirSync(dirname(outputPath), { recursive: true });
 
   // 1) git archive: a ZIP whose contents are exactly the tracked tree at HEAD. The
-  //    .tinkerable/ sidecar (+ artifacts/packages) is appended onto THIS base below.
+  //    .immediately.run/ sidecar (+ artifacts/packages) is appended onto THIS base below.
   //    Without it the zip carries only the sidecar and every tracked blob fails the
   //    host's verifyZipBlobs (REPO_LIFECYCLE_SPEC §3.4) → the zip is rejected and the
   //    runtime falls back to the REST loader. (This step was dropped in the G2-3
@@ -278,7 +278,7 @@ export const buildCacheZip = async (opts: CacheZipOptions): Promise<CacheZipResu
     )} → ${formatBytes(emission.artifactBytes)}`;
   }
 
-  // 3) Append the sidecar (+ artifacts) under .tinkerable/ in one zip call, with
+  // 3) Append the sidecar (+ artifacts) under .immediately.run/ in one zip call, with
   //    paths passed sorted so the appended set is reproducible run-to-run.
   const staging = mkdtempSync(join(tmpdir(), 'cache-zip-'));
   try {
@@ -291,14 +291,14 @@ export const buildCacheZip = async (opts: CacheZipOptions): Promise<CacheZipResu
     };
     stage(MANIFEST_SIDECAR_ENTRY, JSON.stringify(manifest, null, 2));
     if (emission) {
-      stage('.tinkerable/artifacts/index.json', JSON.stringify(emission.index, null, 2));
+      stage('.immediately.run/artifacts/index.json', JSON.stringify(emission.index, null, 2));
       for (const [out, content] of emission.files) {
-        stage(`.tinkerable/artifacts/${out}`, content);
+        stage(`.immediately.run/artifacts/${out}`, content);
       }
     }
     // Bundled dependency content (R3-49a) — verbatim `/package/` msgpack bytes plus an
     // index keyed by the CDN key (so the consume side can match a `fetchModule` hit)
-    // and the in-zip path. Under the .tinkerable/ allowlist (extra-entry rule + diff
+    // and the in-zip path. Under the .immediately.run/ allowlist (extra-entry rule + diff
     // exclusion already cover it).
     if (packages && packages.length) {
       const index = {
@@ -310,9 +310,9 @@ export const buildCacheZip = async (opts: CacheZipOptions): Promise<CacheZipResu
           path: `${bundledPackageFilename(p.name, p.version)}.msgpack`,
         })),
       };
-      stage('.tinkerable/packages/index.json', JSON.stringify(index, null, 2));
+      stage('.immediately.run/packages/index.json', JSON.stringify(index, null, 2));
       for (const p of packages) {
-        stage(`.tinkerable/packages/${bundledPackageFilename(p.name, p.version)}.msgpack`, p.bytes);
+        stage(`.immediately.run/packages/${bundledPackageFilename(p.name, p.version)}.msgpack`, p.bytes);
       }
     }
     stagedPaths.sort();

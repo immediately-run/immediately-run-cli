@@ -16,7 +16,7 @@ Build a **cached repository zip** from a local git checkout. immediately.run can
 load a repo from this zip instead of the GitHub REST API — which is faster and
 avoids anonymous rate limits — and still contribute changes back to GitHub,
 because the zip embeds a contribute-manifest sidecar
-(`.tinkerable/contribute-manifest.json`) carrying the git blob SHAs the
+(`.immediately.run/contribute-manifest.json`) carrying the git blob SHAs the
 contribute flow needs.
 
 ```sh

@@ -120,11 +120,11 @@ test('cache-zip embeds the artifact index; --no-artifacts omits it', async () =>
       out: withArtifacts,
       lockset: false,
     });
-    const index = JSON.parse(readEntry(withArtifacts, '.tinkerable/artifacts/index.json'));
+    const index = JSON.parse(readEntry(withArtifacts, '.immediately.run/artifacts/index.json'));
     assert.equal(index.schemaVersion, 1);
     assert.ok('/src/App.tsx' in index.files);
     // the transpiled output is present and evaluable-shaped (CommonJS module)
-    const out = readEntry(withArtifacts, '.tinkerable/artifacts/transpiled/src/App.tsx.js');
+    const out = readEntry(withArtifacts, '.immediately.run/artifacts/transpiled/src/App.tsx.js');
     assert.match(out, /\$RefreshSig\$/);
 
     const noArtifacts = join(root, 'none.zip');
@@ -137,7 +137,7 @@ test('cache-zip embeds the artifact index; --no-artifacts omits it', async () =>
       artifacts: false,
       lockset: false,
     });
-    assert.throws(() => readEntry(noArtifacts, '.tinkerable/artifacts/index.json'));
+    assert.throws(() => readEntry(noArtifacts, '.immediately.run/artifacts/index.json'));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
