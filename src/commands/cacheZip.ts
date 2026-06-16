@@ -22,7 +22,14 @@ import {
   MANIFEST_SIDECAR_ENTRY,
   type RepoManifest,
 } from '../manifest.js';
-import { DEFAULT_CDN_ROOT, fetchLockset, type DepMap } from '../lockset.js';
+import {
+  DEFAULT_CDN_ROOT,
+  fetchLockset,
+  fetchBundledPackages,
+  bundledPackageFilename,
+  type DepMap,
+  type BundledPackage,
+} from '../lockset.js';
 import { emitArtifacts, type ArtifactEmission } from '../artifacts.js';
 import {
   COMMIT_HASH_RE,
@@ -56,6 +63,8 @@ Options:
                             (default: <repo>/public/cached_repositories/<owner>/<repo>/<ref>.zip)
   --no-artifacts            Skip emitting pre-transpiled artifacts (source-only zip)
   --no-lockset              Skip embedding the resolved-dependency lockset
+  --bundle-packages         Bundle resolved dependency CONTENT into the zip
+                            (R3-49a; opt-in, requires the lockset)
   --cdn-root <url>          Module CDN root for lockset resolution
                             (default: ${DEFAULT_CDN_ROOT})
   -h, --help                Show this help`;
@@ -76,6 +85,12 @@ export interface CacheZipOptions {
   // runtime resolves dependencies live, exactly as before.
   lockset?: boolean;
   cdnRoot?: string;
+  // Bundle the resolved dependency CONTENT into the zip (R3-49a, the boot lever:
+  // `loadNodeModules` is ~99% of cold boot). OPT-IN (--bundle-packages) and
+  // requires the lockset: a default-on bundle could bloat the zip past the host
+  // size cap, and the content is inert until the sandbox consume-side + ZenFS
+  // batch hydration (R3-49b) read it. See plans/dependency-loading-optimization.md.
+  bundlePackages?: boolean;
 }
 
 export interface CacheZipResult {
@@ -92,6 +107,9 @@ export interface CacheZipResult {
   // Human-readable lockset outcome for the summary line: "<n> packages" or
   // "omitted (<reason>)".
   locksetSummary: string;
+  // Human-readable bundled-package outcome: "<n> packages, <bytes>", "omitted
+  // (not requested)", or "omitted (<reason>)".
+  bundledPackagesSummary: string;
 }
 
 // Modules the app resolves from a self-hosted/registry source at its pinned
@@ -157,6 +175,30 @@ const resolveLockset = async (
   }
 };
 
+// Fetch the resolved dependency CONTENT for bundling (R3-49a). Opt-in, and gated on
+// a lockset (the resolved list is the input). All-or-nothing + non-fatal: any failure
+// omits the whole section and the runtime falls back to live `/package/` fetches.
+const resolveBundledPackages = async (
+  opts: CacheZipOptions,
+  lockset: RepoManifest['lockset'] | undefined,
+): Promise<{ packages?: BundledPackage[]; summary: string }> => {
+  if (!opts.bundlePackages) {
+    return { summary: 'omitted (not requested)' };
+  }
+  if (!lockset) {
+    return { summary: 'omitted (no lockset)' };
+  }
+  try {
+    const packages = await fetchBundledPackages(lockset.resolved, opts.cdnRoot);
+    const bytes = packages.reduce((sum, p) => sum + p.bytes.byteLength, 0);
+    return { packages, summary: `${packages.length} packages, ${formatBytes(bytes)}` };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.warn(`Warning: bundled packages omitted (${message})`);
+    return { summary: `omitted (${message})` };
+  }
+};
+
 export const buildCacheZip = async (opts: CacheZipOptions): Promise<CacheZipResult> => {
   const repo = resolve(opts.repoPath);
   if (!isGitRepo(repo)) {
@@ -188,6 +230,7 @@ export const buildCacheZip = async (opts: CacheZipOptions): Promise<CacheZipResu
   const defaultBranch = opts.defaultBranch || defaultBranchOf(repo, ref);
   const entries = treeEntries(repo);
   const { lockset, summary: locksetSummary } = await resolveLockset(repo, opts);
+  const { packages, summary: bundledPackagesSummary } = await resolveBundledPackages(opts, lockset);
 
   const manifest: RepoManifest = {
     schemaVersion: MANIFEST_SCHEMA_VERSION,
@@ -230,7 +273,7 @@ export const buildCacheZip = async (opts: CacheZipOptions): Promise<CacheZipResu
   const staging = mkdtempSync(join(tmpdir(), 'cache-zip-'));
   try {
     const stagedPaths: string[] = [];
-    const stage = (relPath: string, content: string) => {
+    const stage = (relPath: string, content: string | Uint8Array) => {
       const full = join(staging, relPath);
       mkdirSync(dirname(full), { recursive: true });
       writeFileSync(full, content);
@@ -241,6 +284,25 @@ export const buildCacheZip = async (opts: CacheZipOptions): Promise<CacheZipResu
       stage('.tinkerable/artifacts/index.json', JSON.stringify(emission.index, null, 2));
       for (const [out, content] of emission.files) {
         stage(`.tinkerable/artifacts/${out}`, content);
+      }
+    }
+    // Bundled dependency content (R3-49a) — verbatim `/package/` msgpack bytes plus an
+    // index keyed by the CDN key (so the consume side can match a `fetchModule` hit)
+    // and the in-zip path. Under the .tinkerable/ allowlist (extra-entry rule + diff
+    // exclusion already cover it).
+    if (packages && packages.length) {
+      const index = {
+        cdnVersion: lockset!.cdnVersion,
+        packages: packages.map((p) => ({
+          n: p.name,
+          v: p.version,
+          key: p.key,
+          path: `${bundledPackageFilename(p.name, p.version)}.msgpack`,
+        })),
+      };
+      stage('.tinkerable/packages/index.json', JSON.stringify(index, null, 2));
+      for (const p of packages) {
+        stage(`.tinkerable/packages/${bundledPackageFilename(p.name, p.version)}.msgpack`, p.bytes);
       }
     }
     stagedPaths.sort();
@@ -259,6 +321,7 @@ export const buildCacheZip = async (opts: CacheZipOptions): Promise<CacheZipResu
     entryCount: entries.length,
     artifactsSummary,
     locksetSummary,
+    bundledPackagesSummary,
   };
 };
 
@@ -279,6 +342,7 @@ export const runCacheZip = async (args: ParsedArgs): Promise<number> => {
     out: flagValue(args.flags, 'out'),
     artifacts: args.flags['no-artifacts'] ? false : undefined,
     lockset: args.flags['no-lockset'] ? false : undefined,
+    bundlePackages: args.flags['bundle-packages'] ? true : undefined,
     cdnRoot: flagValue(args.flags, 'cdn-root'),
   });
   console.log(`Wrote ${result.outputPath}`);
@@ -288,5 +352,6 @@ export const runCacheZip = async (args: ParsedArgs): Promise<number> => {
   console.log(`  tracked files: ${result.entryCount}`);
   console.log(`  artifacts:     ${result.artifactsSummary}`);
   console.log(`  lockset:       ${result.locksetSummary}`);
+  console.log(`  bundled pkgs:  ${result.bundledPackagesSummary}`);
   return 0;
 };

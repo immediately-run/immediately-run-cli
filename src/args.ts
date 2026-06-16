@@ -20,6 +20,7 @@ const BOOLEAN_FLAGS = new Set([
   'h',
   'open',
   'no-lockset',
+  'bundle-packages',
   'check',
   'republish',
   'origin-unsafe',

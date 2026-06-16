@@ -74,3 +74,60 @@ export const fetchLockset = async (
   }
   return { cdnVersion: LOCKSET_CDN_VERSION, dependencies, resolved };
 };
+
+// --- bundled package content (R3-49a) ----------------------------------------
+//
+// The lockset above embeds only the RESOLUTION (name/version/depth). The module
+// CONTENT is what the runtime still fetches per-package from `/package/<name@ver>`
+// at boot — the step profiling showed dominates cold boot (`loadNodeModules`,
+// ~99%). Bundling that content into the cache zip makes it local + deterministic;
+// the sandbox consume-side + ZenFS batch hydration (R3-49b) then deliver it without
+// the per-package round-trips. See plans/dependency-loading-optimization.md.
+
+/** The `/package/` key the CDN (and the sandbox runtime's `fetchModule`) use for a
+ *  package: `btoa("<CDN_VERSION>(<name>@<version>)")`. Mirrors the sandbox's
+ *  `module-cdn.ts` `encodePayload` so a bundled package is found under the exact key
+ *  the runtime would otherwise fetch. */
+export const encodePackageKey = (name: string, version: string): string =>
+  Buffer.from(`${LOCKSET_CDN_VERSION}(${name}@${version})`).toString('base64');
+
+/** Filesystem-safe in-zip filename for a bundled package. The CDN key is standard
+ *  base64 (contains `/`), so it can't be a path; `encodeURIComponent(name@version)`
+ *  is deterministic, collision-free, and escapes the `/` in scoped names
+ *  (`@scope/pkg`). The consume side computes the same from name+version. */
+export const bundledPackageFilename = (name: string, version: string): string =>
+  encodeURIComponent(`${name}@${version}`);
+
+/** A fetched package: its `/package/` key + the verbatim msgpack `ICDNModule` bytes
+ *  (stored unchanged so the runtime decodes them identically to a live fetch). */
+export interface BundledPackage {
+  key: string;
+  name: string;
+  version: string;
+  bytes: Uint8Array;
+}
+
+/**
+ * Fetch the verbatim `/package/<name@version>` response for every resolved
+ * dependency, for embedding in the cache zip. Each `/package/` URL is immutable
+ * (a fixed name@exact-version), so the bytes are reproducible. A per-package
+ * failure throws — package bundling is all-or-nothing for a build (a partial
+ * bundle would silently fall back to live fetch for the gaps, defeating
+ * determinism); the caller may catch to omit the whole section.
+ */
+export const fetchBundledPackages = async (
+  resolved: readonly ResolvedDependency[],
+  cdnRoot: string = DEFAULT_CDN_ROOT,
+): Promise<BundledPackage[]> => {
+  const base = cdnRoot.endsWith('/') ? cdnRoot : `${cdnRoot}/`;
+  return Promise.all(
+    resolved.map(async ({ n: name, v: version }) => {
+      const key = encodePackageKey(name, version);
+      const response = await fetch(`${base}package/${key}`);
+      if (!response.ok) {
+        throw new Error(`package fetch failed for ${name}@${version}: HTTP ${response.status}`);
+      }
+      return { key, name, version, bytes: new Uint8Array(await response.arrayBuffer()) };
+    }),
+  );
+};
