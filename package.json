@@ -5,13 +5,13 @@
   "type": "module",
   "license": "MIT",
   "author": "immediately.run",
-  "homepage": "https://github.com/immediately-run/cli#readme",
+  "homepage": "https://github.com/immediately-run/immediately-run-cli#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/immediately-run/cli.git"
+    "url": "git+https://github.com/immediately-run/immediately-run-cli.git"
   },
   "bugs": {
-    "url": "https://github.com/immediately-run/cli/issues"
+    "url": "https://github.com/immediately-run/immediately-run-cli/issues"
   },
   "keywords": [
     "immediately.run",
