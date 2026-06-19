@@ -1,5 +1,5 @@
 /*
- * `immediately-run cache-zip` — build a cached repository ZIP (with a contribute
+ * `immediately.run cache-zip` — build a cached repository ZIP (with a contribute
  * manifest sidecar) from a local git checkout, mirroring what the immediately.run
  * client would otherwise fetch from the GitHub API.
  *
@@ -44,7 +44,7 @@ import {
 } from '../git.js';
 import { flagValue, type ParsedArgs } from '../args.js';
 
-export const CACHE_ZIP_USAGE = `Usage: immediately-run cache-zip [repo-path] [options]
+export const CACHE_ZIP_USAGE = `Usage: immediately.run cache-zip [repo-path] [options]
 
 Build a cached repository zip with a contribute-manifest sidecar from a local
 git checkout. Defaults derive everything from the repo's git metadata; pass the

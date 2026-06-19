@@ -1,10 +1,10 @@
 /*
- * `immediately-run preauth` — apply an M1 pre-authorization policy headlessly
+ * `immediately.run preauth` — apply an M1 pre-authorization policy headlessly
  * (UI_AS_APPS_SPEC §8.15 M1 / §8.9; roadmap R3-51d, plan
  * docs/plans/cli-preauth-shared-core.md, Phase 3).
  *
  * An operator/CI runs this to pre-grant an app's capabilities + net:fetch hosts
- * (and mounts) so a later headless/`immediately-run dev`/CI run boots with NO
+ * (and mounts) so a later headless/`immediately.run dev`/CI run boots with NO
  * consent modal. It is a THIN token-authenticated HTTP client: it POSTs the
  * policy to the backend `POST /api/v1/preauth` executor, which runs the ONE §8.9
  * target check + mint path site-main's in-browser M1 uses. The CLI holds no
@@ -30,7 +30,7 @@ const API_PREFIX = '/api/v1';
  *  verifies it like `/net-fetch`), as an alternative to `--token`. */
 export const ID_TOKEN_ENV = 'IMMEDIATELY_RUN_ID_TOKEN';
 
-export const PREAUTH_USAGE = `Usage: immediately-run preauth <app> [options]
+export const PREAUTH_USAGE = `Usage: immediately.run preauth <app> [options]
 
 Apply an M1 pre-authorization policy to an app headlessly: pre-grant its
 capabilities + net:fetch hosts (and mounts) so a later headless/CI run boots

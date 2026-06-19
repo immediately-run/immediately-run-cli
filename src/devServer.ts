@@ -1,5 +1,5 @@
 /*
- * Localhost HTTP server behind `immediately-run dev` (LOCAL_DEVELOPMENT_SPEC
+ * Localhost HTTP server behind `immediately.run dev` (LOCAL_DEVELOPMENT_SPEC
  * §6.3): serves a project's working tree to hosted immediately.run as the
  * readonly source of a `local` provider mount.
  *

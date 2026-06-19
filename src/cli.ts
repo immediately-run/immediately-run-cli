@@ -25,9 +25,9 @@ const COMMANDS: Record<string, (args: ReturnType<typeof parseArgs>) => number | 
   preauth: runPreAuth,
 };
 
-const USAGE = `immediately-run — command-line tools for immediately.run
+const USAGE = `immediately.run — command-line tools for immediately.run
 
-Usage: immediately-run <command> [options]
+Usage: immediately.run <command> [options]
 
 Commands:
   agent       Bridge a local Claude Code to the in-browser host (MCP over stdio)
@@ -37,7 +37,7 @@ Commands:
   pin-release Resolve UI release authoring files into pinned lock artifacts
   preauth     Apply an M1 pre-authorization policy to an app (headless/CI)
 
-Run 'immediately-run <command> --help' for command-specific options.`;
+Run 'immediately.run <command> --help' for command-specific options.`;
 
 const main = async (): Promise<number> => {
   const [command, ...rest] = process.argv.slice(2);
