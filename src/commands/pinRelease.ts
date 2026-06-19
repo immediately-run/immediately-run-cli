@@ -1,5 +1,5 @@
 /*
- * `immediately-run pin-release` — resolve the UI release authoring files in a
+ * `immediately.run pin-release` — resolve the UI release authoring files in a
  * `releases/` directory into fully-pinned, immutable lock artifacts plus a
  * registry `index.json` (UI_RELEASES_SPEC §5).
  *
@@ -37,7 +37,7 @@ import {
  *  capability becomes first-party-only again). Wiring it from the host is a follow-on. */
 const HOST_BUILD_DEFAULTS: Record<string, BuildDefaultRef> = {};
 
-export const PIN_RELEASE_USAGE = `Usage: immediately-run pin-release [options]
+export const PIN_RELEASE_USAGE = `Usage: immediately.run pin-release [options]
 
 Resolve UI release authoring files into pinned lock artifacts + a registry index
 (UI_RELEASES_SPEC §5). Authoring files are <name>.json in the releases dir; the

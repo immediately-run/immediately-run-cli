@@ -54,7 +54,7 @@ type Pending = {
 
 /**
  * The bridge state machine. Single-process, in-memory, one bridge per
- * `immediately-run agent` run.
+ * `immediately.run agent` run.
  */
 export class AgentBridge {
   /** call timeout, overridable for tests */

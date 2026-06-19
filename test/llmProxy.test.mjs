@@ -1,4 +1,4 @@
-// Tests for the `immediately-run llm` proxy (R3-77 / P3-75; LLM_AND_AGENTS_SPEC
+// Tests for the `immediately.run llm` proxy (R3-77 / P3-75; LLM_AND_AGENTS_SPEC
 // §2.4, D3). The §9 D3 exit — NOT an open relay — is proven both as a pure unit
 // (resolveUpstreamTarget pins to the configured origin) and end-to-end against a
 // live fake upstream on the real dev server, alongside the T25 negative space

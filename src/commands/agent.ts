@@ -1,5 +1,5 @@
 /*
- * `immediately-run agent` — bridge a locally-running Claude Code to the
+ * `immediately.run agent` — bridge a locally-running Claude Code to the
  * in-browser immediately.run host (R3-76; LLM_AND_AGENTS_SPEC §3.4;
  * LOCAL_DEV_AUTHED_SERVER_SPEC). Two things run in one process:
  *
@@ -34,7 +34,7 @@ import {
   sanitizeProjectName,
 } from './dev.js';
 
-export const AGENT_USAGE = `Usage: immediately-run agent [repo-path] [options]
+export const AGENT_USAGE = `Usage: immediately.run agent [repo-path] [options]
 
 Bridge a local Claude Code to the in-browser immediately.run host. Runs an MCP
 server over stdio (add it to Claude Code with 'claude mcp add') plus the
@@ -105,7 +105,7 @@ export const runAgent = async (args: ParsedArgs): Promise<number> => {
   const url = buildAgentDeepLink(origin, handle.port, token);
 
   // stdout is the MCP JSON-RPC channel; everything human-facing → stderr.
-  console.error(`immediately-run agent bridge on ${endpoint} (namespace ${namespace}).`);
+  console.error(`immediately.run agent bridge on ${endpoint} (namespace ${namespace}).`);
   console.error(`Open this in your browser to pair the in-browser host:`);
   console.error(`  ${url}`);
   console.error(`Allowed origin: ${origin}. Press Ctrl-C to stop.`);

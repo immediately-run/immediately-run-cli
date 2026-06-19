@@ -1,5 +1,5 @@
 /*
- * `immediately-run llm` proxy core (R3-77 / P3-75; LLM_AND_AGENTS_SPEC §2.4/§3.4,
+ * `immediately.run llm` proxy core (R3-77 / P3-75; LLM_AND_AGENTS_SPEC §2.4/§3.4,
  * D3 — Approach 4; LOCAL_DEV_AUTHED_SERVER_SPEC). The CLI extends the SAME
  * authenticated localhost server as the agent bridge (it does NOT stand up a
  * second server) with a `POST /llm/...` route that forwards to a SINGLE,

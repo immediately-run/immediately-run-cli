@@ -1,9 +1,9 @@
 /*
- * `immediately-run llm` — a localhost LLM proxy for local / self-hosted models
+ * `immediately.run llm` — a localhost LLM proxy for local / self-hosted models
  * (Ollama, LM Studio, vLLM) or a user's OpenAI-compatible gateway (R3-77 / P3-75;
  * LLM_AND_AGENTS_SPEC §2.4/§3.4, D3 — Approach 4; LOCAL_DEV_AUTHED_SERVER_SPEC).
  *
- * It reuses the SAME authenticated localhost server as `immediately-run agent`
+ * It reuses the SAME authenticated localhost server as `immediately.run agent`
  * (it does NOT stand up a second server), attaching a `POST /llm/...` route that
  * forwards to a SINGLE, user-configured upstream with the user's key injected
  * server-side. The key (or the whole computation) never leaves the user's
@@ -27,7 +27,7 @@ import { DEFAULT_ORIGIN, DEFAULT_PORT, isRecognizedOrigin } from './dev.js';
  *  would be visible to `ps`). */
 export const LLM_KEY_ENV = 'IMMEDIATELY_RUN_LLM_KEY';
 
-export const LLM_USAGE = `Usage: immediately-run llm --upstream <base-url> [repo-path] [options]
+export const LLM_USAGE = `Usage: immediately.run llm --upstream <base-url> [repo-path] [options]
 
 Run a localhost LLM proxy that forwards to a SINGLE configured OpenAI-compatible
 upstream (a local model server or your own gateway), injecting your key on this
@@ -130,7 +130,7 @@ export const runLlm = async (args: ParsedArgs): Promise<number> => {
   const endpoint = `http://127.0.0.1:${handle.port}`;
   const url = buildLlmDeepLink(origin, handle.port, token);
 
-  console.error(`immediately-run llm proxy on ${endpoint} → ${upstreamUrl.origin} (pinned).`);
+  console.error(`immediately.run llm proxy on ${endpoint} → ${upstreamUrl.origin} (pinned).`);
   console.error(`Key injected server-side${apiKey ? '' : ' (none configured)'}; it never leaves this machine.`);
   console.error(`Open this in your browser to pair the in-browser host:`);
   console.error(`  ${url}`);

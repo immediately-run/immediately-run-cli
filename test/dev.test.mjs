@@ -1,4 +1,4 @@
-// Tests for `immediately-run dev` (the localhost provider server). Runs against
+// Tests for `immediately.run dev` (the localhost provider server). Runs against
 // the compiled dist/ (`npm test` builds first), so it exercises exactly what
 // ships. Uses node:test — no test-framework dependency.
 import { test, before, after } from 'node:test';

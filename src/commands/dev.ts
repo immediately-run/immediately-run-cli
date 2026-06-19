@@ -1,5 +1,5 @@
 /*
- * `immediately-run dev` — serve the current project's working tree to hosted
+ * `immediately.run dev` — serve the current project's working tree to hosted
  * immediately.run over localhost, and print/open the deep link that mounts it
  * as a `local` provider source (LOCAL_DEVELOPMENT_SPEC §6.3/§6.4/§10).
  *
@@ -17,7 +17,7 @@ import { basename, resolve } from 'node:path';
 import { startDevServer } from '../devServer.js';
 import { flagValue, type ParsedArgs } from '../args.js';
 
-export const DEV_USAGE = `Usage: immediately-run dev [repo-path] [options]
+export const DEV_USAGE = `Usage: immediately.run dev [repo-path] [options]
 
 Serve the project's working tree to hosted immediately.run over localhost and
 print the deep link that loads it (no commit, no push). Chrome/Firefox only;

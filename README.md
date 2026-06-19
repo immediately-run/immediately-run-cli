@@ -65,7 +65,7 @@ runners).
 ## `preauth`
 
 Apply an **M1 pre-authorization policy** to an app from the terminal (operator /
-CI), so a later headless / `immediately-run dev` / CI run boots with **no consent
+CI), so a later headless / `immediately.run dev` / CI run boots with **no consent
 prompt** (UI_AS_APPS_SPEC §8.15 M1 / §8.9). It is a thin token-authenticated HTTP
 client of the backend `POST /api/v1/preauth` executor, which runs the **same**
 §8.9 target check + grant-mint path the in-browser surface uses — the CLI holds no
