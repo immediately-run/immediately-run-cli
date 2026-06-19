@@ -26,11 +26,18 @@
  * (browser requests always do; curl tests don't), and jails all paths to the
  * project root (resolveSafe, after dev-fs/src/plugin.ts).
  *
+ * With a {@link DevServerOptions.bind} attached (Tier-1.5, §9.1) the server
+ * instead serves HTTPS on the tailnet interface IP (never `0.0.0.0`) using the
+ * supplied `tailscale cert`, and the Host-header pin matches the MagicDNS
+ * hostname instead of loopback. Every other §8 guard (token, Origin, path jail,
+ * read-only) is unchanged — the tailnet only swaps the network boundary.
+ *
  * The SSE watcher uses fs.watch(root, { recursive: true }) — native on macOS
  * and Windows; on Linux recursive watch requires Node >= 20.
  */
 
 import * as http from 'node:http';
+import * as https from 'node:https';
 import { Readable } from 'node:stream';
 import { watch as fsWatch, statSync, createReadStream, readdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -78,6 +85,19 @@ export interface DevServerOptions {
    * a second one. Absent means `/llm` does not exist and POST stays refused.
    */
   llm?: LlmUpstream;
+  /**
+   * Tier-1.5 tailnet binding (LOCAL_DEVELOPMENT_SPEC §9.1). Absent ⇒ loopback
+   * (127.0.0.1, plain HTTP) exactly as before. Present ⇒ the server listens on
+   * `address` (the tailnet interface IP — never `0.0.0.0`), serves HTTPS with the
+   * supplied `cert`/`key`, and pins the Host header to `host` (the MagicDNS name)
+   * instead of loopback. All other §8 guards are unchanged.
+   */
+  bind?: {
+    host: string; // MagicDNS hostname — the Host-pin target (e.g. mac.tailxyz.ts.net)
+    address: string; // tailnet interface IP to listen on (never 0.0.0.0)
+    cert: string | Buffer;
+    key: string | Buffer;
+  };
 }
 
 /** `/agent/result` + `/agent/catalog` body cap — bridge payloads are small JSON;
@@ -232,9 +252,17 @@ const CORS_MAX_AGE = '600';
 // browser sends `Host: attacker.example` — reject it before the Origin/token
 // checks even run. Pinning the port to the accepting socket (`localPort`) also
 // refuses a Host that names the right loopback but the wrong port.
-const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
+//
+// Under a §9.1 tailnet bind the legitimate Host is instead the MagicDNS name, so
+// the caller passes that as `allowedHosts`; the rebinding defense is identical,
+// only the pinned name changes (lowercased entries — comparison is case-insensitive).
+export const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
 
-export const isAllowedHost = (hostHeader: string | undefined, localPort: number): boolean => {
+export const isAllowedHost = (
+  hostHeader: string | undefined,
+  localPort: number,
+  allowedHosts: ReadonlySet<string> = LOOPBACK_HOSTS,
+): boolean => {
   if (!hostHeader) return false; // HTTP/1.1 requires Host; a missing one is suspect.
   let host = hostHeader;
   let port: string | undefined;
@@ -253,7 +281,7 @@ export const isAllowedHost = (hostHeader: string | undefined, localPort: number)
       port = hostHeader.slice(colon + 1);
     }
   }
-  if (!LOOPBACK_HOSTS.has(host.toLowerCase())) return false;
+  if (!allowedHosts.has(host.toLowerCase())) return false;
   // A present port must match the accepting socket; absent port still pins host.
   if (port !== undefined && port !== String(localPort)) return false;
   return true;
@@ -334,13 +362,17 @@ export const startDevServer = (opts: DevServerOptions): Promise<DevServerHandle>
   const maxTreeEntries = opts.maxTreeEntries ?? MAX_TREE_ENTRIES;
   const maxBlobBytes = opts.maxBlobBytes ?? MAX_BLOB_BYTES;
 
-  const server = http.createServer((req, res) => {
+  // §9.1: under a tailnet bind the only legitimate Host is the MagicDNS name;
+  // otherwise it's a loopback name. Same DNS-rebinding defense, different pin.
+  const allowedHosts = opts.bind ? new Set([opts.bind.host.toLowerCase()]) : LOOPBACK_HOSTS;
+
+  const handler: http.RequestListener = (req, res) => {
     const url = new URL(req.url ?? '/', 'http://127.0.0.1');
     const requestOrigin = req.headers.origin;
 
-    // LD-1: pin the Host to a loopback name on the accepting port BEFORE anything
+    // LD-1: pin the Host to the bound name on the accepting port BEFORE anything
     // else (DNS-rebinding defense). Never echo CORS for a rejected host.
-    if (!isAllowedHost(req.headers.host, req.socket.localPort ?? opts.port)) {
+    if (!isAllowedHost(req.headers.host, req.socket.localPort ?? opts.port, allowedHosts)) {
       sendJson(res, 403, { error: 'host not allowed' });
       return;
     }
@@ -650,12 +682,18 @@ export const startDevServer = (opts: DevServerOptions): Promise<DevServerHandle>
       }
       sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) }, cors);
     }
-  });
+  };
+
+  // §9.1: HTTPS over the tailnet interface when bound; loopback HTTP otherwise.
+  const server: http.Server = opts.bind
+    ? https.createServer({ cert: opts.bind.cert, key: opts.bind.key }, handler)
+    : http.createServer(handler);
 
   return new Promise((resolve, reject) => {
     server.once('error', reject);
-    // 127.0.0.1 only — never reachable from the network (spec §8).
-    server.listen(opts.port, '127.0.0.1', () => {
+    // Loopback only (spec §8) unless a §9.1 tailnet bind is requested, in which
+    // case the tailnet interface IP — never 0.0.0.0, never reachable off-tailnet.
+    server.listen(opts.port, opts.bind ? opts.bind.address : '127.0.0.1', () => {
       const address = server.address();
       const port = typeof address === 'object' && address ? address.port : opts.port;
       resolve({

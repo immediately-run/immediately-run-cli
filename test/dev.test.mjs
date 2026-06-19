@@ -4,7 +4,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -17,6 +17,11 @@ import {
   isAllowedHost,
   DEV_PROTOCOL_VERSION,
 } from '../dist/devServer.js';
+import {
+  parseTailscaleSelf,
+  resolveTailscaleCert,
+} from '../dist/tailscale.js';
+import https from 'node:https';
 import {
   sanitizeProjectName,
   buildDeepLink,
@@ -238,10 +243,31 @@ test('unit: sanitizeProjectName maps to the URL charset', () => {
 });
 
 test('unit: buildDeepLink shape (namespace carries the §6.2 disambiguator)', () => {
-  const url = buildDeepLink('http://localhost:3000/', 'proj-abcd1234', 'proj', 7700, 'tok');
+  const url = buildDeepLink(
+    'http://localhost:3000/',
+    'proj-abcd1234',
+    'proj',
+    'http://127.0.0.1:7700',
+    'tok',
+  );
   assert.equal(
     url,
     'http://localhost:3000/edit/local/proj-abcd1234/proj/live#ir-endpoint=http%3A%2F%2F127.0.0.1%3A7700&ir-token=tok',
+  );
+});
+
+test('unit: buildDeepLink carries a real https tailnet endpoint under --bind tailscale (§9.1)', () => {
+  const url = buildDeepLink(
+    'https://immediately.run',
+    'proj-abcd1234',
+    'proj',
+    'https://mac.tailxyz.ts.net:7700',
+    'tok',
+  );
+  assert.equal(
+    url,
+    'https://immediately.run/edit/local/proj-abcd1234/proj/live' +
+      '#ir-endpoint=https%3A%2F%2Fmac.tailxyz.ts.net%3A7700&ir-token=tok',
   );
 });
 
@@ -267,8 +293,8 @@ test('LD2-1: two same-named checkouts get distinct overlay identities; same real
     const nsA = `my-app-${ha}`;
     const nsB = `my-app-${hb}`;
     assert.notEqual(
-      buildDeepLink('https://immediately.run', nsA, 'my-app', 1, 't'),
-      buildDeepLink('https://immediately.run', nsB, 'my-app', 1, 't'),
+      buildDeepLink('https://immediately.run', nsA, 'my-app', 'http://127.0.0.1:1', 't'),
+      buildDeepLink('https://immediately.run', nsB, 'my-app', 'http://127.0.0.1:1', 't'),
     );
   } finally {
     rmSync(a, { recursive: true, force: true });
@@ -500,4 +526,149 @@ test('LD-3: runDev refuses an unrecognized --origin unless --origin-unsafe is gi
     runDev({ positionals: [root], flags: { origin: 'https://evil.example' } }),
     /origin-unsafe/,
   );
+});
+
+// --- §9.1: Tier-1.5 tailnet binding (--bind tailscale) ----------------------
+
+test('§9.1: isAllowedHost pins the MagicDNS name (+ port) under a tailnet bind', () => {
+  const ts = new Set(['mac.tailxyz.ts.net']);
+  // The MagicDNS name on the accepting port is accepted (case-insensitive).
+  assert.equal(isAllowedHost('mac.tailxyz.ts.net:7700', 7700, ts), true);
+  assert.equal(isAllowedHost('MAC.TailXYZ.ts.net:7700', 7700, ts), true);
+  assert.equal(isAllowedHost('mac.tailxyz.ts.net', 7700, ts), true); // no port → host still pinned
+  // A rebound / foreign Host is refused even on the right port; so is loopback,
+  // which is NOT in the tailnet allowlist (the pin moved off localhost).
+  assert.equal(isAllowedHost('attacker.example:7700', 7700, ts), false);
+  assert.equal(isAllowedHost('mac.tailxyz.ts.net:1', 7700, ts), false); // wrong port
+  assert.equal(isAllowedHost('localhost:7700', 7700, ts), false);
+  assert.equal(isAllowedHost('127.0.0.1:7700', 7700, ts), false);
+});
+
+test('§9.1: parseTailscaleSelf reads the MagicDNS name + prefers the 100.x tailnet IP', () => {
+  const self = parseTailscaleSelf(
+    JSON.stringify({
+      Self: { DNSName: 'mac.tailxyz.ts.net.', TailscaleIPs: ['fd7a:115c::1', '100.101.102.103'] },
+    }),
+  );
+  assert.equal(self.dnsName, 'mac.tailxyz.ts.net'); // trailing dot stripped
+  assert.equal(self.address, '100.101.102.103'); // IPv4 CGNAT preferred for the bind
+});
+
+test('§9.1: parseTailscaleSelf gives actionable errors for a down / unconfigured tailnet', () => {
+  assert.throws(() => parseTailscaleSelf('not json'), /installed and running/);
+  assert.throws(() => parseTailscaleSelf('{}'), /no Self node/);
+  assert.throws(
+    () => parseTailscaleSelf(JSON.stringify({ Self: { TailscaleIPs: ['100.1.1.1'] } })),
+    /no MagicDNS name/,
+  );
+  assert.throws(
+    () => parseTailscaleSelf(JSON.stringify({ Self: { DNSName: 'mac.ts.net.' } })),
+    /no tailnet IP/,
+  );
+});
+
+test('§9.1: resolveTailscaleCert finds <host>.crt/.key on disk and reads both', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ir-cert-'));
+  try {
+    const host = 'mac.tailxyz.ts.net';
+    writeFileSync(join(dir, `${host}.crt`), 'CERTBYTES');
+    writeFileSync(join(dir, `${host}.key`), 'KEYBYTES');
+    const { cert, key } = resolveTailscaleCert(host, [dir]);
+    assert.equal(cert.toString(), 'CERTBYTES');
+    assert.equal(key.toString(), 'KEYBYTES');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('§9.1: resolveTailscaleCert honors an explicit --cert and derives its .key sibling', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ir-cert-'));
+  try {
+    const crt = join(dir, 'custom.crt');
+    writeFileSync(crt, 'C');
+    writeFileSync(join(dir, 'custom.key'), 'K');
+    const { cert, key } = resolveTailscaleCert('mac.tailxyz.ts.net', [], { certPath: crt });
+    assert.equal(cert.toString(), 'C');
+    assert.equal(key.toString(), 'K');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// End-to-end HTTPS bind. Generated with `openssl` when present; skipped cleanly
+// where it isn't (keeps the suite green everywhere while covering the https path
+// + the MagicDNS Host-pin on the boxes that have openssl — CI/dev macOS/Linux).
+test('§9.1: a tailnet-bound server serves HTTPS and pins the MagicDNS Host', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'ir-tls-'));
+  const HOST = 'mac.tailxyz.ts.net';
+  const certPath = join(dir, 'tls.crt');
+  const keyPath = join(dir, 'tls.key');
+  try {
+    try {
+      execFileSync(
+        'openssl',
+        [
+          'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
+          '-keyout', keyPath, '-out', certPath, '-days', '1',
+          '-subj', `/CN=${HOST}`,
+          '-addext', `subjectAltName=DNS:${HOST}`,
+        ],
+        { stdio: 'ignore' },
+      );
+    } catch {
+      t.skip('openssl not available to mint a test cert');
+      return;
+    }
+    const cert = readFileSync(certPath);
+    const key = readFileSync(keyPath);
+
+    // Bind the tailnet transport to loopback (no real tailnet in the test) but
+    // keep the MagicDNS Host pin — exercises the exact §9.1 wiring.
+    const tls = await startDevServer({
+      root,
+      origin: ORIGIN,
+      token: TOKEN,
+      port: 0,
+      bind: { host: HOST, address: '127.0.0.1', cert, key },
+    });
+    try {
+      const req = (headers) =>
+        new Promise((resolve, reject) => {
+          const r = https.request(
+            {
+              host: '127.0.0.1',
+              port: tls.port,
+              path: '/health',
+              method: 'GET',
+              headers,
+              rejectUnauthorized: false, // self-signed test cert
+            },
+            (res) => {
+              let body = '';
+              res.on('data', (c) => (body += c));
+              res.on('end', () => resolve({ status: res.statusCode, body }));
+            },
+          );
+          r.on('error', reject);
+          r.end();
+        });
+
+      // The MagicDNS Host on the accepting port + a valid token → 200 over TLS.
+      const ok = await req({ Authorization: `Bearer ${TOKEN}`, Host: `${HOST}:${tls.port}` });
+      assert.equal(ok.status, 200);
+      assert.deepEqual(JSON.parse(ok.body), { ok: true, protocol: DEV_PROTOCOL_VERSION });
+
+      // Loopback Host is no longer accepted under a tailnet bind (pin moved).
+      const rebound = await req({
+        Authorization: `Bearer ${TOKEN}`,
+        Host: `localhost:${tls.port}`,
+      });
+      assert.equal(rebound.status, 403);
+      assert.match(rebound.body, /host not allowed/);
+    } finally {
+      await tls.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

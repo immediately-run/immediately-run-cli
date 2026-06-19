@@ -14,20 +14,29 @@ import { createHash, randomBytes } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { basename, resolve } from 'node:path';
 
-import { startDevServer } from '../devServer.js';
+import { startDevServer, type DevServerOptions } from '../devServer.js';
 import { flagValue, type ParsedArgs } from '../args.js';
+import { resolveTailscaleCert, tailscaleSelf } from '../tailscale.js';
 
 export const DEV_USAGE = `Usage: immediately.run dev [repo-path] [options]
 
-Serve the project's working tree to hosted immediately.run over localhost and
-print the deep link that loads it (no commit, no push). Chrome/Firefox only;
-keep this process running while the page is open.
+Serve the project's working tree to hosted immediately.run and print the deep
+link that loads it (no commit, no push). Keep this process running while the
+page is open.
 
 Arguments:
   repo-path                 Path to the project directory (default: cwd)
 
 Options:
-  --port <n>                Port to listen on (127.0.0.1 only; default: 7700)
+  --port <n>                Port to listen on (default: 7700)
+  --bind <where>            'localhost' (default; Chrome/Firefox, same machine)
+                            or 'tailscale' to serve HTTPS on the tailnet
+                            interface for cross-machine / iPhone-Safari use (§9.1).
+  --host <magicdns>         Override the MagicDNS hostname for --bind tailscale
+                            (default: this node's tailnet name).
+  --cert <path>             TLS cert (.crt) for --bind tailscale; its .key sibling
+                            is used for the private key. Default: look for
+                            <host>.crt/.key, else mint via \`tailscale cert\`.
   --origin <url>            Allowed browser origin and deep-link base
                             (default: https://immediately.run; use e.g.
                             http://localhost:3000 against a local site build).
@@ -95,16 +104,18 @@ export const realpathHash8 = (root: string): string =>
   createHash('sha256').update(realpathSync(root)).digest('hex').slice(0, 8);
 
 // The connection locator rides the URL fragment — never sent to any server —
-// because the path charset can't carry it (LOCAL_DEVELOPMENT_SPEC §6.4).
+// because the path charset can't carry it (LOCAL_DEVELOPMENT_SPEC §6.4). The
+// `endpoint` is `http://127.0.0.1:<port>` for a loopback bind, or the real
+// `https://<magicdns>:<port>` tailnet URL under `--bind tailscale` (§9.1).
 export const buildDeepLink = (
   origin: string,
   namespace: string,
   repository: string,
-  port: number,
+  endpoint: string,
   token: string,
 ): string =>
   `${origin.replace(/\/+$/, '')}/edit/local/${namespace}/${repository}/live` +
-  `#ir-endpoint=${encodeURIComponent(`http://127.0.0.1:${port}`)}&ir-token=${encodeURIComponent(token)}`;
+  `#ir-endpoint=${encodeURIComponent(endpoint)}&ir-token=${encodeURIComponent(token)}`;
 
 const openInBrowser = (url: string): void => {
   const [cmd, args] =
@@ -146,17 +157,42 @@ export const runDev = async (args: ParsedArgs): Promise<number> => {
     );
   }
 
-  // Per-session secret: any web page can fetch('http://127.0.0.1:…'), so every
-  // request must present this token (spec §8).
+  // §9.1 bind selection. `localhost` (default) is the v1 loopback path; `tailscale`
+  // serves HTTPS on the tailnet interface for cross-machine / iPhone-Safari use.
+  const bindMode = (flagValue(args.flags, 'bind') ?? 'localhost').toLowerCase();
+  if (bindMode !== 'localhost' && bindMode !== 'tailscale') {
+    throw new Error(`Invalid --bind: ${bindMode} (expected 'localhost' or 'tailscale')`);
+  }
+
+  // Per-session secret: any web page can fetch the dev server, so every request
+  // must present this token (spec §8) — the load-bearing control on both binds.
   const token = randomBytes(24).toString('base64url');
 
-  const handle = await startDevServer({ root, origin, token, port });
+  // Resolve the tailnet binding BEFORE starting the server: discover this node's
+  // MagicDNS name + tailnet IP and its `tailscale cert` (minting one if absent).
+  let bind: DevServerOptions['bind'];
+  let endpointHost: string | undefined;
+  if (bindMode === 'tailscale') {
+    const self = tailscaleSelf();
+    const host = flagValue(args.flags, 'host') ?? self.dnsName;
+    const { cert, key } = resolveTailscaleCert(host, [root, process.cwd()], {
+      certPath: flagValue(args.flags, 'cert'),
+    });
+    bind = { host, address: self.address, cert, key };
+    endpointHost = host;
+  }
+
+  const handle = await startDevServer({ root, origin, token, port, bind });
   const projectName = sanitizeProjectName(basename(root));
   // LD2-1: the namespace carries the realpath disambiguator; repository stays the
   // bare project name (`local/<name>-<hash8>/<name>/live`).
   const namespace = `${projectName}-${realpathHash8(root)}`;
-  const endpoint = `http://127.0.0.1:${handle.port}`;
-  const url = buildDeepLink(origin, namespace, projectName, handle.port, token);
+  // The endpoint the iPhone/browser connects to: real https tailnet URL under a
+  // tailnet bind, loopback http otherwise.
+  const endpoint = bind
+    ? `https://${endpointHost}:${handle.port}`
+    : `http://127.0.0.1:${handle.port}`;
+  const url = buildDeepLink(origin, namespace, projectName, endpoint, token);
 
   if (args.flags.json === true) {
     // A3 (§10): exactly one JSON line on stdout once listening; everything else
@@ -167,6 +203,7 @@ export const runDev = async (args: ParsedArgs): Promise<number> => {
     console.error(`Serving ${root} (read-only) on ${endpoint} for ${origin}. Ctrl-C to stop.`);
   } else {
     console.log(`Serving ${root} (read-only) on ${endpoint}`);
+    if (bind) console.log(`Bound to the tailnet interface ${bind.address} (tailnet peers only).`);
     console.log(`Allowed origin: ${origin}`);
     console.log(`immediately.run dev URL: ${url}`);
     console.log('Press Ctrl-C to stop. Keep this running while the page is open.');
