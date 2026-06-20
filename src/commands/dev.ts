@@ -49,7 +49,8 @@ Options:
                             previewed app; the preview then loads from GitHub (§6.8).
   --preview <locator>       With --region, the GitHub app to preview:
                             owner/repo[@ref] or a verbatim present/… route.
-                            Default: the platform landing.
+                            Default: a blank editor (edit/new) for chrome regions
+                            (panel.*, modal.*); the platform landing for page.*.
   --open                    Open the deep link in the default browser
   --json                    Print one machine-readable JSON line to stdout
                             ({ url, endpoint, token, port }); diagnostics → stderr
@@ -142,6 +143,13 @@ export const parsePreviewPath = (spec: string): string => {
   return `present/github/${owner}/${repo}/${ref}/`;
 };
 
+// When `--preview` is omitted, pick a default route that actually SHOWS the
+// overridden region: editor-chrome regions (panel.*, modal.*, …) only render inside
+// an /edit/ view, so default to a blank editor (`edit/new`); a full-page `page.*`
+// region IS the page, so the host's default landing (empty path) shows it.
+export const defaultPreviewPath = (region: string): string =>
+  region.startsWith('page.') ? '' : 'edit/new';
+
 // §6.8 flipped deep link: the PATH is the previewed (GitHub) app — or empty for
 // the host default landing — and the local source rides the fragment as a
 // dev-override directive (`ir-dev-region`/`ir-dev-source`) alongside the §6.4
@@ -220,7 +228,12 @@ export const runDev = async (args: ParsedArgs): Promise<number> => {
   if (region !== undefined && !region.includes('.')) {
     throw new Error(`Invalid --region: "${region}" (expected a region id like panel.files).`);
   }
-  const previewPath = previewFlag !== undefined ? parsePreviewPath(previewFlag) : '';
+  const previewPath =
+    previewFlag !== undefined
+      ? parsePreviewPath(previewFlag)
+      : region !== undefined
+        ? defaultPreviewPath(region)
+        : '';
 
   // Per-session secret: any web page can fetch the dev server, so every request
   // must present this token (spec §8) — the load-bearing control on both binds.
@@ -286,7 +299,7 @@ export const runDev = async (args: ParsedArgs): Promise<number> => {
     if (region !== undefined) {
       console.log(
         `Serving as UI region: ${region} ` +
-          `(preview: ${previewFlag ?? 'platform default landing'})`,
+          `(preview: ${previewFlag ?? (previewPath || 'platform landing')})`,
       );
     }
     console.log(`immediately.run dev URL: ${url}`);

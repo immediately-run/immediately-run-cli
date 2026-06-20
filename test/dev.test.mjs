@@ -27,6 +27,7 @@ import {
   buildDeepLink,
   buildRegionDeepLink,
   parsePreviewPath,
+  defaultPreviewPath,
   realpathHash8,
   isRecognizedOrigin,
   runDev,
@@ -268,6 +269,14 @@ test('unit: parsePreviewPath maps owner/repo[@ref] to a present route (§6.8)', 
     'present/github/acme/notes/main/files/src/App.tsx',
   );
   assert.equal(parsePreviewPath('edit/github/acme/notes/main/'), 'edit/github/acme/notes/main/');
+});
+
+test('unit: defaultPreviewPath picks edit/new for chrome regions, landing for page.* (§6.8)', () => {
+  // editor-chrome regions only render in /edit/, so default to a blank editor
+  assert.equal(defaultPreviewPath('panel.files'), 'edit/new');
+  assert.equal(defaultPreviewPath('modal.share'), 'edit/new');
+  // a full-page region IS the page → host default landing (empty path)
+  assert.equal(defaultPreviewPath('page.landing'), '');
 });
 
 test('unit: parsePreviewPath rejects a malformed locator (§6.8)', () => {
