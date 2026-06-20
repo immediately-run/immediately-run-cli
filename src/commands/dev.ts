@@ -44,6 +44,12 @@ Options:
                             are accepted without --origin-unsafe.
   --origin-unsafe           Allow an --origin outside the recognized set
                             (the per-session token still gates every request)
+  --region <regionId>       Serve the working tree as a UI region (e.g.
+                            panel.files, page.landing, the editor) instead of the
+                            previewed app; the preview then loads from GitHub (§6.8).
+  --preview <locator>       With --region, the GitHub app to preview:
+                            owner/repo[@ref] or a verbatim present/… route.
+                            Default: the platform landing.
   --open                    Open the deep link in the default browser
   --json                    Print one machine-readable JSON line to stdout
                             ({ url, endpoint, token, port }); diagnostics → stderr
@@ -117,6 +123,43 @@ export const buildDeepLink = (
   `${origin.replace(/\/+$/, '')}/edit/local/${namespace}/${repository}/live` +
   `#ir-endpoint=${encodeURIComponent(endpoint)}&ir-token=${encodeURIComponent(token)}`;
 
+// §6.8: turn a `--preview` value into the deep-link path (after the origin, no
+// leading slash). Accepts `owner/repo[@ref]` / `github/owner/repo[@ref]` (→ a
+// `present/github/…/<ref>/` run route, default ref `main`), or a verbatim
+// `present/…` / `edit/…` route passed through unchanged. An empty path (no
+// `--preview`) lets the host load its default landing.
+export const parsePreviewPath = (spec: string): string => {
+  const s = spec.trim().replace(/^\/+/, '');
+  if (s.startsWith('present/') || s.startsWith('edit/')) return s; // verbatim route
+  const [repoPart, ref = 'main'] = s.replace(/^github\//, '').split('@');
+  const segs = repoPart.split('/').filter(Boolean);
+  if (segs.length !== 2) {
+    throw new Error(
+      `Invalid --preview: "${spec}" (expected owner/repo[@ref] or a present/… route)`,
+    );
+  }
+  const [owner, repo] = segs;
+  return `present/github/${owner}/${repo}/${ref}/`;
+};
+
+// §6.8 flipped deep link: the PATH is the previewed (GitHub) app — or empty for
+// the host default landing — and the local source rides the fragment as a
+// dev-override directive (`ir-dev-region`/`ir-dev-source`) alongside the §6.4
+// locator. The host binds the named region to the local source; the previewed
+// app loads normally. The region directive and token are consumed-and-stripped
+// before any sandbox handoff (token hygiene, §6.4).
+export const buildRegionDeepLink = (
+  origin: string,
+  source: string,
+  region: string,
+  endpoint: string,
+  token: string,
+  previewPath: string,
+): string =>
+  `${origin.replace(/\/+$/, '')}/${previewPath}` +
+  `#ir-endpoint=${encodeURIComponent(endpoint)}&ir-token=${encodeURIComponent(token)}` +
+  `&ir-dev-region=${encodeURIComponent(region)}&ir-dev-source=${encodeURIComponent(source)}`;
+
 const openInBrowser = (url: string): void => {
   const [cmd, args] =
     process.platform === 'darwin'
@@ -164,6 +207,21 @@ export const runDev = async (args: ParsedArgs): Promise<number> => {
     throw new Error(`Invalid --bind: ${bindMode} (expected 'localhost' or 'tailscale')`);
   }
 
+  // §6.8: serve the working tree as a UI *region* (not the previewed app). The
+  // preview then loads from GitHub; --preview selects it (default: platform
+  // landing). --preview without --region is meaningless and refused.
+  const region = flagValue(args.flags, 'region');
+  const previewFlag = flagValue(args.flags, 'preview');
+  if (previewFlag !== undefined && region === undefined) {
+    throw new Error(
+      '--preview requires --region (it selects the previewed app while a UI region is served from local).',
+    );
+  }
+  if (region !== undefined && !region.includes('.')) {
+    throw new Error(`Invalid --region: "${region}" (expected a region id like panel.files).`);
+  }
+  const previewPath = previewFlag !== undefined ? parsePreviewPath(previewFlag) : '';
+
   // Per-session secret: any web page can fetch the dev server, so every request
   // must present this token (spec §8) — the load-bearing control on both binds.
   const token = randomBytes(24).toString('base64url');
@@ -192,19 +250,45 @@ export const runDev = async (args: ParsedArgs): Promise<number> => {
   const endpoint = bind
     ? `https://${endpointHost}:${handle.port}`
     : `http://127.0.0.1:${handle.port}`;
-  const url = buildDeepLink(origin, namespace, projectName, endpoint, token);
+  // §6.8: a --region run flips the deep link — the path is the previewed GitHub
+  // app (or empty for the host default landing) and the local source binds to the
+  // named UI region via the fragment. Otherwise the local source IS the preview.
+  const url =
+    region !== undefined
+      ? buildRegionDeepLink(
+          origin,
+          `local/${namespace}/${projectName}/live`,
+          region,
+          endpoint,
+          token,
+          previewPath,
+        )
+      : buildDeepLink(origin, namespace, projectName, endpoint, token);
 
   if (args.flags.json === true) {
     // A3 (§10): exactly one JSON line on stdout once listening; everything else
-    // (so an agent can parse stdout without scraping prose) goes to stderr.
+    // (so an agent can parse stdout without scraping prose) goes to stderr. The
+    // base four fields never change; `region`/`preview` are additive (§6.8).
     process.stdout.write(
-      JSON.stringify({ url, endpoint, token, port: handle.port }) + '\n',
+      JSON.stringify({
+        url,
+        endpoint,
+        token,
+        port: handle.port,
+        ...(region !== undefined ? { region, preview: previewFlag ?? null } : {}),
+      }) + '\n',
     );
     console.error(`Serving ${root} (read-only) on ${endpoint} for ${origin}. Ctrl-C to stop.`);
   } else {
     console.log(`Serving ${root} (read-only) on ${endpoint}`);
     if (bind) console.log(`Bound to the tailnet interface ${bind.address} (tailnet peers only).`);
     console.log(`Allowed origin: ${origin}`);
+    if (region !== undefined) {
+      console.log(
+        `Serving as UI region: ${region} ` +
+          `(preview: ${previewFlag ?? 'platform default landing'})`,
+      );
+    }
     console.log(`immediately.run dev URL: ${url}`);
     console.log('Press Ctrl-C to stop. Keep this running while the page is open.');
   }

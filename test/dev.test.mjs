@@ -25,6 +25,8 @@ import https from 'node:https';
 import {
   sanitizeProjectName,
   buildDeepLink,
+  buildRegionDeepLink,
+  parsePreviewPath,
   realpathHash8,
   isRecognizedOrigin,
   runDev,
@@ -253,6 +255,58 @@ test('unit: buildDeepLink shape (namespace carries the §6.2 disambiguator)', ()
   assert.equal(
     url,
     'http://localhost:3000/edit/local/proj-abcd1234/proj/live#ir-endpoint=http%3A%2F%2F127.0.0.1%3A7700&ir-token=tok',
+  );
+});
+
+test('unit: parsePreviewPath maps owner/repo[@ref] to a present route (§6.8)', () => {
+  assert.equal(parsePreviewPath('acme/notes'), 'present/github/acme/notes/main/');
+  assert.equal(parsePreviewPath('acme/notes@dev'), 'present/github/acme/notes/dev/');
+  assert.equal(parsePreviewPath('github/acme/notes@v2'), 'present/github/acme/notes/v2/');
+  // verbatim present/edit routes pass through (allow a file path); leading slash ok
+  assert.equal(
+    parsePreviewPath('/present/github/acme/notes/main/files/src/App.tsx'),
+    'present/github/acme/notes/main/files/src/App.tsx',
+  );
+  assert.equal(parsePreviewPath('edit/github/acme/notes/main/'), 'edit/github/acme/notes/main/');
+});
+
+test('unit: parsePreviewPath rejects a malformed locator (§6.8)', () => {
+  assert.throws(() => parsePreviewPath('justone'), /Invalid --preview/);
+  assert.throws(() => parsePreviewPath('a/b/c'), /Invalid --preview/);
+});
+
+test('unit: buildRegionDeepLink flips path→GitHub preview, local source→fragment (§6.8)', () => {
+  const url = buildRegionDeepLink(
+    'https://immediately.run',
+    'local/proj-abcd1234/proj/live',
+    'panel.files',
+    'http://127.0.0.1:7700',
+    'tok',
+    'present/github/acme/notes/main/',
+  );
+  assert.equal(
+    url,
+    'https://immediately.run/present/github/acme/notes/main/' +
+      '#ir-endpoint=http%3A%2F%2F127.0.0.1%3A7700&ir-token=tok' +
+      '&ir-dev-region=panel.files&ir-dev-source=local%2Fproj-abcd1234%2Fproj%2Flive',
+  );
+});
+
+test('unit: buildRegionDeepLink with an empty preview path → host default landing (§6.8)', () => {
+  const url = buildRegionDeepLink(
+    'https://immediately.run',
+    'local/proj-abcd1234/proj/live',
+    'page.landing',
+    'http://127.0.0.1:7700',
+    'tok',
+    '',
+  );
+  // path is just the origin root; the dev-override directive still rides the fragment
+  assert.equal(
+    url,
+    'https://immediately.run/' +
+      '#ir-endpoint=http%3A%2F%2F127.0.0.1%3A7700&ir-token=tok' +
+      '&ir-dev-region=page.landing&ir-dev-source=local%2Fproj-abcd1234%2Fproj%2Flive',
   );
 });
 
