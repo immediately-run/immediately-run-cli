@@ -735,3 +735,67 @@ test('§9.1: a tailnet-bound server serves HTTPS and pins the MagicDNS Host', as
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ── Wire contract with the host (immediately-run-site-main) ──────────────────
+// `immediately.run dev --region` emits a deep link whose fragment the HOST parses
+// in src/filesystem/localLocator.ts. The two repos deploy independently, so this
+// is the seam that silently rots: the existing buildRegionDeepLink tests above
+// assert the literal STRING, but a coordinated rename of a param on both the
+// emitter and its own test would still break the host. This test parses the
+// emitted link the way the host does and asserts the round-trip, so a divergence
+// from the host's parser is caught here.
+//
+// The param names and the `local/<ns>/<repo>/<ref>` dev-source PATH form below are
+// COPIED from the host's localLocator.ts and MUST stay in sync with it; the host's
+// localLocator.test.ts asserts the parse half of this same contract
+// (parseLocalLocator / parseDevRegionOverride / devSourceToBindingId).
+const HOST_PARAM = {
+  endpoint: 'ir-endpoint',
+  token: 'ir-token',
+  devRegion: 'ir-dev-region',
+  devSource: 'ir-dev-source',
+};
+
+// Mirror of host devSourceToBindingId: local/<ns…>/<repo>/<ref> → local:<ns>/<repo>@<ref>.
+const hostDevSourceToBindingId = (raw) => {
+  const segs = raw.replace(/^\/+|\/+$/g, '').split('/').filter(Boolean);
+  if (segs.length < 4 || segs[0] !== 'local') return null;
+  const [, ...rest] = segs;
+  const ref = rest.pop();
+  const repository = rest.pop();
+  const namespace = rest.join('/');
+  return namespace && repository && ref ? `local:${namespace}/${repository}@${ref}` : null;
+};
+
+// Mirror of how the host reads the fragment (parseLocalLocator + parseDevRegionOverride):
+// endpoint is normalized to drop a trailing slash; the dev-source is converted to a
+// canonical binding id.
+const hostParse = (url) => {
+  const p = new URLSearchParams(new URL(url).hash.replace(/^#/, ''));
+  const endpoint = p.get(HOST_PARAM.endpoint);
+  const source = p.get(HOST_PARAM.devSource);
+  return {
+    endpoint: endpoint ? endpoint.replace(/\/+$/, '') : null,
+    token: p.get(HOST_PARAM.token),
+    region: p.get(HOST_PARAM.devRegion),
+    bindingId: source ? hostDevSourceToBindingId(source) : null,
+  };
+};
+
+test('wire contract: the host parses the --region deep link the CLI emits (§6.8)', () => {
+  const url = buildRegionDeepLink(
+    'https://immediately.run',
+    'local/proj-abcd1234/proj/live',
+    'panel.editor',
+    'http://127.0.0.1:7715',
+    'sekret',
+    'edit/github/acme/notes/main/',
+  );
+  // What the HOST extracts from the fragment must round-trip to the CLI's inputs.
+  assert.deepEqual(hostParse(url), {
+    endpoint: 'http://127.0.0.1:7715',
+    token: 'sekret',
+    region: 'panel.editor',
+    bindingId: 'local:proj-abcd1234/proj@live',
+  });
+});
