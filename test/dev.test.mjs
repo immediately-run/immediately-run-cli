@@ -799,3 +799,81 @@ test('wire contract: the host parses the --region deep link the CLI emits (§6.8
     bindingId: 'local:proj-abcd1234/proj@live',
   });
 });
+
+// ── System-app devtools `/debug` (plan: docs/plans/system-app-devtools.md) ──
+// Read an SSE stream until `want` data events arrive, then abort. Origin omitted
+// (token-bearing agent request — admitted by the §8 guard).
+const readSse = (path, want) =>
+  new Promise((resolve, reject) => {
+    const req = http.request(
+      { host: '127.0.0.1', port: handle.port, path, method: 'GET' },
+      (res) => {
+        let buf = '';
+        const got = [];
+        res.on('data', (c) => {
+          buf += c;
+          let i;
+          while ((i = buf.indexOf('\n\n')) >= 0) {
+            const frame = buf.slice(0, i);
+            buf = buf.slice(i + 2);
+            for (const line of frame.split('\n')) {
+              if (line.startsWith('data: ')) got.push(line.slice(6));
+            }
+            if (got.length >= want) {
+              req.destroy();
+              resolve(got.slice(0, want));
+              return;
+            }
+          }
+        });
+      },
+    );
+    req.on('error', () => {}); // destroy after resolve surfaces here — ignore
+    const t = setTimeout(() => {
+      req.destroy();
+      reject(new Error('sse timeout'));
+    }, 3000);
+    t.unref?.();
+    req.end();
+  });
+
+test('/debug: POST a batch, then GET replays it (token-gated SSE)', async () => {
+  const post = await authed('/debug', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ entries: [{ kind: 'log', message: 'hello' }, { kind: 'trace', type: 'auth' }] }),
+  });
+  assert.equal(post.status, 200);
+  assert.deepEqual(await post.json(), { ok: true, count: 2 });
+
+  const events = (await readSse(`/debug?token=${TOKEN}&since=0`, 2)).map((l) => JSON.parse(l));
+  assert.equal(events.length, 2);
+  assert.equal(events[0].message, 'hello');
+  assert.equal(events[0].seq, 1); // server stamps a monotonic seq
+  assert.equal(events[1].type, 'auth');
+});
+
+test('/debug: GET ?since streams only newer entries', async () => {
+  // Buffer now holds seq 1,2 from the prior test; add a third and read since=2.
+  await authed('/debug', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify([{ message: 'third' }]),
+  });
+  const events = (await readSse(`/debug?token=${TOKEN}&since=2`, 1)).map((l) => JSON.parse(l));
+  assert.equal(events[0].message, 'third');
+  assert.equal(events[0].seq, 3);
+});
+
+test('/debug: rejects a non-array body', async () => {
+  const res = await authed('/debug', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ nope: 1 }),
+  });
+  assert.equal(res.status, 400);
+});
+
+test('/debug: requires the token', async () => {
+  assert.equal((await fetch(`${base}/debug`, { method: 'POST', body: '[]' })).status, 403);
+});

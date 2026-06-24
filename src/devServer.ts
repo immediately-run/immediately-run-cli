@@ -103,6 +103,10 @@ export interface DevServerOptions {
 /** `/agent/result` + `/agent/catalog` body cap — bridge payloads are small JSON;
  *  a stated bound must exist at this trust boundary (cf. LD2-5). */
 export const MAX_BRIDGE_BODY_BYTES = 4 * 1024 * 1024;
+/** Max entries retained in the `/debug` ring buffer (system-app devtools). */
+export const DEBUG_RING_MAX = 2000;
+/** Body cap for a `POST /debug` batch. */
+export const MAX_DEBUG_BODY_BYTES = 4 * 1024 * 1024;
 
 export interface DevServerHandle {
   server: http.Server;
@@ -366,6 +370,37 @@ export const startDevServer = (opts: DevServerOptions): Promise<DevServerHandle>
   // otherwise it's a loopback name. Same DNS-rebinding defense, different pin.
   const allowedHosts = opts.bind ? new Set([opts.bind.host.toLowerCase()]) : LOOPBACK_HOSTS;
 
+  // System-app devtools (plan: docs/plans/system-app-devtools.md, the CLI
+  // transport). A token-gated `/debug` sink + SSE so a HEADLESS agent (no
+  // browser) can stream the entries the browser host already redacts and forwards
+  // — `debug.log` lines and the redacted host↔app channel trace. POST appends a
+  // batch and fans out to GET subscribers; the buffer is a bounded ring. The
+  // server stores/relays VERBATIM what the host sends — redaction is the host's
+  // job (done before the POST); this never reads the working tree, holds no
+  // authority, and rides the SAME §8 token/Host/Origin guard as every route.
+  const debugBuffer: Array<Record<string, unknown>> = [];
+  const debugSubs = new Set<http.ServerResponse>();
+  let debugSeq = 0;
+  const debugIngest = (entries: unknown[]): number => {
+    let n = 0;
+    for (const raw of entries) {
+      if (!raw || typeof raw !== 'object') continue;
+      const e: Record<string, unknown> = { ...(raw as Record<string, unknown>), seq: ++debugSeq };
+      debugBuffer.push(e);
+      n++;
+      const line = `data: ${JSON.stringify(e)}\n\n`;
+      for (const sub of debugSubs) {
+        try {
+          sub.write(line);
+        } catch {
+          /* a broken subscriber is dropped on its own 'close' */
+        }
+      }
+    }
+    if (debugBuffer.length > DEBUG_RING_MAX) debugBuffer.splice(0, debugBuffer.length - DEBUG_RING_MAX);
+    return n;
+  };
+
   const handler: http.RequestListener = (req, res) => {
     const url = new URL(req.url ?? '/', 'http://127.0.0.1');
     const requestOrigin = req.headers.origin;
@@ -414,7 +449,9 @@ export const startDevServer = (opts: DevServerOptions): Promise<DevServerHandle>
       req.method === 'POST' &&
       !!opts.llm &&
       (url.pathname === LLM_ROUTE_PREFIX || url.pathname.startsWith(LLM_ROUTE_PREFIX + '/'));
-    if (req.method !== 'GET' && !isBridgePost && !isLlmPost) {
+    // System-app devtools: `POST /debug` ingests a batch of redacted entries.
+    const isDebugPost = req.method === 'POST' && url.pathname === '/debug';
+    if (req.method !== 'GET' && !isBridgePost && !isLlmPost && !isDebugPost) {
       sendJson(res, 405, { error: 'method not allowed' }, cors);
       return;
     }
@@ -426,6 +463,58 @@ export const startDevServer = (opts: DevServerOptions): Promise<DevServerHandle>
       bearer === `Bearer ${opts.token}` || url.searchParams.get('token') === opts.token;
     if (!tokenOk) {
       sendJson(res, 403, { error: 'missing or invalid token' }, cors);
+      return;
+    }
+
+    // System-app devtools `/debug` (plan: docs/plans/system-app-devtools.md).
+    // Sits BEHIND the Host → Origin → token guard like every other route.
+    //   POST /debug  → the browser host appends a batch of already-redacted
+    //                  entries ({ entries: [...] } or a bare array).
+    //   GET  /debug  → SSE: replay the ring (optionally `?since=<seq>`) then
+    //                  stream new entries (`?token=` for EventSource).
+    if (url.pathname === '/debug') {
+      if (req.method === 'POST') {
+        void readJsonBody(req, MAX_DEBUG_BODY_BYTES).then((parsed) => {
+          if (!parsed.ok) {
+            sendJson(res, parsed.status, { error: parsed.error }, cors);
+            return;
+          }
+          const v = parsed.value as unknown;
+          const entries = Array.isArray(v)
+            ? v
+            : Array.isArray((v as { entries?: unknown })?.entries)
+              ? (v as { entries: unknown[] }).entries
+              : undefined;
+          if (!entries) {
+            sendJson(res, 400, { error: 'expected an entries array' }, cors);
+            return;
+          }
+          const count = debugIngest(entries);
+          sendJson(res, 200, { ok: true, count }, cors);
+        });
+        return;
+      }
+      if (req.method === 'GET') {
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          Connection: 'keep-alive',
+          ...cors,
+        });
+        res.write('retry: 1000\n\n');
+        const since = Number(url.searchParams.get('since') ?? 0) || 0;
+        for (const e of debugBuffer) {
+          if (!since || (e.seq as number) > since) res.write(`data: ${JSON.stringify(e)}\n\n`);
+        }
+        debugSubs.add(res);
+        const heartbeat = setInterval(() => res.write(': hb\n\n'), 30000);
+        req.on('close', () => {
+          clearInterval(heartbeat);
+          debugSubs.delete(res);
+        });
+        return;
+      }
+      sendJson(res, 405, { error: 'method not allowed' }, cors);
       return;
     }
 
