@@ -11,13 +11,13 @@
  */
 
 import { decode as decodeMsgPack } from '@msgpack/msgpack';
-import { computeInputDepMap, type DepMap } from '@immediately-run/transpiler';
+import { assertDependenciesResolved, computeInputDepMap, type DepMap } from '@immediately-run/transpiler';
 
-// `computeInputDepMap` is the single source of truth in @immediately-run/transpiler
-// (PRETRANSPILED_ARTIFACTS_SPEC §4.4) — re-export it so the runtime's input DepMap
-// derivation (react-preset augment → filter build deps → strip self-hosted → sort)
-// lives in exactly one place, shared with the sandbox bundler.
-export { computeInputDepMap, type DepMap };
+// `computeInputDepMap` and `assertDependenciesResolved` are the single source of
+// truth in @immediately-run/transpiler (PRETRANSPILED_ARTIFACTS_SPEC §4.4) — the
+// input DepMap derivation and the resolution-completeness guard live in exactly
+// one place, shared with the sandbox bundler. Re-exported here for convenience.
+export { assertDependenciesResolved, computeInputDepMap, type DepMap };
 
 // Mirrors sandbox/src/bundler/module-registry/module-cdn.ts (CDN_ROOT,
 // CDN_VERSION). Drift is safe — the runtime checks `cdnVersion` and falls back
@@ -72,6 +72,15 @@ export const fetchLockset = async (
   if (!Array.isArray(resolved) || !resolved.every(isResolvedDependency)) {
     throw new Error('dep_tree response is not a resolved-dependency list');
   }
+  // The CDN SILENTLY OMITS a package it can't resolve (most often a version
+  // newer than its npm mirror knows) rather than erroring. Embedding such an
+  // incomplete lockset bakes the drop into the zip: the runtime would skip the
+  // package and the first import of it resolves to `undefined`. Apply the SAME
+  // completeness guard the sandbox runtime uses (shared from the transpiler) so
+  // the build surfaces the dropped package instead of shipping a broken
+  // pre-resolved manifest. `resolveLockset` treats the throw as non-fatal
+  // (spec §7): it warns with this message and omits the lockset.
+  assertDependenciesResolved(dependencies, resolved);
   return { cdnVersion: LOCKSET_CDN_VERSION, dependencies, resolved };
 };
 
