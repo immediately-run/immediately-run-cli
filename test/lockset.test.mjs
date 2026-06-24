@@ -64,9 +64,14 @@ test('encodeDepTreePayload matches the runtime payload format', () => {
 
 // --- integration: mock CDN + cache-zip ---------------------------------------
 
+// Complete over the react-preset augmentation (core-js / react-error-boundary /
+// react-refresh are added by computeInputDepMap), so the resolution-completeness
+// check (assertLocksetResolves) passes for the `{ react }` inputs below.
 const RESOLVED = [
   { n: 'react', v: '18.3.1', d: 0 },
   { n: 'core-js', v: '3.22.7', d: 0 },
+  { n: 'react-error-boundary', v: '6.1.0', d: 0 },
+  { n: 'react-refresh', v: '0.11.0', d: 0 },
 ];
 
 let server;
@@ -144,6 +149,29 @@ test('fetchLockset returns the CDN resolution with the input echo', async () => 
   assert.deepEqual(lockset.dependencies, computeInputDepMap({ react: '^18.2.0' }));
   // The request hit /dep_tree/<payload encoding exactly that echo>.
   assert.equal(lastPath, `/dep_tree/${encodeDepTreePayload(lockset.dependencies)}`);
+});
+
+test('fetchLockset throws naming a package the CDN silently dropped', async () => {
+  // The mock CDN returns RESOLVED (no lucide-react) — the silent-drop shape.
+  // Build-time detection uses the shared transpiler guard (assertDependenciesResolved)
+  // so the drop is not baked into the zip and reads identically to the runtime.
+  await assert.rejects(
+    fetchLockset({ react: '^18.2.0', 'lucide-react': '^1.21.0' }, cdnRoot),
+    /Could not resolve.*lucide-react@\^1\.21\.0/,
+  );
+});
+
+test('cache-zip warns and omits the lockset when the CDN drops a declared dep', async () => {
+  const root = makeRepo(
+    JSON.stringify({ dependencies: { react: '^18.2.0', 'lucide-react': '^1.21.0' } }),
+  );
+  try {
+    const result = await buildCacheZip(zipOpts(root));
+    assert.match(result.locksetSummary, /^omitted \(/);
+    assert.equal(sidecarOf(result.outputPath).lockset, undefined);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('cache-zip embeds the lockset in the sidecar', async () => {

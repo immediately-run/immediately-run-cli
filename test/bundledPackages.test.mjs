@@ -17,8 +17,14 @@ import {
 } from '../dist/lockset.js';
 import { buildCacheZip } from '../dist/commands/cacheZip.js';
 
+// Complete over the react-preset augmentation (computeInputDepMap adds core-js /
+// react-error-boundary / react-refresh) so the resolution-completeness check
+// passes and the lockset embeds; @scope/pkg is the scoped-name `/`-escape case.
 const RESOLVED = [
   { n: 'react', v: '18.3.1', d: 0 },
+  { n: 'core-js', v: '3.22.7', d: 0 },
+  { n: 'react-error-boundary', v: '6.1.0', d: 0 },
+  { n: 'react-refresh', v: '0.11.0', d: 0 },
   { n: '@scope/pkg', v: '1.0.0', d: 1 }, // scoped name: exercises the `/` escape
 ];
 // A distinct fake `ICDNModule` per package, keyed by the CDN key, so we can assert
@@ -118,7 +124,7 @@ test('--bundle-packages bundles the closure content + an index into the zip', as
   const root = makeRepo();
   try {
     const result = await buildCacheZip(zipOpts(root, { bundlePackages: true }));
-    assert.match(result.bundledPackagesSummary, /^2 packages, /);
+    assert.match(result.bundledPackagesSummary, new RegExp(`^${RESOLVED.length} packages, `));
     const names = entryNames(result.outputPath);
     assert.ok(names.includes('.immediately.run/packages/index.json'));
     for (const { n, v } of RESOLVED) {

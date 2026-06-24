@@ -48,7 +48,7 @@
     "access": "public"
   },
   "dependencies": {
-    "@immediately-run/transpiler": "^0.1.0",
+    "@immediately-run/transpiler": "^0.2.0",
     "@msgpack/msgpack": "^3.1.3"
   }
 }
