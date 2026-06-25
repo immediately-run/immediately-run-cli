@@ -426,7 +426,11 @@ export const startDevServer = (opts: DevServerOptions): Promise<DevServerHandle>
     // for public→private fetches; answer both in one response. The bridge POSTs
     // (R3-76) send a JSON body, so advertise POST + Content-Type only when the
     // bridge is enabled — a read-only server stays strictly GET-only.
-    const authedPost = !!opts.bridge || !!opts.llm; // any POST-accepting feature on?
+    // Any POST-accepting feature on, or the always-available `/debug` sink. A
+    // browser cross-origin POST is preflighted, so its OPTIONS must advertise
+    // POST + Content-Type or the forwarder's fetch is blocked (found in live
+    // testing — the Node-fetch unit test isn't preflighted, so it missed this).
+    const authedPost = !!opts.bridge || !!opts.llm || url.pathname === '/debug';
     if (req.method === 'OPTIONS') {
       res.writeHead(204, {
         ...cors,
