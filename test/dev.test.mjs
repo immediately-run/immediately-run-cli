@@ -877,3 +877,27 @@ test('/debug: rejects a non-array body', async () => {
 test('/debug: requires the token', async () => {
   assert.equal((await fetch(`${base}/debug`, { method: 'POST', body: '[]' })).status, 403);
 });
+
+test('/debug: OPTIONS preflight advertises POST + Content-Type + PNA (browser forwarder)', async () => {
+  const res = await new Promise((resolve, reject) => {
+    const r = http.request(
+      {
+        host: '127.0.0.1',
+        port: handle.port,
+        path: '/debug',
+        method: 'OPTIONS',
+        headers: { Origin: ORIGIN, 'Access-Control-Request-Method': 'POST', 'Access-Control-Request-Headers': 'authorization,content-type' },
+      },
+      (res) => {
+        res.on('data', () => {});
+        res.on('end', () => resolve({ status: res.statusCode, headers: res.headers }));
+      },
+    );
+    r.on('error', reject);
+    r.end();
+  });
+  assert.equal(res.status, 204);
+  assert.match(res.headers['access-control-allow-methods'], /POST/);
+  assert.match(res.headers['access-control-allow-headers'], /Content-Type/);
+  assert.equal(res.headers['access-control-allow-private-network'], 'true');
+});
