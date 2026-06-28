@@ -34,7 +34,8 @@
   ],
   "scripts": {
     "build": "tsc",
-    "test": "npm run build && node --test test/*.test.mjs",
+    "check:sidecar": "node scripts/check-sidecar-literal.mjs",
+    "test": "npm run build && npm run check:sidecar && node --test test/*.test.mjs",
     "prepublishOnly": "npm run build"
   },
   "devDependencies": {
@@ -48,6 +49,7 @@
     "access": "public"
   },
   "dependencies": {
+    "@immediately-run/platform-constants": "^0.1.0",
     "@immediately-run/transpiler": "^0.2.0",
     "@msgpack/msgpack": "^3.1.3"
   }
