@@ -20,6 +20,7 @@ import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join, relative, sep } from 'node:path';
 
+import { isUnderSidecar } from '@immediately-run/platform-constants';
 import {
   computeToolchainHash,
   isTransformable,
@@ -70,10 +71,9 @@ export interface ArtifactEmission {
 }
 
 // `node_modules/` is never covered (the runtime transpiles it live & compact),
-// and `.immediately.run/` is our own infrastructure — exclude both, mirroring §7.
+// and the platform sidecar dir is our own infrastructure — exclude both, mirroring §7.
 const isExcluded = (relPath: string): boolean =>
-  relPath === '.immediately.run' ||
-  relPath.startsWith('.immediately.run/') ||
+  isUnderSidecar(relPath) ||
   relPath.split('/').includes('node_modules');
 
 // Exact blob bytes (NOT the trimmed `git()` helper): the runtime transpiles the

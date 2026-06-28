@@ -17,6 +17,8 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 
+import { ARTIFACTS_DIR, PACKAGES_DIR } from '@immediately-run/platform-constants';
+
 import {
   MANIFEST_SCHEMA_VERSION,
   MANIFEST_SIDECAR_ENTRY,
@@ -291,9 +293,9 @@ export const buildCacheZip = async (opts: CacheZipOptions): Promise<CacheZipResu
     };
     stage(MANIFEST_SIDECAR_ENTRY, JSON.stringify(manifest, null, 2));
     if (emission) {
-      stage('.immediately.run/artifacts/index.json', JSON.stringify(emission.index, null, 2));
+      stage(`${ARTIFACTS_DIR}/index.json`, JSON.stringify(emission.index, null, 2));
       for (const [out, content] of emission.files) {
-        stage(`.immediately.run/artifacts/${out}`, content);
+        stage(`${ARTIFACTS_DIR}/${out}`, content);
       }
     }
     // Bundled dependency content (R3-49a) — verbatim `/package/` msgpack bytes plus an
@@ -310,9 +312,9 @@ export const buildCacheZip = async (opts: CacheZipOptions): Promise<CacheZipResu
           path: `${bundledPackageFilename(p.name, p.version)}.msgpack`,
         })),
       };
-      stage('.immediately.run/packages/index.json', JSON.stringify(index, null, 2));
+      stage(`${PACKAGES_DIR}/index.json`, JSON.stringify(index, null, 2));
       for (const p of packages) {
-        stage(`.immediately.run/packages/${bundledPackageFilename(p.name, p.version)}.msgpack`, p.bytes);
+        stage(`${PACKAGES_DIR}/${bundledPackageFilename(p.name, p.version)}.msgpack`, p.bytes);
       }
     }
     stagedPaths.sort();

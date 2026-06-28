@@ -8,6 +8,8 @@
  * which is exactly what the contribute diff compares the working tree against.
  */
 
+import { CONTRIBUTE_MANIFEST_PATH } from '@immediately-run/platform-constants';
+
 import type { LocksetSection } from './lockset.js';
 
 export type { LocksetSection, ResolvedDependency, DepMap } from './lockset.js';
@@ -15,9 +17,9 @@ export type { LocksetSection, ResolvedDependency, DepMap } from './lockset.js';
 export const MANIFEST_SCHEMA_VERSION = 1;
 
 // Stored without a leading slash — zip entries are root-relative. Mirrors
-// ZIP_MANIFEST_SIDECAR_PATH ('/.immediately.run/contribute-manifest.json') in the
-// client.
-export const MANIFEST_SIDECAR_ENTRY = '.immediately.run/contribute-manifest.json';
+// ZIP_MANIFEST_SIDECAR_PATH ('/<sidecar>/contribute-manifest.json') in the client.
+// The literal lives once in @immediately-run/platform-constants (R3-104).
+export const MANIFEST_SIDECAR_ENTRY = CONTRIBUTE_MANIFEST_PATH;
 
 export type ManifestSource = 'github-rest' | 'zip-sidecar' | 'zip-lazy-fetched';
 export type RefKind = 'branch' | 'tag' | 'commit';
