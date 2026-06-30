@@ -30,6 +30,7 @@ import {
   defaultPreviewPath,
   realpathHash8,
   isRecognizedOrigin,
+  resolveDevLlmConfig,
   runDev,
 } from '../dist/commands/dev.js';
 import { stripRemoteCredentials } from '../dist/git.js';
@@ -900,4 +901,68 @@ test('/debug: OPTIONS preflight advertises POST + Content-Type + PNA (browser fo
   assert.match(res.headers['access-control-allow-methods'], /POST/);
   assert.match(res.headers['access-control-allow-headers'], /Content-Type/);
   assert.equal(res.headers['access-control-allow-private-network'], 'true');
+});
+
+// ── R3-77: dev LLM proxy config (--llm-* flags + IR_DEV_LLM_* env fallback) ──
+
+test('resolveDevLlmConfig: null when no --llm-url / env (proxy stays off)', () => {
+  assert.equal(resolveDevLlmConfig({}, {}), null);
+});
+
+test('resolveDevLlmConfig: builds the upstream + model from flags', () => {
+  const cfg = resolveDevLlmConfig(
+    { 'llm-url': 'https://openrouter.ai/api', 'llm-model': 'openai/gpt-4o-mini', 'llm-key': 'sk-TEST' },
+    {},
+  );
+  assert.deepEqual(cfg, {
+    upstream: { baseUrl: 'https://openrouter.ai/api', apiKey: 'sk-TEST' },
+    model: 'openai/gpt-4o-mini',
+  });
+});
+
+test('resolveDevLlmConfig: env vars are the fallback (CI needs no flags)', () => {
+  const cfg = resolveDevLlmConfig(
+    {},
+    { IR_DEV_LLM_URL: 'http://127.0.0.1:11434', IR_DEV_LLM_MODEL: 'llama3' },
+  );
+  // A local model needs no key.
+  assert.deepEqual(cfg, { upstream: { baseUrl: 'http://127.0.0.1:11434' }, model: 'llama3' });
+});
+
+test('resolveDevLlmConfig: flags win over env', () => {
+  const cfg = resolveDevLlmConfig(
+    { 'llm-url': 'http://127.0.0.1:9999', 'llm-model': 'flag-model' },
+    { IR_DEV_LLM_URL: 'http://127.0.0.1:11434', IR_DEV_LLM_MODEL: 'env-model' },
+  );
+  assert.equal(cfg.upstream.baseUrl, 'http://127.0.0.1:9999');
+  assert.equal(cfg.model, 'flag-model');
+});
+
+test('resolveDevLlmConfig: --llm-url without a model is rejected', () => {
+  assert.throws(
+    () => resolveDevLlmConfig({ 'llm-url': 'http://127.0.0.1:11434' }, {}),
+    /requires --llm-model/,
+  );
+});
+
+test('resolveDevLlmConfig: a non-http(s) --llm-url is rejected', () => {
+  assert.throws(
+    () => resolveDevLlmConfig({ 'llm-url': 'ftp://x', 'llm-model': 'm' }, {}),
+    /Invalid --llm-url/,
+  );
+});
+
+test('resolveDevLlmConfig: custom auth header/scheme pass through (incl. raw)', () => {
+  const cfg = resolveDevLlmConfig(
+    {
+      'llm-url': 'https://gw.example',
+      'llm-model': 'm',
+      'llm-key': 'k',
+      'llm-auth-header': 'x-api-key',
+      'llm-auth-scheme': '',
+    },
+    {},
+  );
+  assert.equal(cfg.upstream.authHeader, 'x-api-key');
+  assert.equal(cfg.upstream.authScheme, '');
 });

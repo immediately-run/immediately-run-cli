@@ -190,3 +190,19 @@ test('without an llm upstream, POST /llm is method-not-allowed (read-only stance
     rmSync(plainRoot, { recursive: true, force: true });
   }
 });
+
+// ── The pairing deep link carries the routing flag + optional model override ──
+import { buildLlmDeepLink } from '../dist/commands/llm.js';
+
+test('buildLlmDeepLink: carries ir-transport=llm and the endpoint+token (no model)', () => {
+  const url = buildLlmDeepLink('https://immediately.run', 7700, 'tok');
+  assert.match(url, /#ir-endpoint=http%3A%2F%2F127\.0\.0\.1%3A7700/);
+  assert.match(url, /&ir-token=tok/);
+  assert.match(url, /&ir-transport=llm/);
+  assert.doesNotMatch(url, /ir-llm-model/);
+});
+
+test('buildLlmDeepLink: appends ir-llm-model when a model is given', () => {
+  const url = buildLlmDeepLink('https://immediately.run', 7700, 'tok', 'openai/gpt-4o-mini');
+  assert.match(url, /&ir-transport=llm&ir-llm-model=openai%2Fgpt-4o-mini/);
+});
