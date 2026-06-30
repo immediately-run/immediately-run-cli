@@ -46,6 +46,9 @@ Options:
   --auth-header <name>      Header to inject the key into (default: authorization)
   --auth-scheme <scheme>    Scheme prefix for the injected header (default: Bearer;
                             pass an empty string for a raw value, e.g. x-api-key)
+  --model <id>              Model the host runs through the proxy (or set
+                            IMMEDIATELY_RUN_LLM_MODEL). Optional — without it the
+                            host uses your configured llm-provider preference.
   --port <n>                Port to listen on (127.0.0.1 only; default: ${DEFAULT_PORT})
   --origin <url>            Allowed browser origin and pairing base
                             (default: ${DEFAULT_ORIGIN})
@@ -54,12 +57,20 @@ Options:
   -h, --help                Show this help`;
 
 // The pairing locator rides the URL fragment (never sent to any server), like the
-// agent deep link. It carries the localhost endpoint + the per-session token —
-// NOT the upstream key, which stays server-side.
-export const buildLlmDeepLink = (origin: string, port: number, token: string): string =>
+// agent deep link. It carries the localhost endpoint + the per-session token +
+// the `ir-transport=llm` routing flag — NOT the upstream key, which stays
+// server-side. An optional `model` rides as `ir-llm-model` (the host's model
+// override); absent, the host falls back to the user's llm-provider preference.
+export const buildLlmDeepLink = (
+  origin: string,
+  port: number,
+  token: string,
+  model?: string,
+): string =>
   `${origin.replace(/\/+$/, '')}/agent` +
   `#ir-endpoint=${encodeURIComponent(`http://127.0.0.1:${port}`)}` +
-  `&ir-token=${encodeURIComponent(token)}&ir-transport=llm`;
+  `&ir-token=${encodeURIComponent(token)}&ir-transport=llm` +
+  (model ? `&ir-llm-model=${encodeURIComponent(model)}` : '');
 
 export const runLlm = async (args: ParsedArgs): Promise<number> => {
   if (args.flags.help || args.flags.h) {
@@ -110,6 +121,8 @@ export const runLlm = async (args: ParsedArgs): Promise<number> => {
   }
   const authHeader = flagValue(args.flags, 'auth-header');
   const authScheme = flagValue(args.flags, 'auth-scheme');
+  // Optional model override the host runs (else it uses the user's preference).
+  const model = flagValue(args.flags, 'model') ?? process.env.IMMEDIATELY_RUN_LLM_MODEL;
 
   // Per-session token — any local page can reach 127.0.0.1, so every request must
   // present it (spec §8). Identical posture to `dev`/`agent`.
@@ -128,7 +141,7 @@ export const runLlm = async (args: ParsedArgs): Promise<number> => {
     },
   });
   const endpoint = `http://127.0.0.1:${handle.port}`;
-  const url = buildLlmDeepLink(origin, handle.port, token);
+  const url = buildLlmDeepLink(origin, handle.port, token, model);
 
   console.error(`immediately.run llm proxy on ${endpoint} → ${upstreamUrl.origin} (pinned).`);
   console.error(`Key injected server-side${apiKey ? '' : ' (none configured)'}; it never leaves this machine.`);

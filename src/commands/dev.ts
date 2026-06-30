@@ -15,6 +15,7 @@ import { spawn } from 'node:child_process';
 import { basename, resolve } from 'node:path';
 
 import { startDevServer, type DevServerOptions } from '../devServer.js';
+import type { LlmUpstream } from '../llmProxy.js';
 import { flagValue, type ParsedArgs } from '../args.js';
 import { resolveTailscaleCert, tailscaleSelf } from '../tailscale.js';
 
@@ -51,6 +52,19 @@ Options:
                             owner/repo[@ref] or a verbatim present/… route.
                             Default: a blank editor (edit/new) for chrome regions
                             (panel.*, modal.*); the platform landing for page.*.
+  --llm-url <baseUrl>       Enable the localhost LLM proxy: forward llm.chat to this
+                            single OpenAI-compatible upstream (the host appends
+                            /v1/chat/completions), with the key injected server-side
+                            on this machine so no passkey seal is needed for an
+                            autonomous/CI session. Requires --llm-model.
+  --llm-model <id>          Model id the host runs through the proxy (e.g.
+                            openai/gpt-4o-mini). Required with --llm-url.
+  --llm-key <key>           Key injected SERVER-SIDE into the upstream request; never
+                            sent to the browser. Optional (local models need none).
+  --llm-auth-header <name>  Header to inject the key into (default: authorization).
+  --llm-auth-scheme <s>     Scheme prefix for the key (default: Bearer; '' = raw).
+                            (--llm-* also read from IR_DEV_LLM_URL / _MODEL / _KEY /
+                            _AUTH_HEADER / _AUTH_SCHEME, so CI needs no flags.)
   --open                    Open the deep link in the default browser
   --json                    Print one machine-readable JSON line to stdout
                             ({ url, endpoint, token, port }); diagnostics → stderr
@@ -85,6 +99,53 @@ export const isRecognizedOrigin = (origin: string): boolean => {
     if (host.endsWith('.web.app') || host.endsWith('.firebaseapp.com')) return true;
   }
   return false;
+};
+
+// R3-77 dev LLM proxy config (LOCAL_DEV_AUTHED_SERVER_SPEC §2.2). `--llm-url`
+// opts the localhost `POST /llm/…` proxy in; the user's key is injected
+// SERVER-SIDE on this machine (never sent to the browser). Flags fall back to
+// `IR_DEV_LLM_*` env vars so CI configures it without flags (the backend's
+// process.env-first pattern). When `--llm-url` is set, `--llm-model` is REQUIRED:
+// the upstream needs a model id for the chat body, which the host reads off the
+// `ir-llm-model` deep-link fragment (beside the `ir-transport=llm` routing flag).
+// Returns null when no upstream is configured
+// (the proxy stays off; the server is GET-only as before). PURE / unit-testable.
+export interface DevLlmConfig {
+  upstream: LlmUpstream;
+  /** Model id surfaced to the host via the `ir-llm-model` fragment. */
+  model: string;
+}
+
+export const resolveDevLlmConfig = (
+  flags: ParsedArgs['flags'],
+  env: NodeJS.ProcessEnv = process.env,
+): DevLlmConfig | null => {
+  const baseUrl = flagValue(flags, 'llm-url') ?? env.IR_DEV_LLM_URL;
+  if (!baseUrl) return null;
+  try {
+    const u = new URL(baseUrl);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error('not http(s)');
+  } catch {
+    throw new Error(`Invalid --llm-url: ${baseUrl} (expected an http(s) base URL).`);
+  }
+  const model = flagValue(flags, 'llm-model') ?? env.IR_DEV_LLM_MODEL;
+  if (!model) {
+    throw new Error(
+      '--llm-url requires --llm-model (or IR_DEV_LLM_MODEL): the upstream needs a model id for chat completions.',
+    );
+  }
+  const apiKey = flagValue(flags, 'llm-key') ?? env.IR_DEV_LLM_KEY;
+  const authHeader = flagValue(flags, 'llm-auth-header') ?? env.IR_DEV_LLM_AUTH_HEADER;
+  const authScheme = flagValue(flags, 'llm-auth-scheme') ?? env.IR_DEV_LLM_AUTH_SCHEME;
+  return {
+    upstream: {
+      baseUrl,
+      ...(apiKey ? { apiKey } : {}),
+      ...(authHeader ? { authHeader } : {}),
+      ...(authScheme !== undefined ? { authScheme } : {}),
+    },
+    model,
+  };
 };
 
 // The URL path segments only admit [a-zA-Z0-9-_] (immediately-run-sdk
@@ -208,6 +269,10 @@ export const runDev = async (args: ParsedArgs): Promise<number> => {
     );
   }
 
+  // R3-77: resolve the optional dev LLM proxy (flags + IR_DEV_LLM_* env). Throws a
+  // clear error on a malformed --llm-url or a missing --llm-model.
+  const llmConfig = resolveDevLlmConfig(args.flags);
+
   // §9.1 bind selection. `localhost` (default) is the v1 loopback path; `tailscale`
   // serves HTTPS on the tailnet interface for cross-machine / iPhone-Safari use.
   const bindMode = (flagValue(args.flags, 'bind') ?? 'localhost').toLowerCase();
@@ -253,7 +318,14 @@ export const runDev = async (args: ParsedArgs): Promise<number> => {
     endpointHost = host;
   }
 
-  const handle = await startDevServer({ root, origin, token, port, bind });
+  const handle = await startDevServer({
+    root,
+    origin,
+    token,
+    port,
+    bind,
+    ...(llmConfig ? { llm: llmConfig.upstream } : {}),
+  });
   const projectName = sanitizeProjectName(basename(root));
   // LD2-1: the namespace carries the realpath disambiguator; repository stays the
   // bare project name (`local/<name>-<hash8>/<name>/live`).
@@ -266,7 +338,7 @@ export const runDev = async (args: ParsedArgs): Promise<number> => {
   // §6.8: a --region run flips the deep link — the path is the previewed GitHub
   // app (or empty for the host default landing) and the local source binds to the
   // named UI region via the fragment. Otherwise the local source IS the preview.
-  const url =
+  let url =
     region !== undefined
       ? buildRegionDeepLink(
           origin,
@@ -277,6 +349,15 @@ export const runDev = async (args: ParsedArgs): Promise<number> => {
           previewPath,
         )
       : buildDeepLink(origin, namespace, projectName, endpoint, token);
+  // R3-77: when the `/llm` proxy is configured, signal the host to route
+  // `llm.chat@1` through `${endpoint}/llm` with `ir-transport=llm` (the same param
+  // `immediately.run llm` emits), and carry the chosen model as `ir-llm-model`. The
+  // key is NEVER in the link — it lives server-side on this machine; only the
+  // (non-secret) transport flag + model id ride along, beside the host-only `ir-*`
+  // params, all stripped before any sandbox handoff.
+  if (llmConfig) {
+    url += `&ir-transport=llm&ir-llm-model=${encodeURIComponent(llmConfig.model)}`;
+  }
 
   if (args.flags.json === true) {
     // A3 (§10): exactly one JSON line on stdout once listening; everything else
@@ -296,6 +377,12 @@ export const runDev = async (args: ParsedArgs): Promise<number> => {
     console.log(`Serving ${root} (read-only) on ${endpoint}`);
     if (bind) console.log(`Bound to the tailnet interface ${bind.address} (tailnet peers only).`);
     console.log(`Allowed origin: ${origin}`);
+    if (llmConfig) {
+      console.log(
+        `LLM proxy: llm.chat → ${llmConfig.upstream.baseUrl} (model ${llmConfig.model}, ` +
+          `key injected server-side${llmConfig.upstream.apiKey ? '' : ' — none configured'}).`,
+      );
+    }
     if (region !== undefined) {
       console.log(
         `Serving as UI region: ${region} ` +
