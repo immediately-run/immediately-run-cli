@@ -21,6 +21,18 @@ export default function App() {
 const UTIL_TS = `export const add = (a: number, b: number): number => a + b;
 `;
 
+const POST_MDX = `---
+title: Hello
+tags:
+  - a
+  - b
+---
+
+# Heading
+
+A paragraph with a ~~strike~~ and a [link](https://example.com).
+`;
+
 // Build a throwaway git repo. commit.gpgsign is disabled because this is a plain
 // content fixture, not a signed release.
 const makeRepo = (files) => {
@@ -44,7 +56,6 @@ test('emits a valid index and byte-identical transpiled output', async () => {
   const root = makeRepo({
     'src/App.tsx': APP_TSX,
     'src/util.ts': UTIL_TS,
-    'README.md': '# not a source file\n',
     'node_modules/dep/index.js': 'module.exports = 1;\n',
   });
   try {
@@ -56,7 +67,7 @@ test('emits a valid index and byte-identical transpiled output', async () => {
     assert.equal(emission.index.toolchain.preset, 'react');
     assert.match(emission.index.toolchain.toolchainHash, /^[0-9a-f]{64}$/);
 
-    // covered sources in, README + node_modules out
+    // covered sources in, node_modules out
     const keys = Object.keys(emission.index.files).sort();
     assert.deepEqual(keys, ['/src/App.tsx', '/src/util.ts']);
 
@@ -76,6 +87,49 @@ test('emits a valid index and byte-identical transpiled output', async () => {
     // react-refresh instrumentation present on the .tsx, absent on the plain .ts
     assert.match(emission.files.get('transpiled/src/App.tsx.js'), /\$RefreshSig\$/);
     assert.doesNotMatch(emission.files.get('transpiled/src/util.ts.js'), /\$RefreshSig\$/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('emits .mdx (and .md) artifacts as MDX — react-refresh-instrumented, deps collected (G-MDX-2)', async () => {
+  const root = makeRepo({
+    'content/post.mdx': POST_MDX,
+    // App-root `.md` is MDX too (transpiler `isTransformable` covers `.mdx?`),
+    // so a README is compiled as MDX like any other content file.
+    'README.md': '# Readme\n\nPlain markdown.\n',
+    'node_modules/pkg/readme.md': '# not covered — under node_modules\n',
+  });
+  try {
+    const emission = await emitArtifacts(root, treeEntries(root));
+
+    // Both app-root markdown files are covered; the node_modules one is not.
+    const keys = Object.keys(emission.index.files).sort();
+    assert.deepEqual(keys, ['/README.md', '/content/post.mdx']);
+
+    // Byte-identity: the emitted `.mdx` artifact equals `transformFile` of the
+    // same source at the runtime path (the §1.1 build==runtime guarantee for MDX).
+    const expected = await transformFile({ path: '/app/content/post.mdx', code: POST_MDX });
+    assert.ok(!('error' in expected));
+    assert.equal(emission.files.get('transpiled/content/post.mdx.js'), expected.code);
+
+    const entry = emission.index.files['/content/post.mdx'];
+    // srcSha == the git blob sha, exactly like other extensions.
+    const blobSha = treeEntries(root).find((e) => e.path === 'content/post.mdx').sha;
+    assert.equal(entry.srcSha, blobSha);
+
+    // deps collected (not the old empty Set): the MDX-emitted provider import, and
+    // the react-refresh HMR helper the wrap adds — identical to transformFile.
+    assert.deepEqual(entry.deps, expected.deps);
+    assert.ok(
+      entry.deps.includes('@immediately-run/sdk/MDXProvider'),
+      `expected provider in deps, got ${JSON.stringify(entry.deps)}`,
+    );
+
+    // react-refresh instrumentation present → a seeded MDX artifact hot-accepts.
+    assert.match(emission.files.get('transpiled/content/post.mdx.js'), /\$RefreshSig\$/);
+    // frontmatter is stripped by the compile (it is data, not rendered content).
+    assert.doesNotMatch(emission.files.get('transpiled/content/post.mdx.js'), /tags:/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
