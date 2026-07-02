@@ -5,9 +5,9 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 
-import { transformFile } from '@immediately-run/transpiler';
+import { transformFile, parseFrontmatter } from '@immediately-run/transpiler';
 import { treeEntries } from '../dist/git.js';
-import { emitArtifacts } from '../dist/artifacts.js';
+import { emitArtifacts, emitMdxMetadata } from '../dist/artifacts.js';
 import { buildCacheZip } from '../dist/commands/cacheZip.js';
 
 const APP_TSX = `import { useState } from 'react';
@@ -132,6 +132,85 @@ test('emits .mdx (and .md) artifacts as MDX — react-refresh-instrumented, deps
     assert.doesNotMatch(emission.files.get('transpiled/content/post.mdx.js'), /tags:/);
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('emitMdxMetadata — .mdx-only, /app-space-ready keys, empty-frontmatter dropped (G-MDX-3)', () => {
+  const root = makeRepo({
+    'content/post.mdx': POST_MDX,
+    'content/empty.mdx': '---\n---\n\n# no frontmatter\n', // 0 keys → dropped
+    'content/none.mdx': '# plain, no fence\n', // no frontmatter → dropped
+    // App-root `.md` is MDX-transpilable (gets an artifact) but the metadata store
+    // is `.mdx`-only, so it must NOT appear in the sidecar (keeps §2 cache==live).
+    'README.md': '---\ntitle: Readme\n---\n\n# hi\n',
+    'node_modules/pkg/doc.mdx': '---\ntitle: dep\n---\n', // excluded
+  });
+  try {
+    const entries = treeEntries(root);
+    const { sidecar, count } = emitMdxMetadata(root, entries);
+
+    assert.equal(sidecar.schemaVersion, 1);
+    // Only the one .mdx with non-empty frontmatter; keys are repo-relative with a
+    // leading slash (the index.json / manifest key space).
+    assert.deepEqual(Object.keys(sidecar.files), ['/content/post.mdx']);
+    assert.equal(count, 1);
+
+    const e = sidecar.files['/content/post.mdx'];
+    // srcSha == git blob sha, exactly like the artifact index.
+    const blobSha = entries.find((x) => x.path === 'content/post.mdx').sha;
+    assert.equal(e.srcSha, blobSha);
+    // frontmatter is byte-identical to the shared parser (cache==live by construction).
+    assert.deepEqual(e.frontmatter, parseFrontmatter(POST_MDX).data);
+    assert.deepEqual(e.frontmatter, { title: 'Hello', tags: ['a', 'b'] });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('emitMdxMetadata — a malformed frontmatter file is omitted, non-fatally', () => {
+  const root = makeRepo({
+    'content/ok.mdx': POST_MDX,
+    'content/bad.mdx': '---\n: : not: valid: yaml\n\t- broken\n---\n\n# bad\n',
+  });
+  try {
+    const { sidecar, skipped } = emitMdxMetadata(root, treeEntries(root));
+    assert.ok('/content/ok.mdx' in sidecar.files);
+    assert.ok(!('/content/bad.mdx' in sidecar.files));
+    assert.equal(skipped.length, 1);
+    assert.equal(skipped[0].path, 'content/bad.mdx');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('cache-zip embeds mdx-metadata.json; --no-mdx-metadata omits it; no-frontmatter repo omits it', async () => {
+  const readEntry = (zip, name) =>
+    execFileSync('unzip', ['-p', zip, name], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+
+  const withRoot = makeRepo({ 'content/post.mdx': POST_MDX, 'package.json': '{"name":"x"}\n' });
+  try {
+    const withZip = join(withRoot, 'with.zip');
+    await buildCacheZip({ repoPath: withRoot, owner: 'a', repository: 'b', ref: 'main', out: withZip, lockset: false });
+    const sidecar = JSON.parse(readEntry(withZip, '.immediately.run/artifacts/mdx-metadata.json'));
+    assert.equal(sidecar.schemaVersion, 1);
+    assert.ok('/content/post.mdx' in sidecar.files);
+
+    // --no-mdx-metadata omits the sidecar.
+    const offZip = join(withRoot, 'off.zip');
+    await buildCacheZip({ repoPath: withRoot, owner: 'a', repository: 'b', ref: 'main', out: offZip, lockset: false, mdxMetadata: false });
+    assert.throws(() => readEntry(offZip, '.immediately.run/artifacts/mdx-metadata.json'));
+  } finally {
+    rmSync(withRoot, { recursive: true, force: true });
+  }
+
+  // A repo with no MDX frontmatter ships no sidecar (runtime live-scans, finds nothing).
+  const bareRoot = makeRepo({ 'src/App.tsx': APP_TSX, 'package.json': '{"name":"x"}\n' });
+  try {
+    const bareZip = join(bareRoot, 'bare.zip');
+    await buildCacheZip({ repoPath: bareRoot, owner: 'a', repository: 'b', ref: 'main', out: bareZip, lockset: false });
+    assert.throws(() => readEntry(bareZip, '.immediately.run/artifacts/mdx-metadata.json'));
+  } finally {
+    rmSync(bareRoot, { recursive: true, force: true });
   }
 });
 

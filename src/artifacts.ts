@@ -24,6 +24,7 @@ import { isUnderSidecar } from '@immediately-run/platform-constants';
 import {
   computeToolchainHash,
   isTransformable,
+  parseFrontmatter,
   PRESET_NAME,
   transformFile,
   TRANSPILER_VERSION,
@@ -166,4 +167,74 @@ export const emitArtifacts = async (
     sourceBytes,
     artifactBytes,
   };
+};
+
+export interface MdxMetadataFileEntry {
+  /** git blob SHA — must equal the manifest entry's `sha` (the runtime confines
+   *  a sidecar entry to a manifest member whose sha matches before seeding). */
+  srcSha: string;
+  /** The parsed frontmatter, byte-for-byte what the runtime's live scan derives. */
+  frontmatter: Record<string, unknown>;
+}
+
+export interface MdxMetadataSidecar {
+  schemaVersion: 1;
+  /** Repo-relative keys (`/content/post.mdx`), the manifest/`index.json` key space.
+   *  The runtime translates to the absolute `/app/...` metadata-store key at seed. */
+  files: Record<string, MdxMetadataFileEntry>;
+}
+
+export interface MdxMetadataEmission {
+  sidecar: MdxMetadataSidecar;
+  count: number;
+  skipped: { path: string; reason: string }[];
+}
+
+/**
+ * The frontmatter content-collection sidecar (MDX_CONTENT_COLLECTIONS_SPEC §1.3):
+ * a blob-SHA-keyed map from every tracked `.mdx` under the app root to its parsed
+ * frontmatter, so a clean cached boot can seed the metadata store from JSON instead
+ * of a recursive directory walk + per-file read across the COW port.
+ *
+ * `.mdx`-ONLY and byte-identical to the live scan by construction:
+ *  - The runtime metadata store is `.mdx`-only — `Bundler.preloadMDXMetadata` globs
+ *    `/**\/*.mdx` and `extractMetadata` guards `path.endsWith('.mdx')` — so an app-root
+ *    `.md` (which is MDX-transpilable, hence has a `/transpiled` artifact) still carries
+ *    NO frontmatter metadata. Emitting `.md` here would break the §2 cache==live set.
+ *  - Uses the SAME `parseFrontmatter` the runtime's `extractMetadata` uses.
+ *  - Replicates the empty-frontmatter DROP (`extractMetadata` stores nothing when the
+ *    parsed frontmatter has zero keys): no entry for absent/empty (`---\n---`) frontmatter.
+ *  - A file whose frontmatter fails to parse is omitted with a warning (as the runtime's
+ *    try/catch drops it), never failing the build — this is a third independently-failing
+ *    cache-zip step, opt-out via `--no-mdx-metadata`.
+ */
+export const emitMdxMetadata = (repo: string, entries: ManifestEntry[]): MdxMetadataEmission => {
+  const files: Record<string, MdxMetadataFileEntry> = {};
+  const skipped: { path: string; reason: string }[] = [];
+
+  for (const entry of entries) {
+    if (entry.type !== 'blob') continue;
+    const rel = entry.path;
+    if (isExcluded(rel)) continue;
+    // Case-sensitive `.mdx`, matching the runtime scan (NOT `isTransformable`'s
+    // case-insensitive `.mdx?` — that governs transpile coverage, not the store).
+    if (!rel.endsWith('.mdx')) continue;
+
+    const code = readBlob(repo, entry.sha);
+    let frontmatter: Record<string, unknown>;
+    try {
+      frontmatter = parseFrontmatter(code).data;
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      console.warn(`Warning: mdx-metadata omitted for ${rel} (frontmatter parse failed: ${reason})`);
+      skipped.push({ path: rel, reason });
+      continue;
+    }
+    // Empty-frontmatter drop — replicate extractMetadata exactly.
+    if (Object.keys(frontmatter).length === 0) continue;
+
+    files[`/${rel}`] = { srcSha: entry.sha, frontmatter };
+  }
+
+  return { sidecar: { schemaVersion: 1, files }, count: Object.keys(files).length, skipped };
 };
