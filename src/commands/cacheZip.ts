@@ -32,7 +32,12 @@ import {
   type DepMap,
   type BundledPackage,
 } from '../lockset.js';
-import { emitArtifacts, type ArtifactEmission } from '../artifacts.js';
+import {
+  emitArtifacts,
+  emitMdxMetadata,
+  type ArtifactEmission,
+  type MdxMetadataEmission,
+} from '../artifacts.js';
 import {
   COMMIT_HASH_RE,
   currentBranch,
@@ -64,6 +69,7 @@ Options:
   --out <path>              Output zip path
                             (default: <repo>/public/cached_repositories/<owner>/<repo>/<ref>.zip)
   --no-artifacts            Skip emitting pre-transpiled artifacts (source-only zip)
+  --no-mdx-metadata         Skip emitting the MDX frontmatter sidecar
   --no-lockset              Skip embedding the resolved-dependency lockset
   --bundle-packages         Bundle resolved dependency CONTENT into the zip
                             (R3-49a; opt-in, requires the lockset)
@@ -82,6 +88,11 @@ export interface CacheZipOptions {
   // by default; per-file transform failures are non-fatal (omit + warn), and the
   // runtime falls back to live transpile for anything absent.
   artifacts?: boolean;
+  // Frontmatter content-collection sidecar (MDX_CONTENT_COLLECTIONS_SPEC §1.3, a
+  // third independently-failing step). On by default; opt out with --no-mdx-metadata.
+  // Only emitted when at least one tracked `.mdx` has non-empty frontmatter; the
+  // runtime falls back to the live scan when it is absent.
+  mdxMetadata?: boolean;
   // Lockset embedding (PRETRANSPILED_ARTIFACTS_SPEC §7 step 2). On by default;
   // any failure to produce one is non-fatal — the zip ships without it and the
   // runtime resolves dependencies live, exactly as before.
@@ -106,6 +117,9 @@ export interface CacheZipResult {
   // Human-readable artifact outcome for the summary line: "<n> files (<k> skipped),
   // <bytes>" or "omitted (--no-artifacts)".
   artifactsSummary: string;
+  // Human-readable MDX-metadata outcome: "<n> entries", "no MDX frontmatter", or
+  // "omitted (--no-mdx-metadata)".
+  mdxMetadataSummary: string;
   // Human-readable lockset outcome for the summary line: "<n> packages" or
   // "omitted (<reason>)".
   locksetSummary: string;
@@ -280,6 +294,20 @@ export const buildCacheZip = async (opts: CacheZipOptions): Promise<CacheZipResu
     )} → ${formatBytes(emission.artifactBytes)}`;
   }
 
+  // 2b) Frontmatter content-collection sidecar (MDX_CONTENT_COLLECTIONS_SPEC §1.3) —
+  //     on by default, opt out with --no-mdx-metadata. Independently failing: a bad
+  //     frontmatter file is omitted-with-warning inside emitMdxMetadata, and the
+  //     runtime falls back to the live MDX scan when the sidecar is absent.
+  let mdxMetadataSummary = 'omitted (--no-mdx-metadata)';
+  let mdxEmission: MdxMetadataEmission | undefined;
+  if (opts.mdxMetadata !== false) {
+    mdxEmission = emitMdxMetadata(repo, entries);
+    const skip = mdxEmission.skipped.length ? ` (${mdxEmission.skipped.length} skipped)` : '';
+    mdxMetadataSummary = mdxEmission.count
+      ? `${mdxEmission.count} entries${skip}`
+      : `no MDX frontmatter${skip}`;
+  }
+
   // 3) Append the sidecar (+ artifacts) under .immediately.run/ in one zip call, with
   //    paths passed sorted so the appended set is reproducible run-to-run.
   const staging = mkdtempSync(join(tmpdir(), 'cache-zip-'));
@@ -297,6 +325,11 @@ export const buildCacheZip = async (opts: CacheZipOptions): Promise<CacheZipResu
       for (const [out, content] of emission.files) {
         stage(`${ARTIFACTS_DIR}/${out}`, content);
       }
+    }
+    // The frontmatter sidecar — only when it carries at least one entry (a repo with
+    // no MDX frontmatter ships no sidecar; the runtime live-scans, finding nothing).
+    if (mdxEmission && mdxEmission.count > 0) {
+      stage(`${ARTIFACTS_DIR}/mdx-metadata.json`, JSON.stringify(mdxEmission.sidecar, null, 2));
     }
     // Bundled dependency content (R3-49a) — verbatim `/package/` msgpack bytes plus an
     // index keyed by the CDN key (so the consume side can match a `fetchModule` hit)
@@ -332,6 +365,7 @@ export const buildCacheZip = async (opts: CacheZipOptions): Promise<CacheZipResu
     commitSha,
     entryCount: entries.length,
     artifactsSummary,
+    mdxMetadataSummary,
     locksetSummary,
     bundledPackagesSummary,
   };
@@ -353,6 +387,7 @@ export const runCacheZip = async (args: ParsedArgs): Promise<number> => {
     defaultBranch: flagValue(args.flags, 'default-branch'),
     out: flagValue(args.flags, 'out'),
     artifacts: args.flags['no-artifacts'] ? false : undefined,
+    mdxMetadata: args.flags['no-mdx-metadata'] ? false : undefined,
     lockset: args.flags['no-lockset'] ? false : undefined,
     bundlePackages: args.flags['bundle-packages'] ? true : undefined,
     cdnRoot: flagValue(args.flags, 'cdn-root'),
@@ -363,6 +398,7 @@ export const runCacheZip = async (args: ParsedArgs): Promise<number> => {
   console.log(`  commit:        ${result.commitSha}`);
   console.log(`  tracked files: ${result.entryCount}`);
   console.log(`  artifacts:     ${result.artifactsSummary}`);
+  console.log(`  mdx-metadata:  ${result.mdxMetadataSummary}`);
   console.log(`  lockset:       ${result.locksetSummary}`);
   console.log(`  bundled pkgs:  ${result.bundledPackagesSummary}`);
   return 0;
