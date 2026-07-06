@@ -36,6 +36,7 @@
     "build": "tsc",
     "check:sidecar": "node scripts/check-sidecar-literal.mjs",
     "test": "npm run build && npm run check:sidecar && node --test test/*.test.mjs",
+    "verify": "npm test && npm run build",
     "prepublishOnly": "npm run build"
   },
   "devDependencies": {
