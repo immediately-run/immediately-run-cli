@@ -92,3 +92,10 @@ backend refuse the **whole** policy (HTTP 422) and mint **nothing** — the comm
 prints each `{capability, reason}` and **exits non-zero**, so a CI step fails on a
 bad policy. Exit codes: `0` applied · `1` refused / mint failed · `2` usage/auth
 error · `3` rate-limited / server / network.
+
+## Verify (the CI/deploy gate)
+
+`npm run verify` runs this repo's full CI gate in one command — `test` (build +
+sidecar-literal check + the `node --test` suite) → `build`. Run it before pushing; it is
+the same set of checks CI enforces, so a local green equals a green CI. (Ways of working
+§4: the local verify gate must equal the deploy gate — one `npm run verify` per repo.)
