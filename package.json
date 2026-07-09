@@ -1,6 +1,6 @@
 {
   "name": "@immediately-run/cli",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Command-line tools for immediately.run: build a pre-cached repository zip (with a contribute manifest sidecar) for fast, rate-limit-free loading, and pin UI release locks for the region registry.",
   "type": "module",
   "license": "MIT",
@@ -51,7 +51,7 @@
   },
   "dependencies": {
     "@immediately-run/platform-constants": "^0.1.0",
-    "@immediately-run/transpiler": "^0.3.0",
+    "@immediately-run/transpiler": "^0.5.0",
     "@msgpack/msgpack": "^3.1.3"
   }
 }
