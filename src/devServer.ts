@@ -586,6 +586,18 @@ export const startDevServer = (opts: DevServerOptions): Promise<DevServerHandle>
         }
         const headers = buildUpstreamHeaders(req.headers, llm);
         const doFetch = llm.fetchImpl ?? fetch;
+        // R3-224 (§3.3 "abort the in-flight LLM request"): propagate a CALLER
+        // disconnect to the upstream. When the host aborts its fetch to this proxy
+        // (the app's stop button → cancel frame → `streamViaDevProxy` fetch abort),
+        // this connection closes; tear the proxy→provider request down too so the
+        // provider stops GENERATING and BILLING. Without this the client sees the
+        // stream stop while the upstream runs the completion to the end and bills it.
+        const upstreamAbort = new AbortController();
+        const onCallerGone = (): void => {
+          // Only abort a still-running stream — a normal end also emits 'close'.
+          if (!res.writableFinished) upstreamAbort.abort();
+        };
+        res.on('close', onCallerGone);
         let upstream: Response;
         try {
           upstream = await doFetch(target.url, {
@@ -595,9 +607,11 @@ export const startDevServer = (opts: DevServerOptions): Promise<DevServerHandle>
             // Never chase a redirect to another origin with the key attached —
             // hand the 3xx back instead (keeps the pin; mirrors the bridge stance).
             redirect: 'manual',
+            signal: upstreamAbort.signal,
           });
         } catch {
-          sendJson(res, 502, { error: 'upstream unreachable' }, cors);
+          // A caller-disconnect abort races the connect; don't write to a dead socket.
+          if (!upstreamAbort.signal.aborted) sendJson(res, 502, { error: 'upstream unreachable' }, cors);
           return;
         }
         // Stream the upstream response straight back. Pass the content-type
@@ -608,7 +622,13 @@ export const startDevServer = (opts: DevServerOptions): Promise<DevServerHandle>
         if (ct) out['Content-Type'] = ct;
         res.writeHead(upstream.status, out);
         if (upstream.body) {
-          Readable.fromWeb(upstream.body as Parameters<typeof Readable.fromWeb>[0]).pipe(res);
+          const body = Readable.fromWeb(upstream.body as Parameters<typeof Readable.fromWeb>[0]);
+          // If the caller vanishes mid-stream, destroy the source too so reading
+          // stops and the upstream `signal` abort actually closes the connection.
+          res.on('close', () => {
+            if (!res.writableFinished) body.destroy();
+          });
+          body.pipe(res);
         } else {
           res.end();
         }

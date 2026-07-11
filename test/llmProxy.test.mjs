@@ -140,6 +140,47 @@ test('forwards to the pinned upstream with the key injected server-side', async 
   assert.match(u.body, /llama3/); // body forwarded verbatim
 });
 
+test('R3-224: a caller disconnect mid-stream aborts the upstream request (stop billing)', async () => {
+  // A streaming upstream that emits one chunk then STALLS forever — it only ends
+  // when its inbound connection is torn down. It records that teardown.
+  let upstreamAborted = false;
+  const streamer = http.createServer((sreq, sres) => {
+    sreq.on('close', () => {
+      if (!sres.writableFinished) upstreamAborted = true;
+    });
+    sres.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    sres.write('data: {"choices":[{"delta":{"content":"hi"}}]}\n\n');
+    // deliberately never end → the completion "keeps generating/billing" until aborted
+  });
+  await new Promise((r) => streamer.listen(0, '127.0.0.1', r));
+  const streamerBase = `http://127.0.0.1:${streamer.address().port}`;
+  const h = await startDevServer({
+    root,
+    origin: ORIGIN,
+    token: TOKEN,
+    port: 0,
+    llm: { baseUrl: streamerBase, apiKey: KEY },
+  });
+  try {
+    const ac = new AbortController();
+    const res = await fetch(`http://127.0.0.1:${h.port}/llm/v1/chat/completions`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json', Origin: ORIGIN },
+      body: JSON.stringify({ model: 'm', messages: [], stream: true }),
+      signal: ac.signal,
+    });
+    const reader = res.body.getReader();
+    await reader.read(); // pull the first streamed token
+    ac.abort(); // the app hit stop → the host aborts its fetch to the proxy
+    // Poll (bounded) for the proxy to observe the client close and tear the upstream down.
+    for (let i = 0; i < 50 && !upstreamAborted; i++) await new Promise((r) => setTimeout(r, 20));
+    assert.equal(upstreamAborted, true, 'the proxy must abort its upstream provider request on a caller disconnect');
+  } finally {
+    await h.close();
+    await new Promise((r) => streamer.close(r));
+  }
+});
+
 test('not an open relay: a caller-supplied target is refused, upstream untouched', async () => {
   const before = reqs.length;
   const res = await fetch(`${base}/llm//evil.example/v1/x`, {
