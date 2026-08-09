@@ -4,18 +4,28 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+
+# R-TA-1 (TESTING_AUTOMATION_SPEC §6): publishing a public artifact is
+# DECISION-gated, not mechanical — an npm version is irreversible and
+# consumer-facing, so it is production-promotion-class. The release half is
+# therefore split out of the PR-validating build into its own job that declares
+# `environment: production` (a GitHub Environments protection rule with required
+# reviewers = the one-click human approval), and asserts at run time that the
+# approval actually happened. Keeping it in one job would have gated every PR
+# run behind an approval too, which is why this is a split rather than one added
+# line. Mirrors immediately-run-sdk/.github/workflows/ci.yml.
 jobs:
-  build-test-publish:
+  # Runs on every PR and every push to main. Holds NO write/publish authority —
+  # the release job below is the only one that does.
+  build-test:
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # for pushing the release tag
-      id-token: write   # for npm trusted publishing (OIDC)
+      contents: read
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
           node-version: '24'
-          registry-url: 'https://registry.npmjs.org'
           package-manager-cache: false  # never use caching in release builds
       # Trusted publishing requires npm >= 11.5.1
       - run: npm install -g npm@11
@@ -23,9 +33,59 @@ jobs:
       - run: npm test
       - run: npm run build
 
+  # The public-release job: git tag + npm publish. Both are irreversible.
+  #
+  # ⚠ OPERATOR PREREQUISITE (one-time, per repo — cannot be done from a PR):
+  #   Settings → Environments → New environment `production` → enable
+  #   "Required reviewers" and add the maintainer(s).
+  # Declaring `environment:` for an environment that does not exist makes GitHub
+  # AUTO-CREATE it with NO protection rules — i.e. the gate silently becomes a
+  # no-op, the exact failure this item exists to remove. That is why the first
+  # step below re-reads this run's own approval history and FAILS CLOSED when no
+  # human approval is recorded, instead of trusting the `environment:` key.
+  # `deploy/scripts/verify-release-gates.mjs` is the settings-side companion
+  # check (run it after configuring the environment).
+  release:
+    needs: build-test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: write   # pushing the release tag
+      id-token: write   # npm trusted publishing (OIDC)
+      actions: read     # read THIS run's approval history (the assertion below)
+    steps:
+      # Fail-closed authority gate (ways_of_working §2 "authority gates fail
+      # closed"): a run that reached here without a recorded `production`
+      # approval means the protection rule is missing or was removed. Refuse to
+      # publish rather than publish an irreversible version unattended.
+      - name: Assert this run cleared the `production` approval gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          APPROVALS=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/approvals")
+          COUNT=$(printf '%s' "$APPROVALS" | jq '[.[] | select(.state == "approved") | select(any(.environments[]?; .name == "production"))] | length')
+          if [ "${COUNT:-0}" -lt 1 ]; then
+            echo "::error::No human approval recorded for environment 'production' on this run. The Environments protection rule is missing (GitHub auto-creates an UNPROTECTED environment when one is declared but absent). Configure Settings → Environments → production → Required reviewers, then re-run. Refusing to publish an irreversible public version unattended (TESTING_AUTOMATION_SPEC R-TA-1)."
+            exit 1
+          fi
+          printf '%s' "$APPROVALS" | jq -r '.[] | select(.state == "approved") | "approved by \(.user.login): \(.comment // "")"'
+
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+          package-manager-cache: false  # never use caching in release builds
+      - run: npm install -g npm@11
+      - run: npm ci
+      # A fresh build in the release job: jobs share no filesystem. `npm test` is
+      # NOT repeated — `needs: build-test` already required it to pass on this
+      # exact commit.
+      - run: npm run build
+
       # Tag the release (guarded): a tag only when v<version> doesn't already exist.
       - name: Tag the release
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
           VERSION=$(node -p "require('./package.json').version")
           TAG="v$VERSION"
@@ -39,7 +99,6 @@ jobs:
           fi
 
       - name: Publish to npm via trusted publishing (skip if version already published)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
           # setup-node's registry-url writes an .npmrc that binds npm to NODE_AUTH_TOKEN.
           # Clearing it forces npm to use OIDC trusted publishing instead of (empty) token
