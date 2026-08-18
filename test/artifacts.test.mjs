@@ -7,7 +7,8 @@ import { tmpdir } from 'node:os';
 
 import { transformFile, parseFrontmatter } from '@immediately-run/transpiler';
 import { treeEntries } from '../dist/git.js';
-import { emitArtifacts, emitMdxMetadata } from '../dist/artifacts.js';
+import { assertEmittedSidecar, emitArtifacts, emitMdxMetadata } from '../dist/artifacts.js';
+import { validateMdxMetadataSidecar } from '@immediately-run/platform-constants';
 import { buildCacheZip } from '../dist/commands/cacheZip.js';
 
 const APP_TSX = `import { useState } from 'react';
@@ -271,6 +272,70 @@ test('cache-zip embeds the artifact index; --no-artifacts omits it', async () =>
       lockset: false,
     });
     assert.throws(() => readEntry(noArtifacts, '.immediately.run/artifacts/index.json'));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// R3-275b — the sidecar's schema is owned by @immediately-run/platform-constants now,
+// and this writer runs the READER's validator over its own output before the zip is
+// written. These pin that guard: the drift it catches is this emitter diverging from
+// the schema the sandbox enforces, caught in the build that produced the zip rather
+// than downstream, where an unusable sidecar looks exactly like a repo with no
+// frontmatter (the runtime treats present-but-unusable as "seeded, nothing to do").
+test('assertEmittedSidecar — a deliberately broken write is caught before it is written', () => {
+  const valid = { schemaVersion: 1, files: { '/a.mdx': { srcSha: 'abc', frontmatter: { t: 1 } } } };
+  assert.doesNotThrow(() => assertEmittedSidecar(valid));
+
+  // Whole-file breakage: the reader would not know what it is looking at.
+  assert.throws(
+    () => assertEmittedSidecar({ ...valid, schemaVersion: 2 }),
+    /schema-version/,
+  );
+  assert.throws(() => assertEmittedSidecar({ schemaVersion: 1, files: [] }), /files-not-an-object/);
+  assert.throws(() => assertEmittedSidecar(null), /not-an-object/);
+
+  // Entry-level breakage: the reader would silently drop just this file, so the guard
+  // has to name it rather than let a partly-useless sidecar ship.
+  assert.throws(
+    () => assertEmittedSidecar({ schemaVersion: 1, files: { '/a.mdx': { frontmatter: { t: 1 } } } }),
+    /entry-src-sha/,
+  );
+  assert.throws(
+    () => assertEmittedSidecar({ schemaVersion: 1, files: { '/a.mdx': { srcSha: 'x', frontmatter: 'nope' } } }),
+    /entry-frontmatter/,
+  );
+  assert.throws(
+    () => assertEmittedSidecar({ schemaVersion: 1, files: { '/a.mdx': { srcSha: 'x', frontmatter: {} } } }),
+    /entry-frontmatter-empty/,
+  );
+});
+
+test('emitMdxMetadata output is accepted by the shared validator, entry for entry', () => {
+  const root = makeRepo({
+    'content/post.mdx': POST_MDX,
+    'content/other.mdx': '---\ntitle: Other\ntags:\n  - a\n  - b\n---\n\n# other\n',
+  });
+  try {
+    const entries = treeEntries(root);
+    const { sidecar } = emitMdxMetadata(root, entries);
+
+    // The reader's own verdict on the writer's bytes — the round trip this item is
+    // about, minus the transport.
+    const verdict = validateMdxMetadataSidecar(JSON.parse(JSON.stringify(sidecar)));
+    assert.equal(verdict.ok, true);
+    assert.deepEqual(verdict.rejected, []);
+    assert.deepEqual(Object.keys(verdict.sidecar.files).sort(), ['/content/other.mdx', '/content/post.mdx']);
+
+    // …and the two confinement properties the sandbox checks ON TOP of the schema,
+    // which the writer is the only side able to get right: every key names a manifest
+    // member, and every srcSha is that member's blob sha. A sidecar that fails these
+    // validates fine and still seeds nothing.
+    for (const [key, entry] of Object.entries(verdict.sidecar.files)) {
+      const member = entries.find((e) => `/${e.path}` === key);
+      assert.ok(member, `sidecar key ${key} is not a manifest member`);
+      assert.equal(entry.srcSha, member.sha);
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
