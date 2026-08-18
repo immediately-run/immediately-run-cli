@@ -50,7 +50,7 @@
     "access": "public"
   },
   "dependencies": {
-    "@immediately-run/platform-constants": "^0.1.0",
+    "@immediately-run/platform-constants": "0.2.0",
     "@immediately-run/transpiler": "^0.5.0",
     "@msgpack/msgpack": "^3.1.3"
   }

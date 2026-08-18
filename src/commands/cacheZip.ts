@@ -17,7 +17,11 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 
-import { ARTIFACTS_DIR, PACKAGES_DIR } from '@immediately-run/platform-constants';
+import {
+  ARTIFACTS_DIR,
+  MDX_METADATA_SIDECAR_PATH,
+  PACKAGES_DIR,
+} from '@immediately-run/platform-constants';
 
 import {
   MANIFEST_SCHEMA_VERSION,
@@ -329,7 +333,7 @@ export const buildCacheZip = async (opts: CacheZipOptions): Promise<CacheZipResu
     // The frontmatter sidecar — only when it carries at least one entry (a repo with
     // no MDX frontmatter ships no sidecar; the runtime live-scans, finding nothing).
     if (mdxEmission && mdxEmission.count > 0) {
-      stage(`${ARTIFACTS_DIR}/mdx-metadata.json`, JSON.stringify(mdxEmission.sidecar, null, 2));
+      stage(MDX_METADATA_SIDECAR_PATH, JSON.stringify(mdxEmission.sidecar, null, 2));
     }
     // Bundled dependency content (R3-49a) — verbatim `/package/` msgpack bytes plus an
     // index keyed by the CDN key (so the consume side can match a `fetchModule` hit)

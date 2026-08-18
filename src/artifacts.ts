@@ -20,7 +20,14 @@ import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join, relative, sep } from 'node:path';
 
-import { isUnderSidecar } from '@immediately-run/platform-constants';
+import {
+  isJsonSerializable,
+  isUnderSidecar,
+  validateMdxMetadataSidecar,
+  type Frontmatter,
+  type MdxMetadataFileEntry,
+  type MdxMetadataSidecar,
+} from '@immediately-run/platform-constants';
 import {
   computeToolchainHash,
   isTransformable,
@@ -169,20 +176,18 @@ export const emitArtifacts = async (
   };
 };
 
-export interface MdxMetadataFileEntry {
-  /** git blob SHA — must equal the manifest entry's `sha` (the runtime confines
-   *  a sidecar entry to a manifest member whose sha matches before seeding). */
-  srcSha: string;
-  /** The parsed frontmatter, byte-for-byte what the runtime's live scan derives. */
-  frontmatter: Record<string, unknown>;
-}
-
-export interface MdxMetadataSidecar {
-  schemaVersion: 1;
-  /** Repo-relative keys (`/content/post.mdx`), the manifest/`index.json` key space.
-   *  The runtime translates to the absolute `/app/...` metadata-store key at seed. */
-  files: Record<string, MdxMetadataFileEntry>;
-}
+// The sidecar's SCHEMA is owned by `@immediately-run/platform-constants` (R3-275):
+// this writer and the sandbox's reader used to describe the format independently,
+// which is how a reader can tighten a check the writer never learns about — and every
+// entry it then drops looks exactly like "this repo has no frontmatter". Re-exported
+// under the names this package already published so consumers are unaffected.
+//
+// `srcSha` is the git blob SHA and must equal the manifest entry's `sha`: the runtime
+// confines a sidecar entry to a manifest member whose sha matches before seeding.
+// Keys are repo-relative with a leading slash (`/content/post.mdx`), the
+// manifest/`index.json` key space; the runtime translates them to the absolute
+// `/app/...` metadata-store key at seed time.
+export type { MdxMetadataFileEntry, MdxMetadataSidecar };
 
 export interface MdxMetadataEmission {
   sidecar: MdxMetadataSidecar;
@@ -233,8 +238,58 @@ export const emitMdxMetadata = (repo: string, entries: ManifestEntry[]): MdxMeta
     // Empty-frontmatter drop — replicate extractMetadata exactly.
     if (Object.keys(frontmatter).length === 0) continue;
 
-    files[`/${rel}`] = { srcSha: entry.sha, frontmatter };
+    // The envelope contract (R3-275): values must survive JSON unchanged. A value
+    // that does not — a `Date`, a non-finite number — would be written as something
+    // ELSE (a string, `null`) and the cached boot would then see a different value
+    // than the live scan, silently. Omit-with-warning instead, the same treatment a
+    // parse failure gets, so the sidecar is never a lie about what it carries.
+    //
+    // Unreachable with today's parser: `@immediately-run/transpiler` uses `yaml`'s
+    // core schema, which yields a string for `date: 2020-01-02`. This guards the
+    // parser CHANGING (a YAML-1.1 timestamp schema, a custom tag), which is exactly
+    // the kind of upstream change that would otherwise land as a boot-time mystery.
+    if (!isJsonSerializable(frontmatter)) {
+      const reason = 'frontmatter contains a value JSON cannot carry unchanged';
+      console.warn(`Warning: mdx-metadata omitted for ${rel} (${reason})`);
+      skipped.push({ path: rel, reason });
+      continue;
+    }
+
+    files[`/${rel}`] = { srcSha: entry.sha, frontmatter: frontmatter as Frontmatter };
   }
 
-  return { sidecar: { schemaVersion: 1, files }, count: Object.keys(files).length, skipped };
+  const sidecar: MdxMetadataSidecar = { schemaVersion: 1, files };
+  assertEmittedSidecar(sidecar);
+  return { sidecar, count: Object.keys(files).length, skipped };
+};
+
+/**
+ * Run the READER's validator over our own output before it is written (R3-275b).
+ *
+ * The point is not to catch a corrupted disk — nothing has touched the object yet.
+ * It is to catch THIS emitter drifting from the schema the sandbox enforces, here,
+ * in the build that produced the zip, instead of downstream as "the cache seeded
+ * nothing" on someone else's boot, which is indistinguishable from "this repo has no
+ * frontmatter". Since the two sides ran independent readings of the format until
+ * R3-275, that drift is the historically likely failure, not a hypothetical one.
+ *
+ * Throws rather than warning: a cache zip carrying a sidecar the runtime will
+ * discard is strictly worse than one carrying no sidecar at all — the runtime treats
+ * a present-but-unusable sidecar as "seeded, nothing to do" and does not live-scan.
+ */
+export const assertEmittedSidecar = (sidecar: MdxMetadataSidecar): void => {
+  const validation = validateMdxMetadataSidecar(sidecar);
+  if (!validation.ok) {
+    throw new Error(
+      `mdx-metadata sidecar failed its own schema validation (${validation.reason}) — ` +
+        'this is a bug in emitMdxMetadata, not in the repo being packaged.',
+    );
+  }
+  if (validation.rejected.length) {
+    const detail = validation.rejected.map((r) => `${r.path} (${r.reason})`).join(', ');
+    throw new Error(
+      `mdx-metadata sidecar built ${validation.rejected.length} entry/entries the runtime ` +
+        `would discard: ${detail} — this emitter and the shared schema have drifted.`,
+    );
+  }
 };
