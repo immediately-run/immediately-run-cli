@@ -22,7 +22,7 @@ import { existsSync, statSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { basename, resolve } from 'node:path';
 
-import { startDevServer } from '../devServer.js';
+import { startDevServer, runUntilShutdown } from '../devServer.js';
 import { AgentBridge, DEFAULT_CALL_TIMEOUT_MS } from '../bridge.js';
 import { runMcpStdio } from '../mcp.js';
 import { flagValue, type ParsedArgs } from '../args.js';
@@ -30,7 +30,7 @@ import {
   DEFAULT_ORIGIN,
   DEFAULT_PORT,
   isRecognizedOrigin,
-  realpathHash8,
+  identityHash8,
   sanitizeProjectName,
 } from './dev.js';
 
@@ -101,7 +101,7 @@ export const runAgent = async (args: ParsedArgs): Promise<number> => {
   const handle = await startDevServer({ root, origin, token, port, bridge });
   const endpoint = `http://127.0.0.1:${handle.port}`;
   const projectName = sanitizeProjectName(basename(root));
-  const namespace = `${projectName}-${realpathHash8(root)}`;
+  const namespace = `${projectName}-${identityHash8(root)}`;
   const url = buildAgentDeepLink(origin, handle.port, token);
 
   // stdout is the MCP JSON-RPC channel; everything human-facing → stderr.
@@ -113,12 +113,7 @@ export const runAgent = async (args: ParsedArgs): Promise<number> => {
   // Drive the MCP server over this process's stdio (Claude Code spawns us).
   const stopMcp = runMcpStdio(bridge);
 
-  return await new Promise<number>((resolveExit) => {
-    const shutdown = () => {
-      stopMcp();
-      void handle.close().finally(() => resolveExit(0));
-    };
-    process.once('SIGINT', shutdown);
-    process.once('SIGTERM', shutdown);
-  });
+  // R3-422: same graceful-shutdown path as `dev` — destroy live SSE
+  // connections, bounded grace period, force-exit on a wedge or second signal.
+  return await runUntilShutdown(handle, { onShutdown: stopMcp });
 };

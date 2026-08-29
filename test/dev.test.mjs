@@ -4,7 +4,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -12,6 +12,7 @@ import http from 'node:http';
 
 import {
   startDevServer,
+  runUntilShutdown,
   listWorkingTreeFiles,
   resolveSafe,
   isAllowedHost,
@@ -28,7 +29,7 @@ import {
   buildRegionDeepLink,
   parsePreviewPath,
   defaultPreviewPath,
-  realpathHash8,
+  identityHash8,
   isRecognizedOrigin,
   resolveDevLlmConfig,
   runDev,
@@ -335,24 +336,24 @@ test('unit: buildDeepLink carries a real https tailnet endpoint under --bind tai
   );
 });
 
-// --- LD2-1: realpath-hash cowName disambiguator (the §6.2 exit criterion) ---
+// --- LD2-1: path-hash cowName disambiguator (the §6.2 exit criterion) ---
 
-test('LD2-1: two same-named checkouts get distinct overlay identities; same realpath is stable', () => {
+test('LD2-1: two same-named checkouts get distinct overlay identities; same path is stable', () => {
   // Two checkouts that share the basename `my-app` at DIFFERENT paths.
   const a = mkdtempSync(join(tmpdir(), 'ir-cow-a-'));
   const b = mkdtempSync(join(tmpdir(), 'ir-cow-b-'));
   try {
     mkdirSync(join(a, 'my-app'));
     mkdirSync(join(b, 'my-app'));
-    const ha = realpathHash8(join(a, 'my-app'));
-    const hb = realpathHash8(join(b, 'my-app'));
+    const ha = identityHash8(join(a, 'my-app'));
+    const hb = identityHash8(join(b, 'my-app'));
     assert.match(ha, /^[0-9a-f]{8}$/);
     // Distinct checkouts → distinct hash → distinct namespace → distinct overlay
     // (the cross-checkout contamination LD2-1 closes).
     assert.notEqual(ha, hb);
-    // Reconnect semantics: the SAME realpath always yields the SAME hash, so the
-    // overlay + journal reattach across server restarts / new tokens / new ports.
-    assert.equal(realpathHash8(join(a, 'my-app')), ha);
+    // Reconnect semantics: the SAME invoked path always yields the SAME hash, so
+    // the overlay + journal reattach across server restarts / new tokens / ports.
+    assert.equal(identityHash8(join(a, 'my-app')), ha);
     // The host keys on the namespace segment, which now differs for the two:
     const nsA = `my-app-${ha}`;
     const nsB = `my-app-${hb}`;
@@ -363,6 +364,77 @@ test('LD2-1: two same-named checkouts get distinct overlay identities; same real
   } finally {
     rmSync(a, { recursive: true, force: true });
     rmSync(b, { recursive: true, force: true });
+  }
+});
+
+// --- R3-422: invoked-path identity (symlinks are honest) + --fresh salting ---
+
+test('R3-422: a symlinked checkout gets its own identity (invoked path, not realpath)', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'ir-sym-'));
+  try {
+    const real = join(dir, 'my-app');
+    mkdirSync(real);
+    const link = join(dir, 'my-app-link');
+    try {
+      symlinkSync(real, link, 'dir');
+    } catch {
+      t.skip('symlinks not permitted on this filesystem');
+      return;
+    }
+    // The docs promise: serving via a different path yields a fresh appKey. A
+    // realpath-derived hash collapsed the symlink onto its target and broke
+    // that; the invoked-path hash keeps the two identities distinct...
+    assert.notEqual(identityHash8(link), identityHash8(real));
+    // ...while resolving-to-the-same-realpath still holds for the filesystem
+    // (sanity: the link really does point at the same tree).
+    assert.equal(realpathSync(link), realpathSync(real));
+    // And each spelling is individually stable (reattach semantics preserved).
+    assert.equal(identityHash8(link), identityHash8(link));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('R3-422: identityHash8 salt (--fresh) changes the identity; no salt is the stable one', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ir-fresh-'));
+  try {
+    const base = identityHash8(dir);
+    assert.match(base, /^[0-9a-f]{8}$/);
+    const salted = identityHash8(dir, ' fresh:0011223344556677');
+    assert.match(salted, /^[0-9a-f]{8}$/);
+    assert.notEqual(salted, base);
+    // Two distinct salts (two --fresh runs) yield two distinct identities.
+    assert.notEqual(identityHash8(dir, ' fresh:aa'), identityHash8(dir, ' fresh:bb'));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('R3-422: dev --fresh serves a namespace distinct from the stable identity', async () => {
+  const proc = spawn(
+    process.execPath,
+    [CLI_ENTRY, 'dev', root, '--json', '--fresh', '--port', '0', '--origin', ORIGIN],
+    { stdio: ['ignore', 'pipe', 'ignore'] },
+  );
+  try {
+    const line = await new Promise((resolve, reject) => {
+      let out = '';
+      proc.stdout.on('data', (c) => {
+        out += c;
+        const nl = out.indexOf('\n');
+        if (nl !== -1) resolve(out.slice(0, nl));
+      });
+      proc.on('error', reject);
+      setTimeout(() => reject(new Error('no JSON line on stdout within 8s')), 8000);
+    });
+    const { url } = JSON.parse(line);
+    const ns = url.match(/\/edit\/local\/([^/]+)\//)[1];
+    // The salted namespace must NOT be the checkout's stable identity — that is
+    // the whole point of --fresh (new appKey, no prior grants).
+    assert.ok(!ns.endsWith(`-${identityHash8(root)}`), 'namespace must not reuse the stable hash');
+    assert.match(ns, /-[0-9a-f]{8}$/);
+  } finally {
+    proc.kill('SIGKILL');
   }
 });
 
@@ -483,6 +555,92 @@ test('A3: dev --json prints exactly one JSON line { url, endpoint, token, port }
     assert.equal(typeof obj.port, 'number');
   } finally {
     proc.kill('SIGINT');
+  }
+});
+
+// --- R3-422: graceful shutdown on SIGTERM/SIGINT --------------------------------
+// Mechanism under test: `http.Server.close()` waits for in-flight connections,
+// and the SSE routes (`/watch` etc.) hold never-ending keep-alive streams — so
+// before R3-422 a `dev` process with a page attached ignored a plain SIGTERM
+// (close() never called back) until `kill -9`. `close()` now destroys live
+// sockets, and `runUntilShutdown` adds the grace-timeout backstop.
+
+test('R3-422: handle.close() resolves promptly even with a live SSE /watch stream', async () => {
+  const srv = await startDevServer({ root, origin: ORIGIN, token: TOKEN, port: 0 });
+  // Attach a never-ending SSE consumer (this is what wedged the old close()).
+  const res = await fetch(`http://127.0.0.1:${srv.port}/watch?token=${TOKEN}`);
+  assert.equal(res.status, 200);
+  const closed = srv.close();
+  const outcome = await Promise.race([
+    closed.then(() => 'closed'),
+    new Promise((r) => setTimeout(() => r('hung'), 3000)),
+  ]);
+  assert.equal(outcome, 'closed', 'close() must not wait out a never-ending SSE stream');
+  await res.body.cancel().catch(() => {});
+});
+
+test('R3-422: runUntilShutdown force-exits when teardown hangs past the grace period', async () => {
+  const before = process.listeners('SIGTERM');
+  const forced = [];
+  const neverCloses = { close: () => new Promise(() => {}) };
+  const running = runUntilShutdown(neverCloses, {
+    graceMs: 50,
+    forceExit: (code) => forced.push(code),
+  });
+  try {
+    process.emit('SIGTERM', 'SIGTERM'); // in-process signal dispatch
+    await new Promise((r) => setTimeout(r, 200));
+    assert.deepEqual(forced, [1], 'a hung close() must trip the grace-timeout force exit');
+    // A second signal force-exits immediately (no second grace wait).
+    process.emit('SIGTERM', 'SIGTERM');
+    assert.deepEqual(forced, [1, 1]);
+    void running; // never resolves by design here — the forceExit hook fired instead
+  } finally {
+    // Drop the listeners runUntilShutdown registered so later tests are unaffected.
+    for (const l of process.listeners('SIGTERM')) {
+      if (!before.includes(l)) process.removeListener('SIGTERM', l);
+    }
+    for (const l of process.listeners('SIGINT')) {
+      if (!before.includes(l)) process.removeListener('SIGINT', l);
+    }
+  }
+});
+
+test('R3-422: a dev process with a live SSE consumer exits on a plain SIGTERM', async () => {
+  const proc = spawn(
+    process.execPath,
+    [CLI_ENTRY, 'dev', root, '--json', '--port', '0', '--origin', ORIGIN],
+    { stdio: ['ignore', 'pipe', 'pipe'] },
+  );
+  let sseRes;
+  try {
+    const line = await new Promise((resolve, reject) => {
+      let out = '';
+      proc.stdout.on('data', (c) => {
+        out += c;
+        const nl = out.indexOf('\n');
+        if (nl !== -1) resolve(out.slice(0, nl));
+      });
+      proc.on('error', reject);
+      setTimeout(() => reject(new Error('no JSON line on stdout within 8s')), 8000);
+    });
+    const { endpoint, token } = JSON.parse(line);
+    // Reproduce the reported hang: hold a /watch SSE stream open, then SIGTERM.
+    sseRes = await fetch(`${endpoint}/watch?token=${token}`);
+    assert.equal(sseRes.status, 200);
+
+    const exit = new Promise((resolve) => proc.on('exit', (code, signal) => resolve({ code, signal })));
+    proc.kill('SIGTERM'); // the plain `kill` that used to be ignored
+    const outcome = await Promise.race([
+      exit,
+      new Promise((_, rej) => setTimeout(() => rej(new Error('process ignored SIGTERM (still alive after 5s)')), 5000)),
+    ]);
+    // Graceful path: exit code 0 (the grace-timeout force path would be 1 —
+    // either is termination, but the clean close must win here).
+    assert.equal(outcome.code, 0, `expected a clean exit, got ${JSON.stringify(outcome)}`);
+  } finally {
+    if (sseRes) await sseRes.body.cancel().catch(() => {});
+    if (proc.exitCode === null) proc.kill('SIGKILL');
   }
 });
 

@@ -9,12 +9,12 @@
  * single parseable line.
  */
 
-import { existsSync, realpathSync, statSync } from 'node:fs';
+import { existsSync, statSync } from 'node:fs';
 import { createHash, randomBytes } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { basename, resolve } from 'node:path';
 
-import { startDevServer, type DevServerOptions } from '../devServer.js';
+import { startDevServer, runUntilShutdown, type DevServerOptions } from '../devServer.js';
 import type { LlmUpstream } from '../llmProxy.js';
 import { flagValue, type ParsedArgs } from '../args.js';
 import { resolveTailscaleCert, tailscaleSelf } from '../tailscale.js';
@@ -27,8 +27,18 @@ page is open.
 
 Arguments:
   repo-path                 Path to the project directory (default: cwd)
+                            The app's identity (its per-checkout namespace, and
+                            therefore its appKey on the host) derives from this
+                            path AS INVOKED — symlinks are not resolved — so a
+                            symlinked view of a checkout runs as a distinct app
+                            with its own grants and overlay.
 
 Options:
+  --fresh                   Salt the app identity for this run: the host sees a
+                            brand-new appKey with no prior grants or overlay —
+                            test your first-run consent flow honestly without
+                            copying the tree. Each --fresh run is distinct; drop
+                            the flag to return to the checkout's stable identity.
   --port <n>                Port to listen on (default: 7700)
   --bind <where>            'localhost' (default; Chrome/Firefox, same machine)
                             or 'tailscale' to serve HTTPS on the tailnet
@@ -159,17 +169,32 @@ export const sanitizeProjectName = (name: string): string => {
 };
 
 // The per-checkout disambiguator (LD2-1, LOCAL_DEVELOPMENT_SPEC §6.2, decision
-// #23): the first 8 lowercase-hex chars of SHA-256 over the project root's
-// RESOLVED real path. The CoW overlay/journal identity the host keys on is
+// #23): the first 8 lowercase-hex chars of SHA-256 over the project root path.
+// The CoW overlay/journal identity the host keys on is
 // `local/<name>-<hash8>/<name>/live`, so:
-//  - the SAME checkout (same realpath) always yields the same hash ⇒ the same
-//    overlay reattaches across server restarts / new tokens / new ports;
+//  - the SAME checkout (same invoked path) always yields the same hash ⇒ the
+//    same overlay reattaches across server restarts / new tokens / new ports;
 //  - two same-named checkouts at DIFFERENT paths get distinct hashes ⇒ distinct
 //    overlays, never cross-contaminating each other's in-browser edits.
 // Baking it into the deep-link namespace means the host needs no disk-path
 // knowledge — it just keys on the namespace segment it already parses.
-export const realpathHash8 = (root: string): string =>
-  createHash('sha256').update(realpathSync(root)).digest('hex').slice(0, 8);
+//
+// R3-422: the hash covers the path AS INVOKED (absolute-resolved, but symlinks
+// NOT followed — `resolve`, not `realpathSync`). The old realpath derivation
+// collapsed a symlinked checkout onto its target's identity, which silently
+// broke the documented "serve the tree from another path to get a fresh appKey"
+// consent-testing recipe; the invoked path keeps reattach semantics (same
+// spelling ⇒ same overlay) while letting a symlink honestly be a distinct app.
+// Serving/watching still follow symlinks naturally via the filesystem — only
+// identity is spelled the way the user typed it.
+//
+// `salt` (from `--fresh`) folds extra entropy into the identity so a run serves
+// under a brand-new namespace ⇒ a brand-new appKey with no prior grants.
+export const identityHash8 = (root: string, salt = ''): string =>
+  createHash('sha256')
+    .update(resolve(root) + salt)
+    .digest('hex')
+    .slice(0, 8);
 
 // The connection locator rides the URL fragment — never sent to any server —
 // because the path charset can't carry it (LOCAL_DEVELOPMENT_SPEC §6.4). The
@@ -327,9 +352,12 @@ export const runDev = async (args: ParsedArgs): Promise<number> => {
     ...(llmConfig ? { llm: llmConfig.upstream } : {}),
   });
   const projectName = sanitizeProjectName(basename(root));
-  // LD2-1: the namespace carries the realpath disambiguator; repository stays the
-  // bare project name (`local/<name>-<hash8>/<name>/live`).
-  const namespace = `${projectName}-${realpathHash8(root)}`;
+  // LD2-1: the namespace carries the invoked-path disambiguator; repository stays
+  // the bare project name (`local/<name>-<hash8>/<name>/live`). R3-422 `--fresh`
+  // salts it with per-run entropy so the host mints a brand-new appKey (no prior
+  // grants/overlay) without the tree having to be copied.
+  const freshSalt = args.flags.fresh === true ? ` fresh:${randomBytes(8).toString('hex')}` : '';
+  const namespace = `${projectName}-${identityHash8(root, freshSalt)}`;
   // The endpoint the iPhone/browser connects to: real https tailnet URL under a
   // tailnet bind, loopback http otherwise.
   const endpoint = bind
@@ -375,6 +403,9 @@ export const runDev = async (args: ParsedArgs): Promise<number> => {
     console.error(`Serving ${root} (read-only) on ${endpoint} for ${origin}. Ctrl-C to stop.`);
   } else {
     console.log(`Serving ${root} (read-only) on ${endpoint}`);
+    if (freshSalt) {
+      console.log('Fresh identity (--fresh): the host will mint a new appKey with no prior grants.');
+    }
     if (bind) console.log(`Bound to the tailnet interface ${bind.address} (tailnet peers only).`);
     console.log(`Allowed origin: ${origin}`);
     if (llmConfig) {
@@ -397,12 +428,9 @@ export const runDev = async (args: ParsedArgs): Promise<number> => {
     openInBrowser(url);
   }
 
-  // Run until interrupted; close the server cleanly on SIGINT/SIGTERM.
-  return await new Promise<number>((resolveExit) => {
-    const shutdown = () => {
-      void handle.close().finally(() => resolveExit(0));
-    };
-    process.once('SIGINT', shutdown);
-    process.once('SIGTERM', shutdown);
-  });
+  // Run until interrupted; close the server cleanly on SIGINT/SIGTERM. R3-422:
+  // runUntilShutdown destroys the live SSE connections and force-exits past a
+  // grace period, so a plain `kill` (SIGTERM) always terminates the process —
+  // see its doc comment for the mechanism behind the old hang.
+  return await runUntilShutdown(handle);
 };

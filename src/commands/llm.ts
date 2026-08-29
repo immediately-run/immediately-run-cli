@@ -19,7 +19,7 @@ import { existsSync, statSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { resolve } from 'node:path';
 
-import { startDevServer } from '../devServer.js';
+import { startDevServer, runUntilShutdown } from '../devServer.js';
 import { flagValue, type ParsedArgs } from '../args.js';
 import { DEFAULT_ORIGIN, DEFAULT_PORT, isRecognizedOrigin } from './dev.js';
 
@@ -149,11 +149,7 @@ export const runLlm = async (args: ParsedArgs): Promise<number> => {
   console.error(`  ${url}`);
   console.error(`Allowed origin: ${origin}. Press Ctrl-C to stop.`);
 
-  return await new Promise<number>((resolveExit) => {
-    const shutdown = () => {
-      void handle.close().finally(() => resolveExit(0));
-    };
-    process.once('SIGINT', shutdown);
-    process.once('SIGTERM', shutdown);
-  });
+  // R3-422: same graceful-shutdown path as `dev` — destroy live SSE
+  // connections, bounded grace period, force-exit on a wedge or second signal.
+  return await runUntilShutdown(handle);
 };
