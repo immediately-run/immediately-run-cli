@@ -25,6 +25,7 @@ const BOOLEAN_FLAGS = new Set([
   'republish',
   'origin-unsafe',
   'json',
+  'fresh',
 ]);
 
 export const parseArgs = (argv: string[]): ParsedArgs => {

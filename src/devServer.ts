@@ -38,6 +38,7 @@
 
 import * as http from 'node:http';
 import * as https from 'node:https';
+import type { Socket } from 'node:net';
 import { Readable } from 'node:stream';
 import { watch as fsWatch, statSync, createReadStream, readdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -113,6 +114,78 @@ export interface DevServerHandle {
   port: number;
   close(): Promise<void>;
 }
+
+/** R3-422: how long a signal-initiated shutdown may take before the process is
+ *  force-exited (teardown is normally instant; this is the wedge backstop). */
+export const SHUTDOWN_GRACE_MS = 2000;
+
+/**
+ * R3-422: run a serve-forever command until SIGINT/SIGTERM, then close the
+ * server and resolve the process exit code.
+ *
+ * WHY this exists — the old inline pattern
+ * (`process.once('SIGTERM', () => handle.close().finally(resolve))`) made
+ * `immediately.run dev` ignore a plain `kill`: the handler DID run, but
+ * `http.Server.close()` only stops new connections and waits for in-flight ones
+ * to finish — and `/watch`, `/debug`, and `/agent/pending` are never-ending
+ * keep-alive SSE streams, so with a page attached the close callback never
+ * fired, the promise never resolved, and the still-open sockets kept the event
+ * loop (and the process) alive until a `kill -9`. The fix is two-part:
+ * {@link startDevServer}'s `close()` now destroys in-flight connections so it
+ * completes promptly, and this helper adds a bounded grace period — if teardown
+ * still hangs past `graceMs` (or a second signal arrives), the process
+ * force-exits instead of wedging.
+ *
+ * `forceExit` is injectable for tests; production callers use `process.exit`.
+ */
+export const runUntilShutdown = (
+  handle: Pick<DevServerHandle, 'close'>,
+  options: {
+    graceMs?: number;
+    /** Extra teardown to run before the server closes (e.g. stop an MCP loop). */
+    onShutdown?: () => void;
+    forceExit?: (code: number) => void;
+  } = {},
+): Promise<number> => {
+  const graceMs = options.graceMs ?? SHUTDOWN_GRACE_MS;
+  const forceExit = options.forceExit ?? ((code: number) => process.exit(code));
+  return new Promise<number>((resolveExit) => {
+    let shuttingDown = false;
+    const shutdown = (): void => {
+      if (shuttingDown) {
+        // A second Ctrl-C / signal means "now": don't wait out the grace timer.
+        console.error('immediately.run: forced exit (second signal).');
+        forceExit(1);
+        return;
+      }
+      shuttingDown = true;
+      try {
+        options.onShutdown?.();
+      } catch {
+        /* teardown is best-effort on the way out */
+      }
+      // Wedge backstop: a hung teardown must not strand the process.
+      const timer = setTimeout(() => {
+        console.error(`immediately.run: teardown exceeded ${graceMs}ms; forcing exit.`);
+        forceExit(1);
+      }, graceMs);
+      timer.unref?.();
+      void handle.close().then(
+        () => {
+          clearTimeout(timer);
+          resolveExit(0);
+        },
+        () => {
+          clearTimeout(timer);
+          resolveExit(0);
+        },
+      );
+    };
+    // `on`, not `once`: the second signal must reach the force-exit branch.
+    process.on('SIGINT', shutdown);
+    process.on('SIGTERM', shutdown);
+  });
+};
 
 export interface TreeFile {
   path: string; // repo-relative, leading slash, '/'-separated
@@ -802,6 +875,21 @@ export const startDevServer = (opts: DevServerOptions): Promise<DevServerHandle>
     ? https.createServer({ cert: opts.bind.cert, key: opts.bind.key }, handler)
     : http.createServer(handler);
 
+  // R3-422: track every live TCP connection so `close()` can destroy them.
+  // `http.Server.close()` alone only refuses NEW connections and waits for the
+  // in-flight ones to end — but the SSE routes (`/watch`, `/debug`,
+  // `/agent/pending`) hold never-ending keep-alive responses, so with a page
+  // attached the close callback never fires and the open sockets keep the event
+  // loop alive: this is exactly why `immediately.run dev` used to survive a
+  // plain SIGTERM until `kill -9`. ('connection' fires for both plain HTTP and
+  // the §9.1 TLS server — for TLS it delivers the raw TCP socket, which is the
+  // right thing to destroy.)
+  const sockets = new Set<Socket>();
+  server.on('connection', (socket: Socket) => {
+    sockets.add(socket);
+    socket.once('close', () => sockets.delete(socket));
+  });
+
   return new Promise((resolve, reject) => {
     server.once('error', reject);
     // Loopback only (spec §8) unless a §9.1 tailnet bind is requested, in which
@@ -813,7 +901,13 @@ export const startDevServer = (opts: DevServerOptions): Promise<DevServerHandle>
         server,
         port,
         close: () =>
-          new Promise<void>((res2, rej2) => server.close((e) => (e ? rej2(e) : res2()))),
+          new Promise<void>((res2, rej2) => {
+            server.close((e) => (e ? rej2(e) : res2()));
+            // Destroy in-flight connections (the SSE streams never end on their
+            // own); each route's `req.on('close')` handler then clears its
+            // heartbeat interval / fs watcher, so nothing else pins the loop.
+            for (const socket of sockets) socket.destroy();
+          }),
       });
     });
   });
