@@ -51,7 +51,7 @@
   },
   "dependencies": {
     "@immediately-run/platform-constants": "0.2.0",
-    "@immediately-run/transpiler": "^0.5.0",
+    "@immediately-run/transpiler": "0.8.1",
     "@msgpack/msgpack": "^3.1.3"
   }
 }
