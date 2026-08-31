@@ -22,6 +22,7 @@ import {
   MDX_METADATA_SIDECAR_PATH,
   PACKAGES_DIR,
 } from '@immediately-run/platform-constants';
+import { rootRuntimeDependencies, type RootPackageShape } from '@immediately-run/transpiler';
 
 import {
   MANIFEST_SCHEMA_VERSION,
@@ -161,8 +162,13 @@ const headDependencies = (
     return { deps: {}, registryResolved: [], reason: 'package.json at HEAD is not valid JSON' };
   }
   const registryResolved = headRegistryResolved(parsed);
-  const deps = (parsed as { dependencies?: unknown }).dependencies;
-  if (!deps || typeof deps !== 'object' || Array.isArray(deps)) {
+  // R3-289: the lockset echo must be the SAME input DepMap the runtime computes
+  // — including the root package's non-optional `peerDependencies` (the root of
+  // a run has no consumer, so a peer is a runtime need there). The merge is the
+  // transpiler's shared `rootRuntimeDependencies`, the single source, so the
+  // runtime's echo-match against this lockset holds.
+  const deps = rootRuntimeDependencies(parsed as RootPackageShape);
+  if (Object.keys(deps).length === 0) {
     return { deps: {}, registryResolved, reason: 'package.json has no dependencies' };
   }
   for (const [name, range] of Object.entries(deps)) {
@@ -170,7 +176,7 @@ const headDependencies = (
       return { deps: {}, registryResolved, reason: `dependency ${name} has a non-string version` };
     }
   }
-  return { deps: deps as DepMap, registryResolved };
+  return { deps, registryResolved };
 };
 
 const resolveLockset = async (
