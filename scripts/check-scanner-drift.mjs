@@ -25,6 +25,20 @@ const PAIRS = [
   ['src/vendor/cjsScan/sourceScan.ts', 'src/utils/sourceScan.ts'],
 ];
 
+// The SECOND thing copied out of the sandbox, and the one that cost a live acceptance: the
+// order the runtime resolves relative specifiers in. `RUNTIME_EXTENSIONS` must equal
+// `bundler.ts`'s `extensions` default verbatim, ORDER INCLUDED — `.js` before `.cjs` is the
+// whole content of the rule, and a copy that merely holds the same SET resolves
+// `./Omnibox` to the other build and mispairs the interop. Not a missing file; a wrong one.
+const EXT_SOURCE = ['src/bundler/bundler.ts', /extensions: string\[\] = (\[[^\]]*\])/];
+const MINE_EXT = ['src/localPackageSource.ts', /RUNTIME_EXTENSIONS = (\[[^\]]*\])/];
+
+const extract = (text, re, what) => {
+  const m = re.exec(text);
+  if (!m) throw new Error(`could not find ${what} — the shape it is read from changed`);
+  return m[1].replace(/\s+/g, ' ').trim();
+};
+
 if (process.argv.includes('--self-test')) {
   const norm = (t) => ALLOWED.reduce((s, [from, to]) => s.split(to).join(from), t);
   const cases = [
@@ -32,6 +46,10 @@ if (process.argv.includes('--self-test')) {
     ['a changed line fails', 'a\nb\n', 'a\nc\n', false],
     ['the allowed import rewrite passes', "from './sourceScan.js';\n", "from '../../../utils/sourceScan';\n", true],
     ['a second, unallowed rewrite fails', "from './other.js';\n", "from '../../../utils/sourceScan';\n", false],
+    // The extension list is compared as TEXT so order counts; these prove it does.
+    ['the same extensions in the same order pass', "['.js', '.cjs']", "['.js', '.cjs']", true],
+    ['the same extensions REORDERED fail', "['.cjs', '.js']", "['.js', '.cjs']", false],
+    ['a missing extension fails', "['.js']", "['.js', '.cjs']", false],
   ];
   let bad = 0;
   for (const [name, mine, theirs, expected] of cases) {
@@ -81,4 +99,25 @@ if (drifted) {
   console.error('  `Dependency "…" not collected` at runtime, not at build time.');
   process.exit(1);
 }
+// The extension order, compared as text so a reordering fails.
+try {
+  const theirs = extract(readFileSync(join(SANDBOX, EXT_SOURCE[0]), 'utf8'), EXT_SOURCE[1], 'the sandbox resolver extensions');
+  const mine = extract(readFileSync(join(root, MINE_EXT[0]), 'utf8'), MINE_EXT[1], 'RUNTIME_EXTENSIONS');
+  if (mine !== theirs) {
+    console.error(`✗ RUNTIME_EXTENSIONS has DRIFTED from ${EXT_SOURCE[0]}`);
+    console.error(`      copy:    ${mine}`);
+    console.error(`      sandbox: ${theirs}`);
+    console.error('\n  Order is load-bearing: the runtime tries these against a relative');
+    console.error('  specifier in THIS order, so a package shipping both `x.js` and `x.cjs`');
+    console.error('  gets whichever comes first. Resolving to the other one does not fail —');
+    console.error('  it hands a module transpiled against one build to an importer expecting');
+    console.error('  the other ("Element type is invalid: … but got: object").');
+    process.exit(1);
+  }
+  console.log(`PASS  RUNTIME_EXTENSIONS matches the sandbox resolver: ${mine}`);
+} catch (err) {
+  console.error(`✗ ${err.message}`);
+  process.exit(1);
+}
+
 console.log('PASS  the vendored CJS scanner matches the sandbox, verbatim.');

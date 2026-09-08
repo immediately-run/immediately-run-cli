@@ -42,13 +42,16 @@ import {
   type DepMap,
   type BundledPackage,
 } from '../lockset.js';
+import { ownPackageRoot, platformProvidedNames } from '../platformProvided.js';
 import {
   buildLocalPackage,
+  mergeResolved,
   encodeLocalPackage,
   resolveFromInstalledTree,
   resolvePackageDir,
 } from '../localPackageSource.js';
 import { scanCjsModule } from '../vendor/cjsScan/scan.js';
+import { transformFile } from '@immediately-run/transpiler';
 import {
   emitArtifacts,
   emitMdxMetadata,
@@ -192,6 +195,23 @@ const headDependencies = (
 };
 
 /**
+ * The platform-injected dependencies (`react-refresh`, `core-js`, `react-error-boundary`),
+ * resolved from THIS package's own installed tree.
+ *
+ * Narrow on purpose: only names the augmented map added that the app's manifest never
+ * mentioned, so an app's own `react` can never be answered by ours. `check-platform-provided`
+ * keeps the set we carry in step with the set the transpiler injects.
+ */
+const resolvePlatformProvided = (rootDeps: DepMap, augmented: DepMap): ResolvedDependency[] => {
+  const names = platformProvidedNames(rootDeps, augmented);
+  const own = names.length ? ownPackageRoot() : null;
+  if (!own || names.length === 0) return [];
+  const wanted: DepMap = {};
+  for (const n of names) wanted[n] = augmented[n];
+  return resolveFromInstalledTree(own, wanted);
+};
+
+/**
  * The lockset, with any package the dependency CDN cannot resolve FILLED IN from the
  * runner's own installed tree (R3-567).
  *
@@ -232,9 +252,17 @@ const resolveLockset = async (
   }
 
   const local = resolveFromInstalledTree(repo, dependencies);
-  const have = new Set(fromCdn.map((r) => r.n));
-  const filled = local.filter((r) => !have.has(r.n));
-  const resolved = [...fromCdn, ...filled];
+  // The app's tree cannot hold what the app never declared, so the platform-injected names
+  // are resolved from OUR tree — narrowly, by name, never as a general second root. See
+  // `src/platformProvided.ts`; this is what makes exit criterion 1 reachable at all.
+  const platform = resolvePlatformProvided(deps, dependencies);
+  // STRICT PRECEDENCE, not concatenation: CDN, then the app's tree, then ours. Found on the
+  // live acceptance — `react-error-boundary` is injected by the platform AND hoisted into
+  // landing-page's tree, so a plain union emitted it twice, at two different versions
+  // (6.1.3 and 6.1.5), and `assertDependenciesResolved` was happy with both. The runtime
+  // takes one of them; nothing says which. A name is resolved once, by the nearest source.
+  const resolved = mergeResolved(fromCdn, local, platform);
+  const filled = resolved.slice(fromCdn.length);
 
   try {
     // The SAME completeness guard the runtime applies. A gap neither source could fill
@@ -273,6 +301,7 @@ const resolveBundledPackages = async (
   opts: CacheZipOptions,
   lockset: RepoManifest['lockset'] | undefined,
   repo: string,
+  platformNames: ReadonlySet<string> = new Set(),
 ): Promise<{ packages?: BundledPackage[]; summary: string }> => {
   if (!opts.bundlePackages) {
     return { summary: 'omitted (not requested)' };
@@ -286,9 +315,15 @@ const resolveBundledPackages = async (
   // always lose to the augmented build deps npm never installs.
   const localBuilt: BundledPackage[] = [];
   const needCdn: typeof lockset.resolved = [];
+  const localRefusals: string[] = [];
   for (const entry of lockset.resolved) {
     const { n: name, v: version } = entry;
-    const dir = resolvePackageDir(name, repo, repo);
+    // Same two roots as the lockset, and in the same order: the app's tree answers for
+    // what the app declared, ours only for what the platform injected. A package resolved
+    // from one and versioned from the other would be a silent substitution, so the root
+    // that supplies the directory is the root the version is read from.
+    const platformRoot = platformNames.has(name) ? ownPackageRoot() : null;
+    const dir = resolvePackageDir(name, repo, repo) ?? (platformRoot ? resolvePackageDir(name, platformRoot, platformRoot) : null);
     let installedVersion: string | null = null;
     try {
       installedVersion = dir ? (JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')).version ?? null) : null;
@@ -304,11 +339,15 @@ const resolveBundledPackages = async (
           key: encodePackageKey(name, version),
           name,
           version,
-          bytes: encodeLocalPackage(buildLocalPackage(dir, scanCjsModule)),
+          bytes: encodeLocalPackage(await buildLocalPackage(dir, scanCjsModule, transformFile)),
         });
         continue;
-      } catch {
-        /* fall through to the CDN for this one */
+      } catch (err) {
+        // A package that cannot be built LOCALLY falls back to the CDN whole — never
+        // half-built. `buildLocalPackage` throws rather than shipping a hole, and the
+        // refusal is surfaced: a silent fallback here is how a package would quietly go on
+        // depending on the CDN forever.
+        localRefusals.push(`${name}@${version}: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
     needCdn.push(entry);
@@ -318,6 +357,9 @@ const resolveBundledPackages = async (
     const fetched = needCdn.length ? await fetchBundledPackages(needCdn, opts.cdnRoot) : [];
     const packages = [...localBuilt, ...fetched];
     const bytes = packages.reduce((sum, p) => sum + p.bytes.byteLength, 0);
+    if (localRefusals.length) {
+      console.warn(`  · ${localRefusals.length} package(s) fell back to the CDN: ${localRefusals.slice(0, 3).join('; ')}`);
+    }
     const source =
       needCdn.length === 0
         ? 'all from node_modules'
@@ -363,7 +405,10 @@ export const buildCacheZip = async (opts: CacheZipOptions): Promise<CacheZipResu
   const defaultBranch = opts.defaultBranch || defaultBranchOf(repo, ref);
   const entries = treeEntries(repo);
   const { lockset, summary: locksetSummary } = await resolveLockset(repo, opts);
-  const { packages, summary: bundledPackagesSummary } = await resolveBundledPackages(opts, lockset, repo);
+  const platformNames = new Set(
+    lockset ? platformProvidedNames(headDependencies(repo).deps, lockset.dependencies) : [],
+  );
+  const { packages, summary: bundledPackagesSummary } = await resolveBundledPackages(opts, lockset, repo, platformNames);
 
   const manifest: RepoManifest = {
     schemaVersion: MANIFEST_SCHEMA_VERSION,

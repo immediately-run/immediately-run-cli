@@ -157,28 +157,92 @@ export function resolveFromInstalledTree(repoPath: string, wanted: DepMap): Reso
 
 // --- package content ---------------------------------------------------------
 
+/**
+ * Merge the resolution sources into one lockset list, NEAREST SOURCE WINS.
+ *
+ * The sources are ordered, not pooled: the dependency CDN, then the app's own installed
+ * tree, then the platform-provided tree this CLI carries. A name already resolved is never
+ * resolved again.
+ *
+ * This is a function rather than three spreads because concatenating them was wrong and the
+ * wrongness was invisible: `react-error-boundary` is injected by the platform AND hoisted
+ * into landing-page's `node_modules`, so the union emitted it twice at two versions, and
+ * `assertDependenciesResolved` — which checks that every wanted name is PRESENT — passed.
+ * A lockset with two entries for one name does not fail; it makes the runtime pick one,
+ * unpredictably, and `--bundle-packages` then ships content for whichever version the
+ * OTHER lookup found. Caught on the live acceptance, not by the suite.
+ */
+export function mergeResolved(...sources: readonly (readonly ResolvedDependency[])[]): ResolvedDependency[] {
+  const seen = new Set<string>();
+  const out: ResolvedDependency[] = [];
+  for (const source of sources) {
+    for (const r of source) {
+      if (seen.has(r.n)) continue;
+      seen.add(r.n);
+      out.push(r);
+    }
+  }
+  return out;
+}
+
 /** Extensions the bundler treats as JS it may need to evaluate. */
 const JS_RE = /\.(c|m)?js$/;
 
-/** Resolve a relative `require()` specifier to a file inside `dir`, node-style. */
-function resolveRelative(dir: string, fromFile: string, spec: string): string | null {
+/**
+ * The extension list the RUNTIME resolves relative specifiers with, in its order.
+ *
+ * Single-sourced from `sandbox/src/bundler/bundler.ts` (the `extensions` default that
+ * `resolveFromCdnLayout` receives) and checked against it by
+ * `scripts/check-scanner-drift.mjs`, because a private copy of someone else's resolution
+ * order is exactly the kind of thing that silently stops matching.
+ */
+export const RUNTIME_EXTENSIONS = ['.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx', '.mdx'];
+
+/**
+ * EVERY file a relative specifier could name, under any resolution the runtime might apply.
+ *
+ * ⚠ THIS RETURNS ALL CANDIDATES, NOT THE FIRST, AND THAT IS THE POINT. An earlier cut
+ * returned one, picked with node's importer-aware extension order (`.cjs` first from a CJS
+ * file). That order is node's; the runtime's is a single fixed list, `.js` before `.cjs`,
+ * the same for every importer (`bundler.ts` `extensions`, consumed by
+ * `resolveFromCdnLayout`). Picking either one is a bet on which resolver runs — the fast
+ * path, the general resolver, or an `exports` map choosing a different entry build — and a
+ * lost bet leaves a file the runtime DOES load sitting in the zip as a bare size, which is a
+ * blocking unpkg fetch at boot.
+ *
+ * There is nothing to gain by choosing. A dual-published package ships `x.js` and `x.cjs`
+ * for the same specifier; carrying both costs bytes (measured: omnibox 3.85x the CDN's
+ * payload, react 1.79x) and removes the guess. Over-inclusion is the safe direction — the
+ * asymmetry the whole suite is built on.
+ */
+function resolveRelativeAll(dir: string, fromFile: string, spec: string): string[] {
   const base = resolvePath(dirname(join(dir, fromFile)), spec);
-  const candidates = [
-    base,
-    `${base}.cjs`,
-    `${base}.js`,
-    `${base}.json`,
-    join(base, 'index.cjs'),
-    join(base, 'index.js'),
-  ];
+  const exts = ['', ...RUNTIME_EXTENSIONS];
+  // Phase A (the path itself) and phase B (a directory index), the runtime's two phases.
+  const candidates = [...exts.map((e) => `${base}${e}`), ...exts.map((e) => join(base, `index${e}`))];
+
+  // The general resolver's directory step, which the fast path has no equivalent of. A
+  // nested `package.json` can re-point `./sub` at a file no extension guess would reach.
+  try {
+    if (statSync(base).isDirectory()) {
+      const own = readJson(join(base, 'package.json'));
+      for (const v of [own?.module, own?.main]) {
+        if (typeof v === 'string') candidates.push(resolvePath(base, v));
+      }
+    }
+  } catch {
+    /* not a directory */
+  }
+
+  const out: string[] = [];
   for (const c of candidates) {
     try {
-      if (statSync(c).isFile()) return relative(dir, c).split('\\').join('/');
+      if (statSync(c).isFile()) out.push(relative(dir, c).split('\\').join('/'));
     } catch {
       /* not this one */
     }
   }
-  return null;
+  return [...new Set(out)];
 }
 
 /** Every file under `dir`, repo-relative with forward slashes, `node_modules` excluded. */
@@ -200,6 +264,25 @@ function walkFiles(dir: string, sub = ''): string[] {
   return out;
 }
 
+/**
+ * Conditions not to seed from. `types`/`typings` are declarations; `react-server` is a
+ * server-only condition a browser bundler never takes.
+ *
+ * `import` and `module` are DELIBERATELY ABSENT, and that is the round-2 correction. They
+ * were skipped on the theory that the runtime evaluates the CJS side — it does not. The
+ * resolver's field priority is `['module', 'browser', 'main', 'jsnext:main']`
+ * (`sandbox/src/resolver/utils/pkg-json.ts`), so `module` is PREFERRED, and a package with
+ * no `exports` at all (lucide-react) is loaded entirely from its ESM build. Skipping ESM
+ * left 1,803 of its files size-only — a blocking unpkg fetch each, at boot. They are seeded
+ * now because `transpileToCjs` makes them safe to inline.
+ */
+const SKIP_CONDITIONS = new Set(['types', 'typings', 'react-server']);
+
+/** The main-ish fields the resolver tries, IN ITS ORDER. All are seeded: which one the
+ *  runtime picks depends on which files exist, and guessing wrong leaves an entry point
+ *  size-only, which is the boot-time unpkg fetch this module exists to prevent. */
+const MAIN_FIELDS = ['module', 'browser', 'main', 'jsnext:main'];
+
 /** The CJS entry a bundler would load for this package, repo-relative. */
 export function cjsEntry(pkg: Record<string, unknown>): string {
   const main = typeof pkg.main === 'string' ? pkg.main : null;
@@ -207,48 +290,47 @@ export function cjsEntry(pkg: Record<string, unknown>): string {
 }
 
 /**
- * Conditions NOT to seed from.
+ * Every entry point a consumer can reach, repo-relative: each `MAIN_FIELDS` value plus
+ * every `exports` target, with `./*` patterns expanded against the files present.
  *
- * `import`/`module` name the ESM build, which the runtime does not evaluate (the CDN
- * records it size-only). `types`/`typings` are declarations. `react-server` is a
- * server-only condition a browser bundler never takes — excluded on that ground, not
- * because the CDN happens to skip it.
- *
- * NOTE THE ASYMMETRY, because it decides how the differential test is written: including
- * a file the runtime never evaluates costs BYTES; excluding one it does evaluate costs a
- * blocking unpkg fetch at boot. So this list stays short and principled, and the test
- * asserts a SUPERSET of the CDN rather than equality.
+ * WILDCARDS ARE NOT OPTIONAL. `"./icons/*": "./dist/esm/icons/*.mjs"` is how a package with
+ * a thousand entry points declares them, and emitting the literal `dist/esm/icons/*.mjs`
+ * drops all of them silently — which is most of lucide-react. The runtime expands them
+ * (`resolver/utils/exports.ts`), so this must too.
  */
-const SKIP_CONDITIONS = new Set(['import', 'module', 'types', 'typings', 'react-server']);
-
-/**
- * Every entry point a consumer can reach, repo-relative — `main` plus each `exports`
- * target that is not ESM-only.
- *
- * THIS IS THE FINDING THAT MADE THE FIRST VERSION WORSE THAN USELESS. Seeding only from
- * `main` inlines only `main`'s require closure, so a multi-entry package ships its other
- * entries as SIZE ONLY — `react/jsx-runtime`, `react-dom/client`, and 1,803 of
- * `lucide-react`'s files. The runtime's `RegistryFS` treats a size-only entry as existing
- * and lazily fetches its bytes **from unpkg**, one blocking round trip per file on every
- * cold boot. That trades one third-party boot dependency for another, silently, which is
- * the exact opposite of this module's purpose.
- *
- * It was invisible because the only fixture had a single `.` export. `react` is now a
- * fixture too, precisely because it does not.
- */
-export function entryPoints(pkg: Record<string, unknown>): string[] {
-  const out = new Set<string>([cjsEntry(pkg)]);
-  const visit = (node: unknown, condition: string | null): void => {
-    if (typeof node === 'string') {
-      if (condition === null || !SKIP_CONDITIONS.has(condition)) {
-        out.add(node.replace(/^\.\//, ''));
-      }
+export function entryPoints(pkg: Record<string, unknown>, files: readonly string[] = []): string[] {
+  const out = new Set<string>();
+  const add = (target: string): void => {
+    const rel = target.replace(/^\.\//, '');
+    if (!rel.includes('*')) {
+      out.add(rel);
       return;
     }
-    if (!node || typeof node !== 'object') return;
+    // Expanded against what is actually on disk, rather than inventing paths.
+    const [before, after = ''] = rel.split('*');
+    for (const f of files) if (f.startsWith(before) && f.endsWith(after)) out.add(f);
+  };
+
+  for (const field of MAIN_FIELDS) {
+    const v = pkg[field];
+    if (typeof v === 'string') add(v);
+  }
+  if (!MAIN_FIELDS.some((f) => typeof pkg[f] === 'string')) add('index.js');
+
+  const visit = (node: unknown, condition: string | null): void => {
+    if (typeof node === 'string') {
+      if (condition === null || !SKIP_CONDITIONS.has(condition)) add(node);
+      return;
+    }
+    // An ARRAY is a fallback list: its numeric keys are neither subpaths nor conditions, so
+    // the inherited condition must carry through. Treating "0" as a condition is how the
+    // old `import` skip leaked an untranspiled ESM file into the bundle.
+    if (Array.isArray(node)) {
+      for (const item of node) visit(item, condition);
+      return;
+    }
+    if (!node || typeof node !== 'object') return; // a `null` target means "blocked"
     for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
-      // A subpath key ("." / "./jsx-runtime") keeps the inherited condition; a condition
-      // key ("require" / "import" / "default") replaces it.
       visit(value, key.startsWith('.') ? condition : key);
     }
   };
@@ -256,27 +338,42 @@ export function entryPoints(pkg: Record<string, unknown>): string[] {
   return [...out];
 }
 
+/** What a file contributes: its shipped source and the specifiers to walk. */
+export interface TranspileResult {
+  code: string;
+  deps: string[];
+}
+
+/** Transpile a non-CJS module to CJS. Injected so this file stays dependency-free and the
+ *  caller supplies `@immediately-run/transpiler`'s `transformFile`. */
+export type Transpiler = (input: { path: string; code: string }) => Promise<{ code?: string; deps?: string[]; error?: { message: string } }>;
+
 /**
  * Build the `ICDNModule` for an installed package.
  *
- * `scan` is injected (the sandbox's `scanCjsModule`, or any equivalent) rather than
- * imported, so this module stays dependency-free and the test can drive the REAL scanner
- * the runtime uses instead of a second implementation that agrees with itself.
+ * ⚠ AN ESM FILE MUST BE TRANSPILED BEFORE IT IS INLINED, AND THAT IS NOT AN OPTIMISATION.
+ * `_writePrecompiledModule` constructs every content-carrying file as
+ * `new Module(path, file.c, true, …)` — `isCompiled`, unconditionally — and nothing on the
+ * consume side reads `file.t`. So shipping raw ESM does not cost bytes and does not fall
+ * back to anything: the bundler treats `import …` as finished CJS, and the app breaks at
+ * boot. The CDN transpiles before inlining, and so does the sandbox's own esm.sh fallback;
+ * this does too, via the same `@immediately-run/transpiler` the runtime uses — which also
+ * hands back the dependency list, so `d` comes from the real producer rather than a scan.
  *
- * Content is carried for the transitive `require()` closure of the CJS entry, because the
- * runtime marks those modules precompiled and never scans them (see the file header);
- * every other file is recorded as a byte SIZE, which is what the CDN does and what keeps
- * the zip from carrying a package's ESM build, sourcemaps and typings for nothing.
+ * Content is carried for the transitive closure of EVERY entry point (see `entryPoints`),
+ * because a bundled module is never scanned and an entry left size-only is a blocking unpkg
+ * fetch at boot. Everything else is recorded as a byte SIZE, which is what the CDN does and
+ * what keeps a package's sourcemaps and typings out of the zip.
  */
-export function buildLocalPackage(
+export async function buildLocalPackage(
   packageDir: string,
-  scan: (source: string) => { requires: string[] },
-): LocalModule {
+  scan: (source: string) => { requires: string[]; isEsm: boolean },
+  transpile: Transpiler,
+): Promise<LocalModule> {
   const pkg = readJson(join(packageDir, 'package.json')) ?? {};
   const files = walkFiles(packageDir);
   const f: Record<string, LocalModuleFile | number> = {};
 
-  // Size-only for everything first; the closure below upgrades what it reaches.
   for (const rel of files) {
     try {
       f[rel] = statSync(join(packageDir, rel)).size;
@@ -285,8 +382,11 @@ export function buildLocalPackage(
     }
   }
 
-  const queue = [...entryPoints(pkg), 'package.json'].filter((p) => f[p] !== undefined);
+  const name = typeof pkg.name === 'string' ? pkg.name : 'pkg';
+  const queue = [...entryPoints(pkg, files), 'package.json'].filter((p) => f[p] !== undefined);
   const seen = new Set<string>();
+  const failures: string[] = [];
+
   while (queue.length) {
     const rel = queue.shift()!;
     if (seen.has(rel)) continue;
@@ -297,19 +397,47 @@ export function buildLocalPackage(
     } catch {
       continue;
     }
-    const isJs = JS_RE.test(rel);
-    const requires = isJs ? scan(source).requires : [];
-    f[rel] = { c: source, d: requires, t: isJs };
-    for (const spec of requires) {
-      if (!spec.startsWith('.')) continue; // a bare specifier is another PACKAGE, not our file
-      const target = resolveRelative(packageDir, rel, spec);
-      if (target && f[target] !== undefined) queue.push(target);
+
+    if (!JS_RE.test(rel)) {
+      // An asset the closure reached (a stylesheet, a JSON): shipped verbatim, no deps.
+      f[rel] = { c: source, d: [], t: false };
+      continue;
+    }
+
+    const scanned = scan(source);
+    let content = source;
+    let deps = scanned.requires;
+    if (scanned.isEsm) {
+      // `path` is what the transpiler keys its transform chain on, so it must look like the
+      // module's real location — a bare basename picks a different chain.
+      const result = await transpile({ path: `/node_modules/${name}/${rel}`, code: source });
+      if (result.error || typeof result.code !== 'string') {
+        // Leave it as a SIZE rather than ship ESM as if it were compiled. That costs an
+        // unpkg fetch for this file; shipping it raw costs the whole app. Recorded so the
+        // caller can refuse the package outright rather than ship a quiet hole.
+        failures.push(`${rel}: ${result.error?.message ?? 'no output'}`);
+        continue;
+      }
+      content = result.code;
+      deps = result.deps ?? [];
+    }
+
+    f[rel] = { c: content, d: deps, t: true };
+    for (const spec of deps) {
+      if (!spec.startsWith('.')) continue; // a bare specifier is another PACKAGE
+      for (const target of resolveRelativeAll(packageDir, rel, spec)) {
+        if (f[target] !== undefined) queue.push(target);
+      }
     }
   }
 
+  if (failures.length) {
+    throw new Error(`could not transpile ${failures.length} file(s): ${failures.slice(0, 3).join('; ')}`);
+  }
+
   // `m` is the package's own EXTERNAL dependencies — the names the runtime must have
-  // resolved elsewhere. Taken from its manifest rather than from the scan, because a
-  // conditional or lazy require would otherwise silently drop a real dependency.
+  // resolved elsewhere. Taken from the manifest rather than the scan, because a conditional
+  // or lazy require would otherwise silently drop a real dependency.
   const deps = (pkg.dependencies ?? {}) as Record<string, string>;
   const peer = (pkg.peerDependencies ?? {}) as Record<string, string>;
   const m = [...new Set([...Object.keys(deps), ...Object.keys(peer)])].sort();
