@@ -34,6 +34,28 @@ import { scanCjsRequires as scanCjsModule } from '../dist/scanCjsRequires.js';
 
 const sorted = (a) => [...a].sort();
 
+// FIRST, because everything below is meaningless without it. `dist` is gitignored in this
+// repo and the fixture IS a published package's dist, so `git add` silently committed 4 of
+// its 29 files: green locally, red in CI, on a fixture that looked present. The negation in
+// .gitignore is the fix; this is the guard that would have named it in one line instead of
+// as a confusing assertion failure three tests later.
+test('the fixture is intact — a partial checkout fails HERE, by name', () => {
+  const missing = Object.keys(CDN.f).filter((rel) => {
+    try {
+      readFileSync(join(FIXTURE, rel));
+      return false;
+    } catch {
+      return true;
+    }
+  });
+  assert.deepEqual(
+    missing,
+    [],
+    `test/fixtures/omnibox-0.2.1 is incomplete — ${missing.length} of ${Object.keys(CDN.f).length} files absent. ` +
+      'Check .gitignore: this fixture is a package dist.',
+  );
+});
+
 test('the local build carries exactly the files the CDN carries', () => {
   const local = buildLocalPackage(FIXTURE, scanCjsModule);
   assert.deepEqual(sorted(Object.keys(local.f)), sorted(Object.keys(CDN.f)));

@@ -1,0 +1,274 @@
+/* The omnibox (R3-512; FRONT_DOOR_IA §5). Tokens come from index.css only; the
+   floating results panel (desktop nav variant) is the only shadowed form —
+   hero, new, and every mobile form are in-flow and carry no shadow. */
+
+.omnibox-outer {
+  width: 100%;
+}
+
+.omnibox-outer--hero,
+.omnibox-outer--new {
+  max-width: 620px;
+}
+
+.omnibox-row {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  border: 1px solid var(--line);
+  border-color: var(--accent);
+  border-radius: var(--r-md);
+  background: var(--panel);
+  overflow: hidden;
+}
+
+.omnibox-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  font: 400 16px/1.2 var(--sans);
+  padding: 14px 14px;
+  outline: none;
+}
+
+.omnibox-input:focus-visible {
+  outline: none;
+}
+
+.omnibox-outer:focus-within .omnibox-row {
+  box-shadow: var(--glow);
+}
+
+.omnibox-chip {
+  display: flex;
+  align-items: center;
+  padding: 0 0 0 16px;
+  flex: 0 0 auto;
+}
+
+.omnibox-chip-label,
+.omnibox-chip-select {
+  font: 400 12px/1 var(--mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-2);
+  background: transparent;
+  border: 0;
+}
+
+.omnibox-run {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin: 6px;
+  padding: 8px 18px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--ink);
+  font: 700 14px/1 var(--sans);
+  text-decoration: none;
+  cursor: pointer;
+  align-self: center;
+}
+
+.omnibox-run-arrow {
+  font-family: var(--mono);
+}
+
+.omnibox--hero .omnibox-run:not([aria-disabled='true']),
+.omnibox--new .omnibox-run:not([aria-disabled='true']) {
+  border: 0;
+  color: #16101a;
+  background-image: var(--grad-btn);
+}
+
+.omnibox-run[aria-disabled='true'] {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.omnibox-helper {
+  margin: 8px 2px 0;
+  font: 400 12px/1.4 var(--mono);
+  color: var(--ink-2);
+}
+
+/* ── results panel ─────────────────────────────────────────────────────── */
+
+.omnibox-panel {
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg);
+  margin-top: 8px;
+  padding: 6px;
+  /* in-flow by default: it pushes content down (mobile + hero + new) */
+}
+
+.omnibox-group {
+  padding: 4px 0;
+}
+
+.omnibox-group + .omnibox-group {
+  border-top: 1px solid var(--line);
+}
+
+.omnibox-option {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+  padding: 10px 12px;
+  border-radius: var(--r-xs);
+  color: var(--ink);
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.omnibox-option[aria-selected='true'],
+.omnibox-option:hover {
+  background: var(--line);
+}
+
+.omnibox-option-name {
+  font-weight: 600;
+  font-size: 15px;
+}
+
+.omnibox-option-cat {
+  font: 400 11px/1 var(--mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-2);
+}
+
+.omnibox-option-blurb {
+  flex-basis: 100%;
+  font-size: 13px;
+  color: var(--ink-2);
+}
+
+.omnibox-option-action {
+  margin-left: auto;
+  font: 400 12px/1 var(--mono);
+  color: var(--ink-2);
+}
+
+.omnibox-empty {
+  padding: 14px 12px;
+  color: var(--ink-2);
+  font-size: 14px;
+}
+
+/* ── nav variant (desktop): floating field + shadowed panel ────────────── */
+
+.omnibox-outer--nav {
+  position: relative;
+  width: 230px;
+}
+
+.omnibox-outer--nav .omnibox-row {
+  border-color: var(--line);
+  border-radius: var(--r-sm);
+}
+
+.omnibox-outer--nav .omnibox-input {
+  padding: 9px 12px;
+  font-size: 14px;
+}
+
+.omnibox-outer--nav .omnibox-helper {
+  display: none;
+}
+
+.omnibox-outer--nav .omnibox-panel {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 0;
+  right: 0;
+  box-shadow: var(--shadow-pop);
+  z-index: 30;
+}
+
+.omnibox-nav-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--ink);
+  font: 400 14px/1 var(--sans);
+  padding: 9px 12px;
+  cursor: pointer;
+}
+
+.omnibox-nav-button .omnibox-nav-button-label {
+  color: var(--ink-2);
+}
+
+/* ── mobile (FRONT_DOOR_IA §5.5): full width, chip collapses into the field's
+   left padding, Run is an in-field 44px arrow, panel in-flow ───────────── */
+
+@media (max-width: 720px) {
+  .omnibox-outer--nav {
+    width: 100%;
+  }
+
+  .omnibox-chip {
+    display: none;
+  }
+
+  .omnibox-input {
+    padding-left: 16px;
+  }
+
+  .omnibox-run {
+    margin: 5px;
+    padding: 0;
+    width: 44px;
+    height: 44px;
+    justify-content: center;
+    gap: 0;
+  }
+
+  .omnibox-run-label {
+    display: none;
+  }
+
+  .omnibox-run-arrow {
+    font-size: 20px;
+  }
+
+  .omnibox-outer--nav .omnibox-helper {
+    display: block;
+  }
+
+  .omnibox-outer--nav .omnibox-panel {
+    position: static;
+    box-shadow: none;
+  }
+}
+
+/* The visually hidden label / live region: present to assistive tech, absent
+   to the eye. Scoped here so the omnibox owns its own a11y plumbing. */
+.omnibox-visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* The keyboard-hint chip the omnibox and the nav shortcut render (R3-512). Moved
+ * verbatim from landing-page App.css with the component that renders it — one home,
+ * so the Home app renders the same chip. */
+.kbd{font:400 11px var(--mono);background:var(--bg);border:1px solid var(--line);
+  border-radius:var(--r-xs);padding:2px 6px;color:var(--ink-3)}
