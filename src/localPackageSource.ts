@@ -54,6 +54,31 @@ export interface LocalModule {
   m: string[];
 }
 
+/**
+ * Does `version` satisfy `range`? Deliberately NARROW: exact, `^`, `~`, `>=` and `*`/`""`
+ * only, and it returns TRUE for anything it does not understand.
+ *
+ * A permissive fallback is the right default here because the cost of the two errors is not
+ * symmetric. Rejecting wrongly means falling back to the CDN — today's behaviour. Accepting
+ * wrongly means a version mismatch enters the lockset. So this refuses only what it is sure
+ * about, and a range shape it cannot parse is left to the CDN's own resolution rather than
+ * guessed at. A full semver implementation is not worth a dependency in a CLI that runs on
+ * a bare CI runner; if this ever needs to be exact, use one rather than growing this.
+ */
+export function satisfies(version: string, range: string | undefined): boolean {
+  if (!range || range === '*' || range === 'latest') return true;
+  const v = /^(\d+)\.(\d+)\.(\d+)/.exec(version);
+  const r = /^([\^~]|>=)?\s*(\d+)\.(\d+)\.(\d+)/.exec(range.trim());
+  if (!v || !r) return true; // not a shape we judge — let the CDN decide
+  const [vm, vn, vp] = [Number(v[1]), Number(v[2]), Number(v[3])];
+  const [op, rm, rn, rp] = [r[1], Number(r[2]), Number(r[3]), Number(r[4])];
+  const atLeast = vm > rm || (vm === rm && (vn > rn || (vn === rn && vp >= rp)));
+  if (op === '^') return vm === rm && atLeast;
+  if (op === '~') return vm === rm && vn === rn && atLeast;
+  if (op === '>=') return atLeast;
+  return vm === rm && vn === rn && vp === rp;
+}
+
 const readJson = (path: string): Record<string, unknown> | null => {
   try {
     return JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
@@ -113,6 +138,12 @@ export function resolveFromInstalledTree(repoPath: string, wanted: DepMap): Reso
       const pkg = readJson(join(dir, 'package.json'));
       const version = typeof pkg?.version === 'string' ? pkg.version : null;
       if (!version) continue;
+      // The DECLARED range still has to hold. The walk bound stops a NEIGHBOUR's copy from
+      // being found; it does nothing about a copy inside this repo that is simply the wrong
+      // version — and the runtime cannot catch that either, because the echo it matches on
+      // is the range map, which still matches. Round 1 asked for both halves and I shipped
+      // only the bound while reporting it fixed.
+      if (depth === 0 && !satisfies(version, wanted[name])) continue;
       out.set(name, { n: name, v: version, d: depth });
       const deps = (pkg?.dependencies ?? {}) as Record<string, string>;
       for (const child of Object.keys(deps)) next.push({ name: child, from: dir });

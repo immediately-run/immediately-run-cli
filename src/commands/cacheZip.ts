@@ -247,7 +247,11 @@ const resolveLockset = async (
     // HTTP 500 on every request reads in the manifest as "may not exist on the CDN's npm
     // mirror yet — try a lower version range in package.json", which advises lowering a
     // range on a pinned `core-js@3.22.7` and sends the next reader after the wrong thing.
-    const full = cdnError ? `${message} [the CDN itself failed: ${cdnError}]` : message;
+    // The CDN's OWN failure leads when there is one: the completeness guard's message
+    // ends in "try a lower version range in package.json", which is advice for mirror lag
+    // and actively misleading when every request 500'd — it sends the next reader to lower
+    // a range on a pinned core-js.
+    const full = cdnError ? `the package CDN failed: ${cdnError} (so nothing could be resolved from it; ${message})` : message;
     console.warn(`Warning: lockset omitted (${full})`);
     return { summary: `omitted (${full})` };
   }

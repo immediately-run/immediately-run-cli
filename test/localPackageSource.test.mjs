@@ -21,6 +21,7 @@ import {
   buildLocalPackage,
   resolveFromInstalledTree,
   resolvePackageDir,
+  satisfies,
   cjsEntry,
   encodeLocalPackage,
 } from '../dist/localPackageSource.js';
@@ -143,10 +144,11 @@ test('…and the same `d` for every file that ships content (order is not semant
 });
 
 test('…and the same `t` (already-transpiled) flag for every file BOTH ship with content', () => {
-  // Found by fault injection: without this, forcing every file to `t: false` passed. The
-  // flag decides whether the bundler treats the shipped bytes as final or as something to
-  // re-transform, so getting it wrong is either a wasted transform or a re-transform of
-  // code that must not be touched.
+  // Kept as a CDN-SHAPE check, with the reason corrected: review found nothing on the
+  // consume side reads `t` at all (`_writePrecompiledModule` passes `isCompiled = true`
+  // unconditionally; `grep -rn 'file\.t' sandbox/src` is empty). So this asserts we produce
+  // the field the format declares, NOT that the bundler behaves differently because of it —
+  // the justification I first wrote was behaviour the consumer does not have.
   const local = buildLocalPackage(FIXTURE, scanCjsModule);
   const wrong = Object.entries(CDN.f)
     .filter(([p, f]) => typeof f !== 'number' && typeof local.f[p] === 'object')
@@ -214,6 +216,42 @@ test('the entry closure is followed — a required sibling gains content, an unr
   const local = buildLocalPackage(FIXTURE, scanCjsModule);
   assert.equal(typeof local.f['dist/launch.cjs'], 'object', 'a required sibling must ship content');
   assert.equal(typeof local.f['dist/launch.js'], 'number', 'the unreached ESM build must stay size-only');
+});
+
+test('a version inside the repo that does NOT satisfy the declared range is rejected', () => {
+  // Round 1 asked for two things and I shipped one while reporting both fixed: the walk
+  // bound stops a NEIGHBOUR's copy being found; it does nothing about a wrong-version copy
+  // inside the repo. The runtime cannot catch that either — the echo it matches on is the
+  // range map, which still matches — so it would ship.
+  const root = mkdtempSync(join(tmpdir(), 'ir-range-'));
+  try {
+    const dir = join(root, 'node_modules', 'gap-pkg');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'gap-pkg', version: '0.0.9' }));
+    assert.deepEqual(resolveFromInstalledTree(root, { 'gap-pkg': '^3.0.0' }), []);
+    // …and it IS accepted when it satisfies, so the case is not passing by rejecting all.
+    assert.deepEqual(resolveFromInstalledTree(root, { 'gap-pkg': '^0.0.9' }), [
+      { n: 'gap-pkg', v: '0.0.9', d: 0 },
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('satisfies() refuses only what it is sure about', () => {
+  // The permissive fallback is the load-bearing choice: rejecting wrongly costs a CDN
+  // fallback (today's behaviour), accepting wrongly puts a mismatch in the lockset. So an
+  // unparseable range must return TRUE and leave the decision to the CDN.
+  assert.equal(satisfies('1.2.3', '1.2.3'), true);
+  assert.equal(satisfies('1.2.4', '1.2.3'), false);
+  assert.equal(satisfies('1.3.0', '^1.2.3'), true);
+  assert.equal(satisfies('2.0.0', '^1.2.3'), false);
+  assert.equal(satisfies('1.2.9', '~1.2.3'), true);
+  assert.equal(satisfies('1.3.0', '~1.2.3'), false);
+  assert.equal(satisfies('9.9.9', '>=1.0.0'), true);
+  assert.equal(satisfies('0.0.9', '*'), true);
+  assert.equal(satisfies('1.0.0', 'github:owner/repo'), true, 'an unjudgeable range must not be refused');
+  assert.equal(satisfies('1.0.0', '1.x || 2.x'), true, 'an unsupported shape defers to the CDN');
 });
 
 test('resolveFromInstalledTree never resolves ABOVE the repo root', () => {
