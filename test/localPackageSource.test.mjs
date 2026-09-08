@@ -23,7 +23,6 @@ import {
   resolveFromInstalledTree,
   resolvePackageDir,
   satisfies,
-  cjsEntry,
   entryPoints,
   encodeLocalPackage,
   RUNTIME_EXTENSIONS,
@@ -392,11 +391,6 @@ test('the bytes decode into something the runtime can actually BOOT', async () =
   }
 });
 
-test('a package with no `main` falls back to index.js rather than shipping nothing', () => {
-  assert.equal(cjsEntry({}), 'index.js');
-  assert.equal(cjsEntry({ main: './dist/index.cjs' }), 'dist/index.cjs');
-});
-
 test('the entry closure is followed on BOTH sides, and an unreachable file stays a size', async () => {
   // This case USED to assert `dist/launch.js` stays size-only, on the theory that the ESM
   // build is reachable from nothing. That was the round-2 defect written down as a test: the
@@ -446,6 +440,27 @@ test('satisfies() refuses only what it is sure about', () => {
   assert.equal(satisfies('0.0.9', '*'), true);
   assert.equal(satisfies('1.0.0', 'github:owner/repo'), true, 'an unjudgeable range must not be refused');
   assert.equal(satisfies('1.0.0', '1.x || 2.x'), true, 'an unsupported shape defers to the CDN');
+});
+
+test('caret under a ZERO major pins the minor, the way npm reads it', () => {
+  // Review round 4. `^0.11.0` does NOT mean "any 0.x": npm treats a 0 major as unstable and
+  // pins the MINOR, so 0.12.0 is out. `react-refresh: ^0.11.0` — carried by this package —
+  // is exactly that shape, so the wrong rule would have accepted a react-refresh the
+  // transpiler never asked for and put it in the lockset under a range it does not satisfy.
+  //
+  // The rule had TWO homes and they disagreed: this one was wrong while
+  // `scripts/check-platform-provided.mjs` was right, so the check passed a version the
+  // resolver would have rejected. The script now imports this implementation.
+  assert.equal(satisfies('0.11.0', '^0.11.0'), true);
+  assert.equal(satisfies('0.11.9', '^0.11.0'), true, 'a higher patch inside the pinned minor is in');
+  assert.equal(satisfies('0.12.0', '^0.11.0'), false, 'the next MINOR is out under a 0 major');
+  assert.equal(satisfies('0.10.9', '^0.11.0'), false, 'and so is a lower one');
+
+  // Non-vacuity: a non-zero major keeps the ordinary caret meaning, so the branch above is
+  // not simply making every caret stricter.
+  assert.equal(satisfies('6.1.5', '^6.1.0'), true);
+  assert.equal(satisfies('6.2.0', '^6.1.0'), true, 'a higher minor IS in when the major is non-zero');
+  assert.equal(satisfies('7.0.0', '^6.1.0'), false);
 });
 
 test('resolveFromInstalledTree never resolves ABOVE the repo root', () => {

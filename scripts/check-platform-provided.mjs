@@ -13,27 +13,18 @@
  */
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join } from 'node:path';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(join(root, 'package.json'));
 const { computeInputDepMap, rootRuntimeDependencies } = require('@immediately-run/transpiler');
 
-/** Narrow semver: exact, ^, ~, >=, *. Unparseable shapes pass — this check exists to catch
- *  a MISSING package, and a range it cannot read is not evidence of one. */
-function satisfies(version, range) {
-  if (!range || range === '*' || range === 'latest') return true;
-  const m = /^([\^~]|>=)?\s*(\d+)\.(\d+)\.(\d+)/.exec(range);
-  const v = /^(\d+)\.(\d+)\.(\d+)/.exec(version);
-  if (!m || !v) return true;
-  const [, op, a, b, c] = m.map((x, i) => (i > 1 ? Number(x) : x));
-  const [, x, y, z] = v.map((s, i) => (i ? Number(s) : s));
-  if (!op) return x === a && y === b && z === c;
-  if (op === '^') return a === 0 ? x === 0 && y === b && z >= c : x === a && (y > b || (y === b && z >= c));
-  if (op === '~') return x === a && y === b && z >= c;
-  return x > a || (x === a && (y > b || (y === b && z >= c)));
-}
+// The SAME `satisfies` the resolution uses — imported, never re-implemented. A private copy
+// here disagreed with `src/localPackageSource.ts` on `^0.x` (npm pins the minor when the
+// major is 0), so this script passed a range the resolver would have failed. One rule, one
+// home (ways_of_working §6).
+const { satisfies } = await import(pathToFileURL(join(root, 'dist/localPackageSource.js')).href);
 
 /** The names the transpiler adds on top of an app's own manifest, for a given root. */
 function injected(rootPkg) {

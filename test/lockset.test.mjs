@@ -319,6 +319,32 @@ test('a package the CDN drops is filled in from node_modules', async () => {
   }
 });
 
+test('a stale same-name copy in the app tree does not shadow the platform copy', async () => {
+  // Review round 4, with the cost that makes it more than a per-package nuisance: the CDN
+  // fetch for bundled content is ALL-OR-NOTHING, so one package that falls through to a
+  // dead CDN omits EVERY bundled package. The app tree below holds an UNDECLARED
+  // `react-error-boundary@5.0.0`; the lockset resolves the platform's own copy, and the
+  // content must come from there too rather than from the shadowing directory.
+  const root = makeRepo(JSON.stringify({ dependencies: { react: '^19.0.0' } }));
+  try {
+    const shadow = join(root, 'node_modules', 'react-error-boundary');
+    mkdirSync(shadow, { recursive: true });
+    writeFileSync(join(shadow, 'package.json'), JSON.stringify({ name: 'react-error-boundary', version: '5.0.0' }));
+
+    const shadowed = await buildCacheZip(zipOpts(root, { bundlePackages: true }));
+    rmSync(shadow, { recursive: true, force: true });
+    const control = await buildCacheZip(zipOpts(root, { bundlePackages: true }));
+
+    // The property is that the shadow changes NOTHING — same package count, same source
+    // attribution. Compared against the control rather than a hard-coded string, so the
+    // case keeps holding as the fixture's dependency set changes.
+    assert.equal(shadowed.bundledPackagesSummary, control.bundledPackagesSummary);
+    assert.doesNotMatch(shadowed.bundledPackagesSummary, /omitted/, 'one shadowed package must not omit them all');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('the local bundling path is actually TAKEN when the version matches', async () => {
   // The positive case. Review found every --bundle-packages test was NEGATIVE (the
   // mismatched-version one), so nothing asserted the local path is used at all — which is

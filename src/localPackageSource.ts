@@ -73,7 +73,12 @@ export function satisfies(version: string, range: string | undefined): boolean {
   const [vm, vn, vp] = [Number(v[1]), Number(v[2]), Number(v[3])];
   const [op, rm, rn, rp] = [r[1], Number(r[2]), Number(r[3]), Number(r[4])];
   const atLeast = vm > rm || (vm === rm && (vn > rn || (vn === rn && vp >= rp)));
-  if (op === '^') return vm === rm && atLeast;
+  // `^0.x` is NOT "same major". npm treats a 0 major as unstable and pins the MINOR, so
+  // `^0.11.0` admits 0.11.x and refuses 0.12.0 — and `react-refresh: ^0.11.0`, which this
+  // package now carries, is exactly that shape. The sibling check script had the rule right
+  // while this had it wrong, which is the R6 failure: one rule, two homes, disagreeing.
+  // `scripts/check-platform-provided.mjs` now imports THIS one.
+  if (op === '^') return rm === 0 ? vm === 0 && vn === rn && vp >= rp : vm === rm && atLeast;
   if (op === '~') return vm === rm && vn === rn && atLeast;
   if (op === '>=') return atLeast;
   return vm === rm && vn === rn && vp === rp;
@@ -287,12 +292,6 @@ const SKIP_CONDITIONS = new Set(['types', 'typings', 'react-server']);
  *  runtime picks depends on which files exist, and guessing wrong leaves an entry point
  *  size-only, which is the boot-time unpkg fetch this module exists to prevent. */
 const MAIN_FIELDS = ['module', 'browser', 'main', 'jsnext:main'];
-
-/** The CJS entry a bundler would load for this package, repo-relative. */
-export function cjsEntry(pkg: Record<string, unknown>): string {
-  const main = typeof pkg.main === 'string' ? pkg.main : null;
-  return (main ?? 'index.js').replace(/^\.\//, '');
-}
 
 /**
  * Every entry point a consumer can reach, repo-relative: each `MAIN_FIELDS` value plus

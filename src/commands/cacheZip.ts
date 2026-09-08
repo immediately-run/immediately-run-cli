@@ -345,18 +345,29 @@ const resolveBundledPackages = async (
     // what the app declared, ours only for what the platform injected. A package resolved
     // from one and versioned from the other would be a silent substitution, so the root
     // that supplies the directory is the root the version is read from.
-    const repoDir = resolvePackageDir(name, repo, repo);
-    const dir = repoDir ?? (platformNames.has(name) ? ownPackageDir(name) : null);
-    let installedVersion: string | null = null;
-    try {
-      installedVersion = dir ? (JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')).version ?? null) : null;
-    } catch {
-      installedVersion = null;
-    }
-    // Only when the tree holds the EXACT version the lockset resolved. A different
-    // version on disk is a different package, and shipping it under this key would be a
-    // silent substitution — the worst failure this whole feature could have.
-    if (dir && installedVersion === version) {
+    // CANDIDATES, not a single choice. The app's tree is asked first, ours only for a
+    // platform-injected name — but a directory that holds the WRONG version must not end the
+    // search, or a stale same-name copy in the app's tree shadows the platform copy and the
+    // package falls to the CDN. That is not a per-package cost: the CDN fetch is
+    // all-or-nothing, so ONE shadowed package omits EVERY bundled package. Reproduced with
+    // an undeclared `react-error-boundary@5.0.0` in the app tree, which turned a working
+    // `4 packages, 974.5 KB` into `bundled pkgs: omitted (fetch failed)`.
+    const candidates = [resolvePackageDir(name, repo, repo)];
+    if (platformNames.has(name)) candidates.push(ownPackageDir(name));
+
+    const versionAt = (d: string | null): string | null => {
+      try {
+        return d ? ((JSON.parse(readFileSync(join(d, 'package.json'), 'utf8')).version as string) ?? null) : null;
+      } catch {
+        return null;
+      }
+    };
+    // Only a directory holding the EXACT version the lockset resolved. A different version
+    // on disk is a different package, and shipping it under this key would be a silent
+    // substitution — the worst failure this whole feature could have.
+    const dir = candidates.find((d) => d !== null && versionAt(d) === version) ?? null;
+    const repoDir = dir === candidates[0] ? dir : null;
+    if (dir) {
       try {
         if (!repoDir) platformBuilt.add(name);
         localBuilt.push({

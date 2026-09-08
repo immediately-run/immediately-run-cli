@@ -11,9 +11,12 @@
 // from whatever this repo's own tree happens to look like.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+const here = dirname(fileURLToPath(import.meta.url));
 
 import { ownPackageDir, platformProvidedNames, resolvePlatformProvided } from '../dist/platformProvided.js';
 
@@ -54,32 +57,59 @@ test('a name the APP declares is never platform-provided — that would be a sil
   assert.ok(!platformProvidedNames({ react: '^19.0.0' }, augmented).includes('react'));
 });
 
-test('resolution works in the HOISTED layout — the one the walk-based version silently failed in', () => {
+test('resolution works in the HOISTED layout — with the REAL resolver, not a stub', async () => {
   // `npm i @immediately-run/cli` puts the CLI at <root>/node_modules/@immediately-run/cli
   // and its dependencies at <root>/node_modules/*, ABOVE the CLI's own directory. A walk
   // floored at the CLI's package root returns nothing here; node's resolution does not.
+  //
+  // ⚠ THIS CASE MUST NOT PASS A RESOLVER. Review round 4 caught the first version of it
+  // doing exactly that: with `resolverOver(files)` injected it never reached
+  // `defaultResolve`, so restoring the buggy walk verbatim left all seven cases green — a
+  // test named for the defect that could not see it, while the file header, the commit
+  // message and the PR body all claimed it could. The module is therefore COPIED into a real
+  // hoisted tree and imported from there, so `createRequire(import.meta.url)` runs against
+  // that layout for real.
   const root = mkdtempSync(join(tmpdir(), 'ir-hoisted-'));
   try {
-    const files = {
-      'core-js/package.json': writePkg(root, 'node_modules/core-js', { name: 'core-js', version: '3.22.7' }),
-      'react-refresh/package.json': writePkg(root, 'node_modules/react-refresh', {
-        name: 'react-refresh',
-        version: '0.11.0',
-      }),
-    };
-    // Nothing lives under the CLI's own directory, which is the whole point.
-    mkdirSync(join(root, 'node_modules/@immediately-run/cli'), { recursive: true });
+    const cliDir = join(root, 'node_modules/@immediately-run/cli');
+    mkdirSync(join(cliDir, 'dist'), { recursive: true });
+    writeFileSync(join(cliDir, 'package.json'), JSON.stringify({ name: '@immediately-run/cli', version: '0.0.0', type: 'module' }));
+    // The built module and the one thing it imports, placed as the published layout has them.
+    for (const file of ['platformProvided.js', 'localPackageSource.js', 'lockset.js']) {
+      copyFileSync(join(here, '../dist', file), join(cliDir, 'dist', file));
+    }
+    // The module's own runtime imports, linked from this repo's tree so the copy can load
+    // at all. They are HOISTED here too, which is the layout under test.
+    for (const dep of ['@msgpack/msgpack', '@immediately-run/transpiler']) {
+      const target = join(here, '../node_modules', dep);
+      const link = join(root, 'node_modules', dep);
+      mkdirSync(dirname(link), { recursive: true });
+      symlinkSync(target, link, 'dir');
+    }
+    // …and the platform dependencies HOISTED to the install root, which is the whole point.
+    writePkg(root, 'node_modules/core-js', { name: 'core-js', version: '3.22.7' });
+    writePkg(root, 'node_modules/react-refresh', { name: 'react-refresh', version: '0.11.0' });
 
-    const resolved = resolvePlatformProvided(
-      ['core-js', 'react-refresh'],
-      { 'core-js': '3.22.7', 'react-refresh': '^0.11.0' },
-      resolverOver(files),
-    );
+    const mod = await import(pathToFileURL(join(cliDir, 'dist/platformProvided.js')).href);
+    // No third argument: this is the real `createRequire(import.meta.url)` path.
+    const resolved = mod.resolvePlatformProvided(['core-js', 'react-refresh'], {
+      'core-js': '3.22.7',
+      'react-refresh': '^0.11.0',
+    });
     assert.deepEqual(resolved, [
       { n: 'core-js', v: '3.22.7', d: 0 },
       { n: 'react-refresh', v: '0.11.0', d: 0 },
     ]);
-    assert.equal(ownPackageDir('core-js', resolverOver(files)), join(root, 'node_modules/core-js'));
+    // `realpathSync` because macOS resolves /var through a symlink to /private/var, and
+    // node's resolution returns the real path — a difference in the harness, not the code.
+    assert.equal(mod.ownPackageDir('core-js'), realpathSync(join(root, 'node_modules/core-js')));
+
+    // Non-vacuity: nothing lives under the CLI's own directory, so a walk floored there —
+    // the round-3 bug — could only have returned nothing.
+    assert.throws(
+      () => readFileSync(join(cliDir, 'node_modules/core-js/package.json')),
+      'the fixture must NOT have a nested copy, or this case cannot tell the two apart',
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
