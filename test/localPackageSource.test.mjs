@@ -24,6 +24,7 @@ import {
   resolvePackageDir,
   satisfies,
   cjsEntry,
+  entryPoints,
   encodeLocalPackage,
   RUNTIME_EXTENSIONS,
 } from '../dist/localPackageSource.js';
@@ -545,4 +546,58 @@ test('the runtime enters a dual package through `require`, and that decides whic
   // This builder ships it with content instead — the whole point — and lands on the same file.
   const local = await build(FIXTURE);
   assert.equal(typeof local.f[target], 'object', 'the local build carries the file the runtime actually loads');
+});
+
+test('the declared range is checked at EVERY depth, not only at the root', async () => {
+  // Review round 3. `depth === 0` looked sufficient because a declared name is resolved at
+  // depth 0 — but a name the root declares is usually ALSO reachable transitively, and the
+  // second route re-resolved it unchecked. The repo below declares `wrongver: ^3.0.0` and
+  // its tree holds 0.0.9, reachable both directly and under a parent; the wrong version must
+  // not enter the lockset by either route.
+  const root = mkdtempSync(join(tmpdir(), 'ir-depth-range-'));
+  const pkg = (dir, manifest) => {
+    mkdirSync(join(root, dir), { recursive: true });
+    writeFileSync(join(root, dir, 'package.json'), JSON.stringify(manifest));
+  };
+  try {
+    pkg('.', { name: 'app', dependencies: { parentpkg: '^1.0.0', wrongver: '^3.0.0' } });
+    pkg('node_modules/parentpkg', { name: 'parentpkg', version: '1.0.0', dependencies: { wrongver: '^0.0.1' } });
+    pkg('node_modules/wrongver', { name: 'wrongver', version: '0.0.9' });
+
+    const wanted = { parentpkg: '^1.0.0', wrongver: '^3.0.0' };
+    const resolved = resolveFromInstalledTree(root, wanted);
+    assert.deepEqual(
+      resolved.map((r) => `${r.n}@${r.v}`),
+      ['parentpkg@1.0.0'],
+      'the wrong version must be omitted however it is reached, so the CDN gets its chance',
+    );
+
+    // Non-vacuity: the SAME tree with a range that fits does resolve it.
+    const ok = resolveFromInstalledTree(root, { parentpkg: '^1.0.0', wrongver: '^0.0.1' });
+    assert.deepEqual(ok.map((r) => `${r.n}@${r.v}`), ['parentpkg@1.0.0', 'wrongver@0.0.9']);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a skipped condition stays skipped through a NESTED condition', async () => {
+  // Review round 3, and a shape both fixtures happen not to use. `SKIP_CONDITIONS` was
+  // consulted only for the innermost key, so `{"types": {"default": "./index.d.ts"}}` seeded
+  // the `.d.ts` — which then fails `JS_RE` and is inlined verbatim as an asset. Typings
+  // shipped as content, silently.
+  //
+  // `main` is set throughout so the no-main `index.js` fallback cannot be mistaken for a
+  // seeded target, and every filename is distinct so each assertion names one path only.
+  const flat = entryPoints({ main: './m.js', exports: { '.': { types: './t.d.ts', default: './d.js' } } });
+  assert.deepEqual(flat.sort(), ['d.js', 'm.js'], 'the flat shape was already correct');
+
+  const nested = entryPoints({ main: './m.js', exports: { '.': { types: { default: './t.d.ts' }, default: './d.js' } } });
+  assert.deepEqual(nested.sort(), ['d.js', 'm.js'], 'and a nested condition under `types` is still skipped');
+
+  // Non-vacuity, both ways: a nested condition under a NON-skipped key IS seeded…
+  const kept = entryPoints({ main: './m.js', exports: { '.': { browser: { default: './b.js' } } } });
+  assert.deepEqual(kept.sort(), ['b.js', 'm.js']);
+  // …and nesting two deep under a skipped one is still skipped.
+  const deep = entryPoints({ main: './m.js', exports: { '.': { types: { browser: { default: './t.d.ts' } } } } });
+  assert.deepEqual(deep.sort(), ['m.js']);
 });

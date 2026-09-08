@@ -42,7 +42,7 @@ import {
   type DepMap,
   type BundledPackage,
 } from '../lockset.js';
-import { ownPackageRoot, platformProvidedNames } from '../platformProvided.js';
+import { ownPackageDir, platformProvidedNames, resolvePlatformProvided } from '../platformProvided.js';
 import {
   buildLocalPackage,
   mergeResolved,
@@ -195,21 +195,16 @@ const headDependencies = (
 };
 
 /**
- * The platform-injected dependencies (`react-refresh`, `core-js`, `react-error-boundary`),
- * resolved from THIS package's own installed tree.
+ * The platform-injected dependencies, resolved from THIS package's own tree.
  *
- * Narrow on purpose: only names the augmented map added that the app's manifest never
- * mentioned, so an app's own `react` can never be answered by ours. `check-platform-provided`
- * keeps the set we carry in step with the set the transpiler injects.
+ * Narrow on purpose, and at depth 0 only: just the names the augmented map ADDED that the
+ * app's manifest never mentioned, so an app's own `react` can never be answered by ours, and
+ * a platform package's own dependencies never enter an app's lockset from here.
+ * `check-platform-provided` keeps the set we carry in step with the set the transpiler
+ * injects. See `src/platformProvided.ts` for why this must not be a directory walk.
  */
-const resolvePlatformProvided = (rootDeps: DepMap, augmented: DepMap): ResolvedDependency[] => {
-  const names = platformProvidedNames(rootDeps, augmented);
-  const own = names.length ? ownPackageRoot() : null;
-  if (!own || names.length === 0) return [];
-  const wanted: DepMap = {};
-  for (const n of names) wanted[n] = augmented[n];
-  return resolveFromInstalledTree(own, wanted);
-};
+const platformProvided = (rootDeps: DepMap, augmented: DepMap): ResolvedDependency[] =>
+  resolvePlatformProvided(platformProvidedNames(rootDeps, augmented), augmented);
 
 /**
  * The lockset, with any package the dependency CDN cannot resolve FILLED IN from the
@@ -255,7 +250,7 @@ const resolveLockset = async (
   // The app's tree cannot hold what the app never declared, so the platform-injected names
   // are resolved from OUR tree — narrowly, by name, never as a general second root. See
   // `src/platformProvided.ts`; this is what makes exit criterion 1 reachable at all.
-  const platform = resolvePlatformProvided(deps, dependencies);
+  const platform = platformProvided(deps, dependencies);
   // STRICT PRECEDENCE, not concatenation: CDN, then the app's tree, then ours. Found on the
   // live acceptance — `react-error-boundary` is injected by the platform AND hoisted into
   // landing-page's tree, so a plain union emitted it twice, at two different versions
@@ -284,9 +279,36 @@ const resolveLockset = async (
     return { summary: `omitted (${full})` };
   }
 
-  const source = filled.length === 0 ? 'CDN' : fromCdn.length === 0 ? 'node_modules' : `CDN + ${filled.length} from node_modules`;
+  // NAME THE THIRD SOURCE. "from node_modules" was reported for packages that came from
+  // THIS CLI's tree, including on a repo with no node_modules at all — an artifact that
+  // cannot say where its content came from is how a silent regression to the CDN, or away
+  // from it, would go unnoticed. The three sources are distinguished everywhere they are
+  // counted.
+  // By the RECORD, not by the name. `react-error-boundary` is platform-injected AND hoisted
+  // into landing-page's tree, so a name-membership test labelled the app's own 6.1.3 as
+  // "platform-provided by this CLI" — the same mislabel one level down, and exactly what
+  // this reporting exists to prevent. `mergeResolved` keeps the winning record's identity,
+  // so identity is what answers "which source won".
+  const platformRecords = new Set<ResolvedDependency>(platform);
+  const fromLocal = filled.filter((r) => !platformRecords.has(r));
+  const fromPlatform = filled.filter((r) => platformRecords.has(r));
+  const contributions: [number, string, string][] = [
+    [fromCdn.length, 'CDN', 'from the CDN'],
+    [fromLocal.length, 'node_modules', 'from node_modules'],
+    [fromPlatform.length, 'platform-provided by this CLI', 'platform-provided by this CLI'],
+  ];
+  const used = contributions.filter(([n]) => n > 0);
+  // One source names itself; several are counted. `(CDN)` stays exactly as it read before
+  // this change, so a repo with no installed tree produces the same line it always did.
+  const source =
+    used.length === 1 ? used[0][1] : used.map(([n, , label]) => `${n} ${label}`).join(', ');
   if (filled.length) {
-    console.log(`  · lockset gaps filled from node_modules: ${filled.map((r) => `${r.n}@${r.v}`).join(', ')}`);
+    if (fromLocal.length) {
+      console.log(`  · lockset gaps filled from node_modules: ${fromLocal.map((r) => `${r.n}@${r.v}`).join(', ')}`);
+    }
+    if (fromPlatform.length) {
+      console.log(`  · platform-provided by this CLI: ${fromPlatform.map((r) => `${r.n}@${r.v}`).join(', ')}`);
+    }
   }
   return {
     lockset: { cdnVersion: LOCKSET_CDN_VERSION, dependencies, resolved },
@@ -314,6 +336,7 @@ const resolveBundledPackages = async (
   // gap-filling as the lockset and for the same reason. All-or-nothing per source would
   // always lose to the augmented build deps npm never installs.
   const localBuilt: BundledPackage[] = [];
+  const platformBuilt = new Set<string>();
   const needCdn: typeof lockset.resolved = [];
   const localRefusals: string[] = [];
   for (const entry of lockset.resolved) {
@@ -322,8 +345,8 @@ const resolveBundledPackages = async (
     // what the app declared, ours only for what the platform injected. A package resolved
     // from one and versioned from the other would be a silent substitution, so the root
     // that supplies the directory is the root the version is read from.
-    const platformRoot = platformNames.has(name) ? ownPackageRoot() : null;
-    const dir = resolvePackageDir(name, repo, repo) ?? (platformRoot ? resolvePackageDir(name, platformRoot, platformRoot) : null);
+    const repoDir = resolvePackageDir(name, repo, repo);
+    const dir = repoDir ?? (platformNames.has(name) ? ownPackageDir(name) : null);
     let installedVersion: string | null = null;
     try {
       installedVersion = dir ? (JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')).version ?? null) : null;
@@ -335,6 +358,7 @@ const resolveBundledPackages = async (
     // silent substitution — the worst failure this whole feature could have.
     if (dir && installedVersion === version) {
       try {
+        if (!repoDir) platformBuilt.add(name);
         localBuilt.push({
           key: encodePackageKey(name, version),
           name,
@@ -360,12 +384,16 @@ const resolveBundledPackages = async (
     if (localRefusals.length) {
       console.warn(`  · ${localRefusals.length} package(s) fell back to the CDN: ${localRefusals.slice(0, 3).join('; ')}`);
     }
+    const built = localBuilt.filter((p) => !platformBuilt.has(p.name)).length;
+    const plat = localBuilt.length - built;
     const source =
-      needCdn.length === 0
-        ? 'all from node_modules'
-        : localBuilt.length === 0
-          ? 'all from the CDN'
-          : `${localBuilt.length} from node_modules, ${fetched.length} from the CDN`;
+      [
+        fetched.length ? `${fetched.length} from the CDN` : '',
+        built ? `${built} from node_modules` : '',
+        plat ? `${plat} platform-provided by this CLI` : '',
+      ]
+        .filter(Boolean)
+        .join(', ') || 'nothing';
     return { packages, summary: `${packages.length} packages, ${formatBytes(bytes)} (${source})` };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

@@ -138,12 +138,17 @@ export function resolveFromInstalledTree(repoPath: string, wanted: DepMap): Reso
       const pkg = readJson(join(dir, 'package.json'));
       const version = typeof pkg?.version === 'string' ? pkg.version : null;
       if (!version) continue;
-      // The DECLARED range still has to hold. The walk bound stops a NEIGHBOUR's copy from
-      // being found; it does nothing about a copy inside this repo that is simply the wrong
-      // version — and the runtime cannot catch that either, because the echo it matches on
-      // is the range map, which still matches. Round 1 asked for both halves and I shipped
-      // only the bound while reporting it fixed.
-      if (depth === 0 && !satisfies(version, wanted[name])) continue;
+      // The DECLARED range still has to hold, AT EVERY DEPTH. The walk bound stops a
+      // NEIGHBOUR's copy from being found; it does nothing about a copy inside this repo
+      // that is simply the wrong version — and the runtime cannot catch that either,
+      // because the echo it matches on is the range map, which still matches.
+      //
+      // `depth === 0` was wrong and the hole was reachable: a name the root declares is
+      // usually also reachable TRANSITIVELY, and the second route re-resolved it unchecked,
+      // so a repo declaring `wrongver: ^3.0.0` with `wrongver@0.0.9` under a parent got
+      // 0.0.9 into the lockset. The check belongs wherever `wanted` has an opinion, which
+      // is what `wanted[name] !== undefined` says.
+      if (wanted[name] !== undefined && !satisfies(version, wanted[name])) continue;
       out.set(name, { n: name, v: version, d: depth });
       const deps = (pkg?.dependencies ?? {}) as Record<string, string>;
       for (const child of Object.keys(deps)) next.push({ name: child, from: dir });
@@ -331,7 +336,16 @@ export function entryPoints(pkg: Record<string, unknown>, files: readonly string
     }
     if (!node || typeof node !== 'object') return; // a `null` target means "blocked"
     for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
-      visit(value, key.startsWith('.') ? condition : key);
+      if (key.startsWith('.')) {
+        // A SUBPATH, not a condition: whatever condition we are under still applies.
+        visit(value, condition);
+        continue;
+      }
+      // A nested condition inside a SKIPPED one is still skipped. Replacing the inherited
+      // condition here let `{"types": {"default": "./index.d.ts"}}` seed a `.d.ts`, which
+      // then fails `JS_RE` and is inlined verbatim as an asset — typings shipped as content.
+      // Both fixtures use the flat `{"types": "./index.d.ts"}` shape, so nothing caught it.
+      visit(value, SKIP_CONDITIONS.has(condition ?? '') ? condition : key);
     }
   };
   visit(pkg.exports, null);

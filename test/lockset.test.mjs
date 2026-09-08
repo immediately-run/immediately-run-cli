@@ -13,7 +13,8 @@ import {
   LOCKSET_CDN_VERSION,
   computeInputDepMap,
   encodeDepTreePayload,
-  fetchLockset,
+  fetchDepTree,
+  assertDependenciesResolved,
 } from '../dist/lockset.js';
 import { buildCacheZip } from '../dist/commands/cacheZip.js';
 import { bundledPackageFilename } from '../dist/lockset.js';
@@ -148,21 +149,25 @@ const zipOpts = (root, extra = {}) => ({
   ...extra,
 });
 
-test('fetchLockset returns the CDN resolution with the input echo', async () => {
-  const lockset = await fetchLockset({ react: '^18.2.0' }, cdnRoot);
-  assert.equal(lockset.cdnVersion, LOCKSET_CDN_VERSION);
-  assert.deepEqual(lockset.resolved, RESOLVED);
-  assert.deepEqual(lockset.dependencies, computeInputDepMap({ react: '^18.2.0' }));
-  // The request hit /dep_tree/<payload encoding exactly that echo>.
-  assert.equal(lastPath, `/dep_tree/${encodeDepTreePayload(lockset.dependencies)}`);
+test('fetchDepTree asks the CDN for exactly the echo the runtime recomputes', async () => {
+  // Retargeted from the deleted `fetchLockset` wrapper, which R3-567 left with no
+  // production caller once `resolveLockset` took over composing the two halves. The
+  // PROPERTY is what mattered and it still holds: the URL encodes the augmented input
+  // DepMap, byte for byte, because the runtime's echo-match (R3-289) compares against it.
+  const dependencies = computeInputDepMap({ react: '^18.2.0' });
+  const resolved = await fetchDepTree(dependencies, cdnRoot);
+  assert.deepEqual(resolved, RESOLVED);
+  assert.equal(lastPath, `/dep_tree/${encodeDepTreePayload(dependencies)}`);
 });
 
-test('fetchLockset throws naming a package the CDN silently dropped', async () => {
-  // The mock CDN returns RESOLVED (no lucide-react) — the silent-drop shape.
-  // Build-time detection uses the shared transpiler guard (assertDependenciesResolved)
-  // so the drop is not baked into the zip and reads identically to the runtime.
-  await assert.rejects(
-    fetchLockset({ react: '^18.2.0', 'lucide-react': '^1.21.0' }, cdnRoot),
+test('the completeness guard names a package the CDN silently dropped', async () => {
+  // The mock CDN returns RESOLVED (no lucide-react) — the silent-drop shape. Detection is
+  // the shared transpiler guard, so it reads identically to the runtime's. `resolveLockset`
+  // treats the throw as non-fatal and omits the lockset; the cache-zip case below is the
+  // end-to-end half of this.
+  const dependencies = computeInputDepMap({ react: '^18.2.0', 'lucide-react': '^1.21.0' });
+  assert.throws(
+    () => assertDependenciesResolved(dependencies, RESOLVED),
     /Could not resolve.*lucide-react@\^1\.21\.0/,
   );
 });

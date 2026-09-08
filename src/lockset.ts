@@ -83,25 +83,6 @@ export const fetchDepTree = async (
   return resolved;
 };
 
-export const fetchLockset = async (
-  pkgDependencies: DepMap,
-  cdnRoot: string = DEFAULT_CDN_ROOT,
-  registryResolved: readonly string[] = [],
-): Promise<LocksetSection> => {
-  const dependencies = computeInputDepMap(pkgDependencies, registryResolved);
-  const resolved = await fetchDepTree(dependencies, cdnRoot);
-  // The CDN SILENTLY OMITS a package it can't resolve (most often a version
-  // newer than its npm mirror knows) rather than erroring. Embedding such an
-  // incomplete lockset bakes the drop into the zip: the runtime would skip the
-  // package and the first import of it resolves to `undefined`. Apply the SAME
-  // completeness guard the sandbox runtime uses (shared from the transpiler) so
-  // the build surfaces the dropped package instead of shipping a broken
-  // pre-resolved manifest. `resolveLockset` treats the throw as non-fatal
-  // (spec §7): it warns with this message and omits the lockset.
-  assertDependenciesResolved(dependencies, resolved);
-  return { cdnVersion: LOCKSET_CDN_VERSION, dependencies, resolved };
-};
-
 // --- bundled package content (R3-49a) ----------------------------------------
 //
 // The lockset above embeds only the RESOLUTION (name/version/depth). The module
