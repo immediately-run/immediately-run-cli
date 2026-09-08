@@ -63,15 +63,27 @@ const readJson = (path: string): Record<string, unknown> | null => {
 };
 
 /**
- * Resolve `name` the way node would from `from`, walking up `node_modules`. Deliberately
- * not `require.resolve`: that resolves against THIS process's paths, and the tree being
- * described is the target repo's, which may not be the CLI's own.
+ * Resolve `name` the way node would from `from`, walking up `node_modules` — but NEVER
+ * above `stopAt` (the repo root).
+ *
+ * THE BOUND IS THE POINT. Without it the walk runs to the filesystem root, so a repo with
+ * no `node_modules` of its own, nested anywhere under a directory that has one, resolves a
+ * FOREIGN package — and it lands in that repo's lockset at the version the neighbour
+ * happens to have. Review reproduced exactly that: a declared `^3.0.0` resolved to
+ * `0.0.9-FOREIGN` at depth 0 and shipped, and the runtime applied it, because the echo it
+ * matches on is the RANGE map, which still matched.
+ *
+ * Deliberately not `require.resolve`: that resolves against THIS process's paths, and the
+ * tree being described is the target repo's, not the CLI's own — the same class of bug
+ * one level up.
  */
-export function resolvePackageDir(name: string, from: string): string | null {
+export function resolvePackageDir(name: string, from: string, stopAt?: string): string | null {
+  const root = stopAt ? resolvePath(stopAt) : null;
   let dir = resolvePath(from);
   for (;;) {
     const candidate = join(dir, 'node_modules', name);
     if (existsSync(join(candidate, 'package.json'))) return candidate;
+    if (root && dir === root) return null;
     const parent = dirname(dir);
     if (parent === dir) return null;
     dir = parent;
@@ -94,7 +106,9 @@ export function resolveFromInstalledTree(repoPath: string, wanted: DepMap): Reso
     const next: { name: string; from: string }[] = [];
     for (const { name, from } of frontier) {
       if (out.has(name)) continue;
-      const dir = resolvePackageDir(name, from);
+      // `repoPath` is the floor for EVERY lookup, including a transitive one: a nested
+      // dependency's own deps resolve within the repo or not at all.
+      const dir = resolvePackageDir(name, from, repoPath);
       if (!dir) continue;
       const pkg = readJson(join(dir, 'package.json'));
       const version = typeof pkg?.version === 'string' ? pkg.version : null;
@@ -162,6 +176,56 @@ export function cjsEntry(pkg: Record<string, unknown>): string {
 }
 
 /**
+ * Conditions NOT to seed from.
+ *
+ * `import`/`module` name the ESM build, which the runtime does not evaluate (the CDN
+ * records it size-only). `types`/`typings` are declarations. `react-server` is a
+ * server-only condition a browser bundler never takes — excluded on that ground, not
+ * because the CDN happens to skip it.
+ *
+ * NOTE THE ASYMMETRY, because it decides how the differential test is written: including
+ * a file the runtime never evaluates costs BYTES; excluding one it does evaluate costs a
+ * blocking unpkg fetch at boot. So this list stays short and principled, and the test
+ * asserts a SUPERSET of the CDN rather than equality.
+ */
+const SKIP_CONDITIONS = new Set(['import', 'module', 'types', 'typings', 'react-server']);
+
+/**
+ * Every entry point a consumer can reach, repo-relative — `main` plus each `exports`
+ * target that is not ESM-only.
+ *
+ * THIS IS THE FINDING THAT MADE THE FIRST VERSION WORSE THAN USELESS. Seeding only from
+ * `main` inlines only `main`'s require closure, so a multi-entry package ships its other
+ * entries as SIZE ONLY — `react/jsx-runtime`, `react-dom/client`, and 1,803 of
+ * `lucide-react`'s files. The runtime's `RegistryFS` treats a size-only entry as existing
+ * and lazily fetches its bytes **from unpkg**, one blocking round trip per file on every
+ * cold boot. That trades one third-party boot dependency for another, silently, which is
+ * the exact opposite of this module's purpose.
+ *
+ * It was invisible because the only fixture had a single `.` export. `react` is now a
+ * fixture too, precisely because it does not.
+ */
+export function entryPoints(pkg: Record<string, unknown>): string[] {
+  const out = new Set<string>([cjsEntry(pkg)]);
+  const visit = (node: unknown, condition: string | null): void => {
+    if (typeof node === 'string') {
+      if (condition === null || !SKIP_CONDITIONS.has(condition)) {
+        out.add(node.replace(/^\.\//, ''));
+      }
+      return;
+    }
+    if (!node || typeof node !== 'object') return;
+    for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+      // A subpath key ("." / "./jsx-runtime") keeps the inherited condition; a condition
+      // key ("require" / "import" / "default") replaces it.
+      visit(value, key.startsWith('.') ? condition : key);
+    }
+  };
+  visit(pkg.exports, null);
+  return [...out];
+}
+
+/**
  * Build the `ICDNModule` for an installed package.
  *
  * `scan` is injected (the sandbox's `scanCjsModule`, or any equivalent) rather than
@@ -190,8 +254,7 @@ export function buildLocalPackage(
     }
   }
 
-  const entry = cjsEntry(pkg);
-  const queue = [entry, 'package.json'].filter((p) => f[p] !== undefined);
+  const queue = [...entryPoints(pkg), 'package.json'].filter((p) => f[p] !== undefined);
   const seen = new Set<string>();
   while (queue.length) {
     const rel = queue.shift()!;

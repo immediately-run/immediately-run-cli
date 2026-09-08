@@ -48,7 +48,7 @@ import {
   resolveFromInstalledTree,
   resolvePackageDir,
 } from '../localPackageSource.js';
-import { scanCjsRequires } from '../scanCjsRequires.js';
+import { scanCjsModule } from '../vendor/cjsScan/scan.js';
 import {
   emitArtifacts,
   emitMdxMetadata,
@@ -198,7 +198,8 @@ const headDependencies = (
  * WHY GAP-FILLING RATHER THAN LOCAL-FIRST. The first cut preferred the installed tree
  * wholesale and always lost, for a reason worth recording: `computeInputDepMap` includes
  * the AUGMENTED build dependencies the sandbox runtime needs (`react-refresh`, `core-js`,
- * `scheduler`) and which npm never installs, so the local tree can never be complete. But
+ * `react-error-boundary`) and which npm never installs, so the local tree can never be
+ * complete. But
  * the two sources fail in exactly opposite places — the CDN drops a version its npm mirror
  * has not ingested (always a FRESH publish), and the local tree lacks only the augmented
  * build deps (always STABLE, always resolvable). Taking the union covers both.
@@ -242,8 +243,13 @@ const resolveLockset = async (
     assertDependenciesResolved(dependencies, resolved);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    console.warn(`Warning: lockset omitted (${message}${cdnError ? `; CDN: ${cdnError}` : ''})`);
-    return { summary: `omitted (${message})` };
+    // `cdnError` belongs in the DURABLE record, not only on the console. Without it, an
+    // HTTP 500 on every request reads in the manifest as "may not exist on the CDN's npm
+    // mirror yet — try a lower version range in package.json", which advises lowering a
+    // range on a pinned `core-js@3.22.7` and sends the next reader after the wrong thing.
+    const full = cdnError ? `${message} [the CDN itself failed: ${cdnError}]` : message;
+    console.warn(`Warning: lockset omitted (${full})`);
+    return { summary: `omitted (${full})` };
   }
 
   const source = filled.length === 0 ? 'CDN' : fromCdn.length === 0 ? 'node_modules' : `CDN + ${filled.length} from node_modules`;
@@ -278,7 +284,7 @@ const resolveBundledPackages = async (
   const needCdn: typeof lockset.resolved = [];
   for (const entry of lockset.resolved) {
     const { n: name, v: version } = entry;
-    const dir = resolvePackageDir(name, repo);
+    const dir = resolvePackageDir(name, repo, repo);
     let installedVersion: string | null = null;
     try {
       installedVersion = dir ? (JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')).version ?? null) : null;
@@ -294,7 +300,7 @@ const resolveBundledPackages = async (
           key: encodePackageKey(name, version),
           name,
           version,
-          bytes: encodeLocalPackage(buildLocalPackage(dir, scanCjsRequires)),
+          bytes: encodeLocalPackage(buildLocalPackage(dir, scanCjsModule)),
         });
         continue;
       } catch {

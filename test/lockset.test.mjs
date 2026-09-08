@@ -314,6 +314,36 @@ test('a package the CDN drops is filled in from node_modules', async () => {
   }
 });
 
+test('the local bundling path is actually TAKEN when the version matches', async () => {
+  // The positive case. Review found every --bundle-packages test was NEGATIVE (the
+  // mismatched-version one), so nothing asserted the local path is used at all — which is
+  // how a main-only entry seed and a paraphrased scanner both stayed invisible behind a
+  // green suite.
+  const root = makeRepo(JSON.stringify({ dependencies: { react: '^19.0.0', 'gap-pkg': '9.9.9' } }));
+  try {
+    dropFromDepTree = 'gap-pkg';
+    const dir = join(root, 'node_modules', 'gap-pkg');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'gap-pkg', version: '9.9.9', main: 'index.js' }));
+    writeFileSync(join(dir, 'index.js'), 'module.exports = require("./helper");\n');
+    writeFileSync(join(dir, 'helper.js'), 'module.exports = "LOCAL BYTES";\n');
+
+    const result = await buildCacheZip(zipOpts(root, { bundlePackages: true }));
+    assert.match(result.bundledPackagesSummary, /from node_modules/);
+
+    // …and the bytes in the zip are the local ones, with the require closure followed.
+    const bytes = execFileSync(
+      'unzip',
+      ['-p', result.outputPath, `.immediately.run/packages/${bundledPackageFilename('gap-pkg', '9.9.9')}.msgpack`],
+      { encoding: 'buffer', maxBuffer: 64 * 1024 * 1024 },
+    );
+    assert.ok(bytes.includes(Buffer.from('LOCAL BYTES')), 'the required sibling must be inlined, not size-only');
+  } finally {
+    dropFromDepTree = undefined;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('a gap node_modules cannot fill still omits the lockset — no invented versions', async () => {
   // The completeness guard is what keeps gap-filling honest: a hole neither source can
   // close must fail loudly here rather than ship a lockset the runtime will act on.
