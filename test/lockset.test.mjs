@@ -4,7 +4,7 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createServer } from 'node:http';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { encode as encodeMsgPack } from '@msgpack/msgpack';
@@ -16,6 +16,7 @@ import {
   fetchLockset,
 } from '../dist/lockset.js';
 import { buildCacheZip } from '../dist/commands/cacheZip.js';
+import { bundledPackageFilename } from '../dist/lockset.js';
 
 // --- unit: input DepMap derivation ------------------------------------------
 
@@ -82,6 +83,10 @@ let nextStatus = 200;
 // payload mentions this substring (e.g. an SDK version not yet replicated),
 // while every other request resolves normally.
 let failIfPayloadIncludes;
+// R3-567: the CDN SILENTLY OMITS a package it cannot resolve rather than erroring — which
+// is the behaviour gap-filling exists to cover, so the stub has to reproduce it faithfully
+// rather than 500. Set to a package name to have the stub answer 200 with that name absent.
+let dropFromDepTree;
 
 const decodeDepTreePath = (url) => {
   const enc = decodeURIComponent(url.replace(/^\/dep_tree\//, ''));
@@ -103,7 +108,8 @@ before(async () => {
       return;
     }
     res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
-    res.end(Buffer.from(encodeMsgPack(RESOLVED)));
+    const body = dropFromDepTree ? RESOLVED.filter((r) => r.n !== dropFromDepTree) : RESOLVED;
+    res.end(Buffer.from(encodeMsgPack(body)));
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   cdnRoot = `http://127.0.0.1:${server.address().port}/`;
@@ -178,7 +184,9 @@ test('cache-zip embeds the lockset in the sidecar', async () => {
   const root = makeRepo(JSON.stringify({ dependencies: { react: '^18.2.0' } }));
   try {
     const result = await buildCacheZip(zipOpts(root));
-    assert.equal(result.locksetSummary, `${RESOLVED.length} packages`);
+    // R3-567: the summary now NAMES the source, because a cache artifact that cannot say
+    // where its content came from is how a silent regression back to the CDN goes unnoticed.
+    assert.equal(result.locksetSummary, `${RESOLVED.length} packages (CDN)`);
     const sidecar = sidecarOf(result.outputPath);
     assert.equal(sidecar.schemaVersion, 1);
     assert.deepEqual(sidecar.lockset.resolved, RESOLVED);
@@ -243,7 +251,9 @@ test('lockset resolves despite SDK CDN lag — implicit, no opt-in field needed'
     failIfPayloadIncludes = SDK;
     const result = await buildCacheZip(zipOpts(root));
     // Resolution still succeeded — the SDK never entered the dep_tree request.
-    assert.equal(result.locksetSummary, `${RESOLVED.length} packages`);
+    // R3-567: the summary now NAMES the source, because a cache artifact that cannot say
+    // where its content came from is how a silent regression back to the CDN goes unnoticed.
+    assert.equal(result.locksetSummary, `${RESOLVED.length} packages (CDN)`);
     const sidecar = sidecarOf(result.outputPath);
     assert.deepEqual(sidecar.lockset.resolved, RESOLVED);
     assert.equal(sidecar.lockset.dependencies[SDK], undefined);
@@ -264,10 +274,92 @@ test('still strips the SDK even with the legacy resolveFromRegistry field presen
   try {
     failIfPayloadIncludes = SDK;
     const result = await buildCacheZip(zipOpts(root));
-    assert.equal(result.locksetSummary, `${RESOLVED.length} packages`);
+    // R3-567: the summary now NAMES the source, because a cache artifact that cannot say
+    // where its content came from is how a silent regression back to the CDN goes unnoticed.
+    assert.equal(result.locksetSummary, `${RESOLVED.length} packages (CDN)`);
     assert.equal(sidecarOf(result.outputPath).lockset.dependencies[SDK], undefined);
   } finally {
     failIfPayloadIncludes = undefined;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// R3-567 — the gap-filling that ends the 2026-09-08 outage. The CDN silently OMITS a
+// package its npm mirror has not ingested (always a FRESH publish); the runner's own
+// node_modules has exactly that package, because npm installed it. Filling the CDN's gaps
+// from the tree covers the one failure mode that actually happened, and the two sources
+// fail in opposite places: the tree lacks only the AUGMENTED build deps
+// (react-refresh/core-js/scheduler), which are stable and which the CDN always has.
+test('a package the CDN drops is filled in from node_modules', async () => {
+  const root = makeRepo(JSON.stringify({ dependencies: { react: '^19.0.0', 'gap-pkg': '9.9.9' } }));
+  try {
+    // The CDN cannot resolve it — exactly what happened to @immediately-run/omnibox@0.3.0.
+    failIfPayloadIncludes = undefined;
+    dropFromDepTree = 'gap-pkg';
+    // …but npm has installed it.
+    const dir = join(root, 'node_modules', 'gap-pkg');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'gap-pkg', version: '9.9.9', main: 'index.js' }));
+    writeFileSync(join(dir, 'index.js'), 'module.exports = 1;\n');
+
+    const result = await buildCacheZip(zipOpts(root));
+    assert.match(result.locksetSummary, /from node_modules/);
+    const resolved = sidecarOf(result.outputPath).lockset.resolved;
+    const entry = resolved.find((r) => r.n === 'gap-pkg');
+    assert.ok(entry, 'the dropped package must be in the lockset');
+    assert.equal(entry.v, '9.9.9', 'and at the version npm installed, never a guess');
+  } finally {
+    dropFromDepTree = undefined;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a gap node_modules cannot fill still omits the lockset — no invented versions', async () => {
+  // The completeness guard is what keeps gap-filling honest: a hole neither source can
+  // close must fail loudly here rather than ship a lockset the runtime will act on.
+  const root = makeRepo(JSON.stringify({ dependencies: { react: '^19.0.0', 'absent-pkg': '1.0.0' } }));
+  try {
+    dropFromDepTree = 'absent-pkg';
+    const result = await buildCacheZip(zipOpts(root));
+    assert.match(result.locksetSummary, /^omitted/);
+  } finally {
+    dropFromDepTree = undefined;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a node_modules copy at a DIFFERENT version is never bundled under the resolved key', async () => {
+  // THE WORST FAILURE THIS FEATURE COULD HAVE, and the one the first version of this test
+  // was too weak to catch (fault injection: weakening the version check left it green).
+  // The hazard is not the lockset — it is the BUNDLE: the CDN resolves react@18.3.1, the
+  // tree happens to hold a different react, and we ship those bytes under 18.3.1's key.
+  // Silent, and undetectable downstream, because the key is the only thing the runtime
+  // matches on.
+  const root = makeRepo(JSON.stringify({ dependencies: { react: '^18.0.0' } }));
+  try {
+    // The CDN resolves react@18.3.1 (see RESOLVED). node_modules holds a DIFFERENT one.
+    const dir = join(root, 'node_modules', 'react');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'react', version: '0.0.1-wrong', main: 'index.js' }));
+    writeFileSync(join(dir, 'index.js'), 'module.exports = "WRONG BYTES";\n');
+
+    const result = await buildCacheZip(zipOpts(root, { bundlePackages: true }));
+    // Whatever else happens, the local copy must NOT have been used for react.
+    assert.doesNotMatch(
+      result.bundledPackagesSummary,
+      /all from node_modules/,
+      'a mismatched local copy must not be treated as the resolved package',
+    );
+    const bundled = execFileSync('unzip', ['-Z1', result.outputPath], { encoding: 'utf8' });
+    if (bundled.includes(`${bundledPackageFilename('react', '18.3.1')}.msgpack`)) {
+      const bytes = execFileSync(
+        'unzip',
+        ['-p', result.outputPath, `.immediately.run/packages/${bundledPackageFilename('react', '18.3.1')}.msgpack`],
+        { encoding: 'buffer', maxBuffer: 64 * 1024 * 1024 },
+      );
+      assert.ok(!bytes.includes(Buffer.from('WRONG BYTES')), 'the wrong version\'s bytes must never ship under the resolved key');
+    }
+  } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });

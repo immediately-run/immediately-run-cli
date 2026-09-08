@@ -13,7 +13,7 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -31,12 +31,24 @@ import {
 } from '../manifest.js';
 import {
   DEFAULT_CDN_ROOT,
-  fetchLockset,
   fetchBundledPackages,
+  LOCKSET_CDN_VERSION,
+  encodePackageKey,
+  computeInputDepMap,
+  assertDependenciesResolved,
+  fetchDepTree,
+  type ResolvedDependency,
   bundledPackageFilename,
   type DepMap,
   type BundledPackage,
 } from '../lockset.js';
+import {
+  buildLocalPackage,
+  encodeLocalPackage,
+  resolveFromInstalledTree,
+  resolvePackageDir,
+} from '../localPackageSource.js';
+import { scanCjsRequires } from '../scanCjsRequires.js';
 import {
   emitArtifacts,
   emitMdxMetadata,
@@ -179,6 +191,24 @@ const headDependencies = (
   return { deps, registryResolved };
 };
 
+/**
+ * The lockset, with any package the dependency CDN cannot resolve FILLED IN from the
+ * runner's own installed tree (R3-567).
+ *
+ * WHY GAP-FILLING RATHER THAN LOCAL-FIRST. The first cut preferred the installed tree
+ * wholesale and always lost, for a reason worth recording: `computeInputDepMap` includes
+ * the AUGMENTED build dependencies the sandbox runtime needs (`react-refresh`, `core-js`,
+ * `scheduler`) and which npm never installs, so the local tree can never be complete. But
+ * the two sources fail in exactly opposite places — the CDN drops a version its npm mirror
+ * has not ingested (always a FRESH publish), and the local tree lacks only the augmented
+ * build deps (always STABLE, always resolvable). Taking the union covers both.
+ *
+ * That is also precisely the outage this exists for: `omnibox@0.3.0` was dropped by the
+ * CDN one hour after publish, and was sitting in `node_modules` the whole time.
+ *
+ * The CDN being unreachable ENTIRELY is not a failure either — the local tree stands alone
+ * and the completeness guard decides whether what it produced is usable.
+ */
 const resolveLockset = async (
   repo: string,
   opts: CacheZipOptions,
@@ -190,15 +220,40 @@ const resolveLockset = async (
   if (reason) {
     return { summary: `omitted (${reason})` };
   }
+  const dependencies = computeInputDepMap(deps, registryResolved);
+
+  let fromCdn: ResolvedDependency[] = [];
+  let cdnError = '';
   try {
-    const lockset = await fetchLockset(deps, opts.cdnRoot, registryResolved);
-    return { lockset, summary: `${lockset.resolved.length} packages` };
+    fromCdn = await fetchDepTree(dependencies, opts.cdnRoot);
   } catch (err) {
-    // Never fail the zip build over the lockset (spec §7): warn and omit.
+    cdnError = err instanceof Error ? err.message : String(err);
+  }
+
+  const local = resolveFromInstalledTree(repo, dependencies);
+  const have = new Set(fromCdn.map((r) => r.n));
+  const filled = local.filter((r) => !have.has(r.n));
+  const resolved = [...fromCdn, ...filled];
+
+  try {
+    // The SAME completeness guard the runtime applies. A gap neither source could fill
+    // must fail here rather than bake a hole into the zip: the runtime would skip the
+    // package and its first import resolves `undefined`.
+    assertDependenciesResolved(dependencies, resolved);
+  } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    console.warn(`Warning: lockset omitted (${message})`);
+    console.warn(`Warning: lockset omitted (${message}${cdnError ? `; CDN: ${cdnError}` : ''})`);
     return { summary: `omitted (${message})` };
   }
+
+  const source = filled.length === 0 ? 'CDN' : fromCdn.length === 0 ? 'node_modules' : `CDN + ${filled.length} from node_modules`;
+  if (filled.length) {
+    console.log(`  · lockset gaps filled from node_modules: ${filled.map((r) => `${r.n}@${r.v}`).join(', ')}`);
+  }
+  return {
+    lockset: { cdnVersion: LOCKSET_CDN_VERSION, dependencies, resolved },
+    summary: `${resolved.length} packages (${source})`,
+  };
 };
 
 // Fetch the resolved dependency CONTENT for bundling (R3-49a). Opt-in, and gated on
@@ -207,6 +262,7 @@ const resolveLockset = async (
 const resolveBundledPackages = async (
   opts: CacheZipOptions,
   lockset: RepoManifest['lockset'] | undefined,
+  repo: string,
 ): Promise<{ packages?: BundledPackage[]; summary: string }> => {
   if (!opts.bundlePackages) {
     return { summary: 'omitted (not requested)' };
@@ -214,10 +270,51 @@ const resolveBundledPackages = async (
   if (!lockset) {
     return { summary: 'omitted (no lockset)' };
   }
+
+  // R3-567: PER PACKAGE, local when the tree has it, CDN otherwise — the same
+  // gap-filling as the lockset and for the same reason. All-or-nothing per source would
+  // always lose to the augmented build deps npm never installs.
+  const localBuilt: BundledPackage[] = [];
+  const needCdn: typeof lockset.resolved = [];
+  for (const entry of lockset.resolved) {
+    const { n: name, v: version } = entry;
+    const dir = resolvePackageDir(name, repo);
+    let installedVersion: string | null = null;
+    try {
+      installedVersion = dir ? (JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')).version ?? null) : null;
+    } catch {
+      installedVersion = null;
+    }
+    // Only when the tree holds the EXACT version the lockset resolved. A different
+    // version on disk is a different package, and shipping it under this key would be a
+    // silent substitution — the worst failure this whole feature could have.
+    if (dir && installedVersion === version) {
+      try {
+        localBuilt.push({
+          key: encodePackageKey(name, version),
+          name,
+          version,
+          bytes: encodeLocalPackage(buildLocalPackage(dir, scanCjsRequires)),
+        });
+        continue;
+      } catch {
+        /* fall through to the CDN for this one */
+      }
+    }
+    needCdn.push(entry);
+  }
+
   try {
-    const packages = await fetchBundledPackages(lockset.resolved, opts.cdnRoot);
+    const fetched = needCdn.length ? await fetchBundledPackages(needCdn, opts.cdnRoot) : [];
+    const packages = [...localBuilt, ...fetched];
     const bytes = packages.reduce((sum, p) => sum + p.bytes.byteLength, 0);
-    return { packages, summary: `${packages.length} packages, ${formatBytes(bytes)}` };
+    const source =
+      needCdn.length === 0
+        ? 'all from node_modules'
+        : localBuilt.length === 0
+          ? 'all from the CDN'
+          : `${localBuilt.length} from node_modules, ${fetched.length} from the CDN`;
+    return { packages, summary: `${packages.length} packages, ${formatBytes(bytes)} (${source})` };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.warn(`Warning: bundled packages omitted (${message})`);
@@ -256,7 +353,7 @@ export const buildCacheZip = async (opts: CacheZipOptions): Promise<CacheZipResu
   const defaultBranch = opts.defaultBranch || defaultBranchOf(repo, ref);
   const entries = treeEntries(repo);
   const { lockset, summary: locksetSummary } = await resolveLockset(repo, opts);
-  const { packages, summary: bundledPackagesSummary } = await resolveBundledPackages(opts, lockset);
+  const { packages, summary: bundledPackagesSummary } = await resolveBundledPackages(opts, lockset, repo);
 
   const manifest: RepoManifest = {
     schemaVersion: MANIFEST_SCHEMA_VERSION,

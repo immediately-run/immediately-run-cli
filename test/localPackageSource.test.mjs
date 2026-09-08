@@ -28,17 +28,9 @@ const here = dirname(fileURLToPath(import.meta.url));
 const FIXTURE = join(here, 'fixtures/omnibox-0.2.1');
 const CDN = decodeMsgPack(new Uint8Array(readFileSync(join(here, 'fixtures/omnibox-0.2.1.cdn.msgpack'))));
 
-// The REAL scanner the runtime uses, not a second implementation that would agree with
-// this one by construction. Inlined rather than imported because the sandbox is a sibling
-// checkout, not a dependency — and a copy that drifts is caught by the differential case
-// below, which is the point.
-const scanCjsModule = (source) => {
-  const requires = [];
-  const re = /require\(\s*['"]([^'"]+)['"]\s*\)/g;
-  let m;
-  while ((m = re.exec(source))) if (!requires.includes(m[1])) requires.push(m[1]);
-  return { requires };
-};
+// The scanner the CLI actually ships, driven through the real thing rather than a
+// convenience regex — this test is what keeps that copy honest against the CDN.
+import { scanCjsRequires as scanCjsModule } from '../dist/scanCjsRequires.js';
 
 const sorted = (a) => [...a].sort();
 
