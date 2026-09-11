@@ -56,12 +56,20 @@ const isResolvedDependency = (value: unknown): value is ResolvedDependency => {
   return typeof d.n === 'string' && typeof d.v === 'string' && typeof d.d === 'number';
 };
 
-export const fetchLockset = async (
-  pkgDependencies: DepMap,
+/**
+ * The RAW `/dep_tree/` answer — whatever the CDN could resolve, with no completeness
+ * guard. Split out for R3-567: gap-filling needs the partial list, because the CDN
+ * SILENTLY OMITS a package it cannot resolve rather than erroring, and that omission is
+ * exactly the set the installed tree fills in.
+ *
+ * Every caller that intends to SHIP the result must still run `assertDependenciesResolved`
+ * over the final list — this function deliberately does not, and it is the only place in
+ * this file that returns something incomplete.
+ */
+export const fetchDepTree = async (
+  dependencies: DepMap,
   cdnRoot: string = DEFAULT_CDN_ROOT,
-  registryResolved: readonly string[] = [],
-): Promise<LocksetSection> => {
-  const dependencies = computeInputDepMap(pkgDependencies, registryResolved);
+): Promise<ResolvedDependency[]> => {
   const base = cdnRoot.endsWith('/') ? cdnRoot : `${cdnRoot}/`;
   const url = `${base}dep_tree/${encodeDepTreePayload(dependencies)}`;
   const response = await fetch(url);
@@ -72,16 +80,7 @@ export const fetchLockset = async (
   if (!Array.isArray(resolved) || !resolved.every(isResolvedDependency)) {
     throw new Error('dep_tree response is not a resolved-dependency list');
   }
-  // The CDN SILENTLY OMITS a package it can't resolve (most often a version
-  // newer than its npm mirror knows) rather than erroring. Embedding such an
-  // incomplete lockset bakes the drop into the zip: the runtime would skip the
-  // package and the first import of it resolves to `undefined`. Apply the SAME
-  // completeness guard the sandbox runtime uses (shared from the transpiler) so
-  // the build surfaces the dropped package instead of shipping a broken
-  // pre-resolved manifest. `resolveLockset` treats the throw as non-fatal
-  // (spec §7): it warns with this message and omits the lockset.
-  assertDependenciesResolved(dependencies, resolved);
-  return { cdnVersion: LOCKSET_CDN_VERSION, dependencies, resolved };
+  return resolved;
 };
 
 // --- bundled package content (R3-49a) ----------------------------------------

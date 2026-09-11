@@ -1,3 +1,8 @@
 node_modules
 dist
+
+# …but NOT the frozen test fixture, which IS a published package's dist and is the whole
+# point of the differential test (R3-567). Without this negation git silently committed 4
+# of its 29 files: green locally, red in CI, on a fixture that looked present.
+!test/fixtures/**
 *.log

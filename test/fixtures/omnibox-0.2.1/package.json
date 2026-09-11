@@ -1,0 +1,56 @@
+{
+  "name": "@immediately-run/omnibox",
+  "version": "0.2.1",
+  "description": "The front door's omnibox: one list-autocomplete combobox that runs a repo by URL or tuple and searches a consumer's app directory and docs (the launch grammar always; the hit sources injected). Shared by landing-page and the Home app so there is one component and one grammar (R3-512, R3-530).",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/immediately-run/omnibox.git"
+  },
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./omnibox.css": "./dist/omnibox.css"
+  },
+  "files": [
+    "dist"
+  ],
+  "sideEffects": [
+    "*.css"
+  ],
+  "scripts": {
+    "build": "tsup && node scripts/build-css.mjs",
+    "test": "vitest run",
+    "lint": "eslint src",
+    "prepare": "npm run build",
+    "check:pins": "node scripts/check-dependency-pins.mjs --self-test && node scripts/check-dependency-pins.mjs",
+    "check:publish-version": "node scripts/check-publish-version.mjs --self-test && node scripts/check-publish-version.mjs"
+  },
+  "peerDependencies": {
+    "@immediately-run/sdk": "0.60.0",
+    "react": "^19.2.5"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.18.0",
+    "@immediately-run/sdk": "0.60.0",
+    "@testing-library/react": "^16.1.0",
+    "@testing-library/user-event": "^14.6.7",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "eslint": "^9.18.0",
+    "jsdom": "^25.0.1",
+    "react": "^19.2.5",
+    "react-dom": "^19.2.5",
+    "tsup": "^8.0.0",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.20.0",
+    "vitest": "^4.1.11"
+  }
+}

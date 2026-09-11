@@ -1,6 +1,6 @@
 {
   "name": "@immediately-run/cli",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "description": "Command-line tools for immediately.run: build a pre-cached repository zip (with a contribute manifest sidecar) for fast, rate-limit-free loading, and pin UI release locks for the region registry.",
   "type": "module",
   "license": "MIT",
@@ -35,9 +35,11 @@
   "scripts": {
     "build": "tsc",
     "check:sidecar": "node scripts/check-sidecar-literal.mjs",
-    "test": "npm run build && npm run check:sidecar && node --test test/*.test.mjs",
+    "test": "npm run build && npm run check:sidecar && npm run check:platform-provided && npm run check:scanner-drift && node --test test/*.test.mjs",
     "verify": "npm test && npm run build",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "check:scanner-drift": "node scripts/check-scanner-drift.mjs --self-test && node scripts/check-scanner-drift.mjs",
+    "check:platform-provided": "node scripts/check-platform-provided.mjs --self-test && node scripts/check-platform-provided.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
@@ -52,6 +54,9 @@
   "dependencies": {
     "@immediately-run/platform-constants": "0.2.0",
     "@immediately-run/transpiler": "0.8.1",
-    "@msgpack/msgpack": "^3.1.3"
+    "@msgpack/msgpack": "^3.1.3",
+    "core-js": "3.22.7",
+    "react-error-boundary": "^6.1.0",
+    "react-refresh": "^0.11.0"
   }
 }
