@@ -14,6 +14,7 @@ import {
   computeInputDepMap,
   encodeDepTreePayload,
   fetchDepTree,
+  fetchDepTreeGuarded,
   assertDependenciesResolved,
 } from '../dist/lockset.js';
 import { buildCacheZip } from '../dist/commands/cacheZip.js';
@@ -88,6 +89,9 @@ let failIfPayloadIncludes;
 // is the behaviour gap-filling exists to cover, so the stub has to reproduce it faithfully
 // rather than 500. Set to a package name to have the stub answer 200 with that name absent.
 let dropFromDepTree;
+// Canned /dep_tree/ answers for the prerelease guard (R3-600), popped before
+// the default RESOLVED body when non-empty.
+let canaryAnswers = [];
 
 const decodeDepTreePath = (url) => {
   const enc = decodeURIComponent(url.replace(/^\/dep_tree\//, ''));
@@ -109,7 +113,11 @@ before(async () => {
       return;
     }
     res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
-    const body = dropFromDepTree ? RESOLVED.filter((r) => r.n !== dropFromDepTree) : RESOLVED;
+    const body = dropFromDepTree
+      ? RESOLVED.filter((r) => r.n !== dropFromDepTree)
+      : canaryAnswers.length > 0
+        ? canaryAnswers.shift()
+        : RESOLVED;
     res.end(Buffer.from(encodeMsgPack(body)));
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -435,6 +443,84 @@ test('control: lagging a NON-self-hosted dep still omits the lockset', async () 
     assert.equal(sidecarOf(result.outputPath).lockset, undefined);
   } finally {
     failIfPayloadIncludes = undefined;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// --- R3-600: the CLI never embeds an unrequested prerelease --------------------
+
+test('a canary answer is re-resolved at the floor, loudly; the guard sits before the gap-fill merge', async () => {
+  const deps = computeInputDepMap({ react: '^18.2.0' });
+  const canary = RESOLVED.map((d) =>
+    d.n === 'react' ? { ...d, v: '18.4.0-canary-abcdef-20260911' } : d,
+  );
+  const exact = RESOLVED.map((d) => (d.n === 'react' ? { ...d, v: '18.2.0' } : d));
+  canaryAnswers.push(canary, exact);
+  const warn = console.warn;
+  const warned = [];
+  console.warn = (...args) => warned.push(args.join(' '));
+  try {
+    const resolved = await fetchDepTreeGuarded(deps, cdnRoot);
+    // The returned resolution is the re-pinned answer…
+    assert.deepEqual(resolved, exact);
+    // …the retry request pinned react at its range's floor…
+    const retryDeps = { ...deps, react: '18.2.0' };
+    assert.equal(lastPath, `/dep_tree/${encodeDepTreePayload(retryDeps)}`);
+    // …loudly (one warn per re-pin, like the runtime's recovery).
+    assert.equal(warned.length, 1);
+    assert.match(warned[0], /"react@\^18\.2\.0" to the prerelease/);
+  } finally {
+    console.warn = warn;
+    canaryAnswers.length = 0;
+  }
+});
+
+test('a prerelease that survives the floor retry throws', async () => {
+  const canary = RESOLVED.map((d) =>
+    d.n === 'react' ? { ...d, v: '18.4.0-canary-abcdef-20260911' } : d,
+  );
+  canaryAnswers.push(canary, canary);
+  try {
+    await assert.rejects(
+      fetchDepTreeGuarded(computeInputDepMap({ react: '^18.2.0' }), cdnRoot),
+      /prereleases no requested range asked for \("react"→18\.4\.0-canary-abcdef-20260911\)/,
+    );
+  } finally {
+    canaryAnswers.length = 0;
+  }
+});
+
+test('a canary answered against an irreducible range throws (no re-pin exists)', async () => {
+  // computeInputDepMap keeps '*' as-is, so the requested range has no floor.
+  canaryAnswers.push(RESOLVED.map((d) => (d.n === 'react' ? { ...d, v: '18.4.0-canary-abcdef-20260911' } : d)));
+  try {
+    await assert.rejects(
+      fetchDepTreeGuarded({ react: '*' }, cdnRoot),
+      /"react".*has no concrete version to re-pin it to/,
+    );
+  } finally {
+    canaryAnswers.length = 0;
+  }
+});
+
+test('R3-600 end to end: a canary-then-exact CDN embeds the exact answer with the ORIGINAL echo', async () => {
+  const deps = computeInputDepMap({ react: '^18.2.0' });
+  const canary = RESOLVED.map((d) =>
+    d.n === 'react' ? { ...d, v: '18.4.0-canary-abcdef-20260911' } : d,
+  );
+  const exact = RESOLVED.map((d) => (d.n === 'react' ? { ...d, v: '18.2.0' } : d));
+  canaryAnswers.push(canary, exact);
+  const root = makeRepo(JSON.stringify({ dependencies: { react: '^18.2.0' } }));
+  try {
+    const result = await buildCacheZip(zipOpts(root));
+    assert.doesNotMatch(result.locksetSummary, /^omitted/);
+    const sidecar = sidecarOf(result.outputPath);
+    // The embedded resolution is the floor-pinned answer…
+    assert.deepEqual(sidecar.lockset.resolved, exact);
+    // …and the echo is the ORIGINAL input map the runtime recomputes.
+    assert.deepEqual(sidecar.lockset.dependencies, deps);
+  } finally {
+    canaryAnswers.length = 0;
     rmSync(root, { recursive: true, force: true });
   }
 });

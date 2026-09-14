@@ -11,12 +11,20 @@
  */
 
 import { decode as decodeMsgPack } from '@msgpack/msgpack';
-import { assertDependenciesResolved, computeInputDepMap, type DepMap } from '@immediately-run/transpiler';
+import {
+  assertDependenciesResolved,
+  concreteVersion,
+  computeInputDepMap,
+  findUnrequestedPrereleases,
+  type DepMap,
+} from '@immediately-run/transpiler';
 
-// `computeInputDepMap` and `assertDependenciesResolved` are the single source of
-// truth in @immediately-run/transpiler (PRETRANSPILED_ARTIFACTS_SPEC §4.4) — the
-// input DepMap derivation and the resolution-completeness guard live in exactly
-// one place, shared with the sandbox bundler. Re-exported here for convenience.
+// `computeInputDepMap`, `assertDependenciesResolved` and the
+// unrequested-prerelease guard are the single source of truth in
+// @immediately-run/transpiler (PRETRANSPILED_ARTIFACTS_SPEC §4.4) — the input
+// DepMap derivation, the resolution-completeness guard and the prerelease
+// guard live in exactly one place, shared with the sandbox bundler.
+// Re-exported here for convenience.
 export { assertDependenciesResolved, computeInputDepMap, type DepMap };
 
 // Mirrors sandbox/src/bundler/module-registry/module-cdn.ts (CDN_ROOT,
@@ -63,8 +71,9 @@ const isResolvedDependency = (value: unknown): value is ResolvedDependency => {
  * exactly the set the installed tree fills in.
  *
  * Every caller that intends to SHIP the result must still run `assertDependenciesResolved`
- * over the final list — this function deliberately does not, and it is the only place in
- * this file that returns something incomplete.
+ * over the final list — this function deliberately does not, and BOTH fetches in this
+ * file (this one and the guarded variant below) can return an incomplete list; the
+ * completeness guard runs in `resolveLockset` over the merged list.
  */
 export const fetchDepTree = async (
   dependencies: DepMap,
@@ -79,6 +88,54 @@ export const fetchDepTree = async (
   const resolved = decodeMsgPack(new Uint8Array(await response.arrayBuffer()));
   if (!Array.isArray(resolved) || !resolved.every(isResolvedDependency)) {
     throw new Error('dep_tree response is not a resolved-dependency list');
+  }
+  return resolved;
+};
+
+/**
+ * The guarded `/dep_tree/` fetch (R3-600): the raw answer, refused when it
+ * carries a prerelease no requested range asked for (the CDN answered `react
+ * ^19.2.5` with `19.3.0-canary-…` while stable 19.3.0 was on npm). On offending
+ * entries the offending top-level dependencies are re-resolved pinned to their
+ * range's floor (`^18.2.0` → `18.2.0` — the runtime's own recovery) — ONE
+ * retry, with a console warning per re-pin on the builder's warn surface — and
+ * the clean answer is returned, BEFORE the R3-567 gap-filling folds in the
+ * local/platform sources (a canary must not survive into the merge). A range
+ * with no concrete floor, or a prerelease that survives the retry, throws.
+ */
+export const fetchDepTreeGuarded = async (
+  dependencies: DepMap,
+  cdnRoot: string = DEFAULT_CDN_ROOT,
+): Promise<ResolvedDependency[]> => {
+  let resolved = await fetchDepTree(dependencies, cdnRoot);
+  const offending = findUnrequestedPrereleases(dependencies, resolved);
+  if (offending.length === 0) return resolved;
+
+  const retry: DepMap = { ...dependencies };
+  for (const entry of offending) {
+    const range = entry.range ?? dependencies[entry.n];
+    if (range === undefined) continue; // transitive: named in the surviving check below
+    const floor = concreteVersion(range);
+    if (floor === undefined) {
+      throw new Error(
+        `The package CDN resolved "${entry.n}" to the prerelease ${entry.v}, and the requested ` +
+          `range "${range}" has no concrete version to re-pin it to.`,
+      );
+    }
+    console.warn(
+      `The package CDN resolved "${entry.n}@${range}" to the prerelease ${entry.v}; ` +
+        `re-resolving pinned at ${floor}`,
+    );
+    retry[entry.n] = floor;
+  }
+  resolved = await fetchDepTree(retry, cdnRoot);
+  const remaining = findUnrequestedPrereleases(retry, resolved);
+  if (remaining.length > 0) {
+    const list = remaining.map((e) => `"${e.n}"→${e.v}`).join(', ');
+    throw new Error(
+      `The package CDN resolved prereleases no requested range asked for (${list}); ` +
+        `refusing the answer rather than embedding one.`,
+    );
   }
   return resolved;
 };

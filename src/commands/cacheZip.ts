@@ -36,7 +36,7 @@ import {
   encodePackageKey,
   computeInputDepMap,
   assertDependenciesResolved,
-  fetchDepTree,
+  fetchDepTreeGuarded,
   type ResolvedDependency,
   bundledPackageFilename,
   type DepMap,
@@ -241,7 +241,7 @@ const resolveLockset = async (
   let fromCdn: ResolvedDependency[] = [];
   let cdnError = '';
   try {
-    fromCdn = await fetchDepTree(dependencies, opts.cdnRoot);
+    fromCdn = await fetchDepTreeGuarded(dependencies, opts.cdnRoot);
   } catch (err) {
     cdnError = err instanceof Error ? err.message : String(err);
   }
