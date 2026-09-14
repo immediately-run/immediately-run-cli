@@ -502,3 +502,25 @@ test('a canary answered against an irreducible range throws (no re-pin exists)',
     canaryAnswers.length = 0;
   }
 });
+
+test('R3-600 end to end: a canary-then-exact CDN embeds the exact answer with the ORIGINAL echo', async () => {
+  const deps = computeInputDepMap({ react: '^18.2.0' });
+  const canary = RESOLVED.map((d) =>
+    d.n === 'react' ? { ...d, v: '18.4.0-canary-abcdef-20260911' } : d,
+  );
+  const exact = RESOLVED.map((d) => (d.n === 'react' ? { ...d, v: '18.2.0' } : d));
+  canaryAnswers.push(canary, exact);
+  const root = makeRepo(JSON.stringify({ dependencies: { react: '^18.2.0' } }));
+  try {
+    const result = await buildCacheZip(zipOpts(root));
+    assert.doesNotMatch(result.locksetSummary, /^omitted/);
+    const sidecar = sidecarOf(result.outputPath);
+    // The embedded resolution is the floor-pinned answer…
+    assert.deepEqual(sidecar.lockset.resolved, exact);
+    // …and the echo is the ORIGINAL input map the runtime recomputes.
+    assert.deepEqual(sidecar.lockset.dependencies, deps);
+  } finally {
+    canaryAnswers.length = 0;
+    rmSync(root, { recursive: true, force: true });
+  }
+});

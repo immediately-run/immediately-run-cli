@@ -71,8 +71,9 @@ const isResolvedDependency = (value: unknown): value is ResolvedDependency => {
  * exactly the set the installed tree fills in.
  *
  * Every caller that intends to SHIP the result must still run `assertDependenciesResolved`
- * over the final list — this function deliberately does not, and it is the only place in
- * this file that returns something incomplete.
+ * over the final list — this function deliberately does not, and BOTH fetches in this
+ * file (this one and the guarded variant below) can return an incomplete list; the
+ * completeness guard runs in `resolveLockset` over the merged list.
  */
 export const fetchDepTree = async (
   dependencies: DepMap,
