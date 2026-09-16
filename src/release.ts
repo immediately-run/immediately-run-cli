@@ -69,6 +69,11 @@ export interface ReleaseAuthoring {
   label?: string;
   /** Single-level base to inherit `apps` from (overlay wins per region). */
   extends?: string;
+  /** §4.4 channel TEMPLATE marker: this authoring publishes ONLY under dated
+   *  immutable names (`--dated`, the testing workflow) — the plain `<id>` name
+   *  belongs to the CHANNEL, so a plain `<id>.lock.json` must never exist (the
+   *  dual-name rule). `--check` therefore requires no plain lock for it. */
+  channel?: boolean;
   /** region id → canonical id string `provider:ns/repo[@ref]`. */
   apps: Record<string, string>;
 }
@@ -96,6 +101,13 @@ export interface ReleaseIndexEntry {
 export interface ReleaseIndex {
   schemaVersion: typeof RELEASE_SCHEMA_VERSION;
   releases: Record<string, ReleaseIndexEntry>;
+  /** UI_RELEASES_SPEC §4.4 — named MOVING pointers to release names
+   *  (`channels: { "testing": "testing-2026-09-16-a1b2c3d4" }`). Optional and
+   *  additive: schemaVersion stays 1 and a host that predates channels ignores
+   *  the field (a channel name then simply fails name lookup → §6.3 fallback).
+   *  A channel may target any PUBLISHED release; a name that is both a release
+   *  and a channel is forbidden (`validateChannels`). */
+  channels?: Record<string, string>;
 }
 
 // ---- flatten + resolve -----------------------------------------------------
@@ -286,9 +298,13 @@ export const serializeLock = (lock: ReleaseLock): string => {
 export const sha256Hex = (text: string): string =>
   createHash('sha256').update(text, 'utf8').digest('hex');
 
-/** Build the registry index from a set of {name → {lockText, label}} entries. */
+/** Build the registry index from a set of {name → {lockText, label}} entries.
+ * `channels` (§4.4) is carried through verbatim — the caller owns reading the
+ * committed map, applying `--channel` updates, and validating it
+ * (`validateChannels`) BEFORE the index is written. */
 export const buildIndex = (
   locks: { id: string; lockText: string; label?: string; publishedAt?: number }[],
+  channels?: Record<string, string>,
 ): ReleaseIndex => {
   const releases: Record<string, ReleaseIndexEntry> = {};
   for (const { id, lockText, label, publishedAt } of locks.sort((a, b) => (a.id < b.id ? -1 : 1))) {
@@ -299,8 +315,52 @@ export const buildIndex = (
       ...(publishedAt ? { publishedAt } : {}),
     };
   }
-  return { schemaVersion: RELEASE_SCHEMA_VERSION, releases };
+  return {
+    schemaVersion: RELEASE_SCHEMA_VERSION,
+    releases,
+    ...(channels && Object.keys(channels).length > 0 ? { channels } : {}),
+  };
+};
+
+/**
+ * UI_RELEASES_SPEC §4.4 channel-map validation — the publish-time gate for the
+ * one mutable artifact in the registry. Throws (naming both ids) when:
+ *  - a channel targets a release that is not published (`releaseNames`);
+ *  - a name is BOTH a release and a channel (ambiguous for every consumer —
+ *    a host resolving a name must never have two answers).
+ */
+export const validateChannels = (channels: Record<string, string>, releaseNames: ReadonlySet<string>): void => {
+  for (const [channel, target] of Object.entries(channels)) {
+    if (releaseNames.has(channel)) {
+      throw new Error(`channel "${channel}" is also a published release name — a name must be one or the other`);
+    }
+    if (!releaseNames.has(target)) {
+      throw new Error(`channel "${channel}" targets "${target}", which is not a published release`);
+    }
+  }
 };
 
 export const serializeIndex = (index: ReleaseIndex): string =>
   JSON.stringify(index, null, 2) + '\n';
+
+/** UI_RELEASES_SPEC §4.4 — substitute the self-referencing channel target
+ *  `@dated` with the dated lock name this run published (the workflow cannot
+ *  know the name before the resolution). Pure; other targets pass through. */
+export const substituteDatedTargets = (
+  channels: Record<string, string>,
+  datedName: string,
+): Record<string, string> =>
+  Object.fromEntries(Object.entries(channels).map(([c, t]) => [c, t === '@dated' ? datedName : t]));
+
+/** UI_RELEASES_SPEC §4.4 — the dated immutable name for a channel's fresh
+ *  target: `<id>-<YYYY-MM-DD>-<sha8>` where sha8 is the first 8 hex of the
+ *  serialized lock's sha256. Deterministic: same composition + same UTC day →
+ *  the same name, so a no-op republish reuses the existing lock (§3.3
+ *  immutability holds by construction); a changed composition or a new day → a
+ *  new name and the old target is abandoned, never mutated. */
+export const datedLockName = (id: string, lockText: string, date: Date = new Date()): string => {
+  const y = date.getUTCFullYear();
+  const m = String(date.getUTCMonth() + 1).padStart(2, '0');
+  const d = String(date.getUTCDate()).padStart(2, '0');
+  return `${id}-${y}-${m}-${d}-${sha256Hex(lockText).slice(0, 8)}`;
+};
