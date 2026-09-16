@@ -338,6 +338,15 @@ export const validateChannels = (channels: Record<string, string>, releaseNames:
 export const serializeIndex = (index: ReleaseIndex): string =>
   JSON.stringify(index, null, 2) + '\n';
 
+/** UI_RELEASES_SPEC §4.4 — substitute the self-referencing channel target
+ *  `@dated` with the dated lock name this run published (the workflow cannot
+ *  know the name before the resolution). Pure; other targets pass through. */
+export const substituteDatedTargets = (
+  channels: Record<string, string>,
+  datedName: string,
+): Record<string, string> =>
+  Object.fromEntries(Object.entries(channels).map(([c, t]) => [c, t === '@dated' ? datedName : t]));
+
 /** UI_RELEASES_SPEC §4.4 — the dated immutable name for a channel's fresh
  *  target: `<id>-<YYYY-MM-DD>-<sha8>` where sha8 is the first 8 hex of the
  *  serialized lock's sha256. Deterministic: same composition + same UTC day →

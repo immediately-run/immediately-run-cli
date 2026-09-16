@@ -18,6 +18,7 @@ import {
   sha256Hex,
   firstPartyStripWarnings,
   datedLockName,
+  substituteDatedTargets,
   validateChannels,
 } from '../dist/release.js';
 import { runPinRelease } from '../dist/commands/pinRelease.js';
@@ -257,4 +258,9 @@ test('pin-release --check fails loudly when the derived map is missing (anti-dri
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('substituteDatedTargets resolves the @dated self-reference; other targets pass through', () => {
+  const out = substituteDatedTargets({ testing: '@dated', stable: 'stable-2026-09' }, 'testing-2026-09-16-d6fe99a4');
+  assert.deepEqual(out, { testing: 'testing-2026-09-16-d6fe99a4', stable: 'stable-2026-09' });
 });

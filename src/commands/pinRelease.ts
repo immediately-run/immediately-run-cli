@@ -44,6 +44,7 @@ import {
   resolveLock,
   serializeIndex,
   serializeLock,
+  substituteDatedTargets,
   validateChannels,
   type BuildDefaultRef,
   type ReleaseAuthoring,
@@ -84,8 +85,13 @@ Options:
   --dated <id>            Write the release <id> under a dated immutable name
                           <id>-<YYYY-MM-DD>-<sha8> (§4.4 — the moving channel's
                           fresh target; the plain <id> lock is not written)
+  --only <id>             Regenerate ONLY this authoring release's lock; every
+                          other committed lock is history (read verbatim, pins
+                          frozen) — the channel workflow's shape, so a testing
+                          run can never republish base
   --channel a=b[,c=d]     Repoint channel(s) in index.json (§5 7a — the only
-                          mutable write; targets must be published releases)
+                          mutable write; targets must be published releases,
+                          or the literal @dated for this run's --dated lock)
   --no-bake               Skip the §5 5a zip bake (authoring iterations; the
                           registry workflow never skips it)
   -h, --help              Show this help`;
@@ -240,6 +246,7 @@ export const runPinRelease = async (args: ParsedArgs): Promise<number> => {
   const check = args.flags.check === true;
   const republish = args.flags.republish === true;
   const datedId = flagValue(args.flags, 'dated');
+  const onlyId = flagValue(args.flags, 'only');
   const noBake = args.flags['no-bake'] === true;
   const channelRaw = flagValue(args.flags, 'channel');
 
@@ -249,6 +256,13 @@ export const runPinRelease = async (args: ParsedArgs): Promise<number> => {
       channelUpdates = parseChannelFlag(channelRaw);
     } catch (err) {
       console.error(`pin-release: ${err instanceof Error ? err.message : String(err)}`);
+      return 1;
+    }
+    // The self-referencing target: `--channel testing=@dated` points at the
+    // lock THIS run publishes under --dated (the workflow cannot know the
+    // dated name before resolving). Only meaningful together with --dated.
+    if (Object.values(channelUpdates).includes('@dated') && datedId === undefined) {
+      console.error('pin-release: --channel <name>=@dated requires --dated (it names this run\'s dated lock)');
       return 1;
     }
   }
@@ -261,6 +275,14 @@ export const runPinRelease = async (args: ParsedArgs): Promise<number> => {
   const flattened = validateAuthoring(authoring);
   if (datedId !== undefined && !flattened.has(datedId)) {
     console.error(`pin-release: --dated "${datedId}" matches no authoring release in ${dir}`);
+    return 1;
+  }
+  if (onlyId !== undefined && !flattened.has(onlyId)) {
+    console.error(`pin-release: --only "${onlyId}" matches no authoring release in ${dir}`);
+    return 1;
+  }
+  if (onlyId !== undefined && datedId !== undefined && onlyId !== datedId) {
+    console.error(`pin-release: --only "${onlyId}" and --dated "${datedId}" name different releases`);
     return 1;
   }
 
@@ -285,7 +307,12 @@ export const runPinRelease = async (args: ParsedArgs): Promise<number> => {
 
   // ---- write mode: resolve refs → commits, write locks, bake, rebuild index --
   const written: { id: string; lockText: string; label?: string }[] = [];
+  let datedName: string | undefined;
   for (const a of authoring) {
+    // §4.4 --only: the channel workflow regenerates exactly ONE release; every
+    // other authoring's committed lock is HISTORY below (pins frozen — a
+    // testing run can never republish base).
+    if (onlyId !== undefined && a.id !== onlyId) continue;
     const lock = resolveLock(a, flattened.get(a.id)!);
     const lockText = serializeLock(lock);
     // §4.4 --dated: the authoring id is a TEMPLATE; the release is published
@@ -309,6 +336,12 @@ export const runPinRelease = async (args: ParsedArgs): Promise<number> => {
     }
     if (existing !== lockText) writeFileSync(lockPath, lockText);
     written.push({ id: name, lockText, label: a.label });
+    if (datedId === a.id) datedName = name;
+  }
+  // --channel <name>=@dated: substitute the self-referencing target with the
+  // dated name this run just published (validated below like any other).
+  if (datedName !== undefined) {
+    channelUpdates = substituteDatedTargets(channelUpdates, datedName);
   }
 
   // Immutable history: locks with no authoring (the dated targets of past
