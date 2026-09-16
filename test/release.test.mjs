@@ -3,7 +3,7 @@
 // path uses a stub resolver, and the command's --check mode is networkless.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -17,6 +17,8 @@ import {
   buildIndex,
   sha256Hex,
   firstPartyStripWarnings,
+  datedLockName,
+  validateChannels,
 } from '../dist/release.js';
 import { runPinRelease } from '../dist/commands/pinRelease.js';
 
@@ -109,6 +111,8 @@ const writeFixture = (dir) => {
   const lockText = serializeLock(lock);
   writeFileSync(join(dir, 'base.lock.json'), lockText);
   writeFileSync(join(dir, 'index.json'), serializeIndex(buildIndex([{ id: 'base', lockText, label: 'Default' }])));
+  // The §3.1 derived map the coverage assertion reads (matches the fixture's regions).
+  writeFileSync(join(dir, 'defaults-map.json'), JSON.stringify(baseAuthoring.apps, null, 2) + '\n');
 };
 
 test('pin-release --check passes on consistent fixtures', async () => {
@@ -142,6 +146,112 @@ test('pin-release --check fails when a lock is missing', async () => {
   try {
     writeFixture(dir);
     rmSync(join(dir, 'base.lock.json'));
+    const code = await runPinRelease({ positionals: [], flags: { dir, check: true } });
+    assert.equal(code, 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// --- §4.4 channels + §5 5a/7a (R3-637) --------------------------------------
+
+test('buildIndex carries the channel map through; serializeIndex round-trips it', () => {
+  const a = { id: 'base', label: 'Default', apps: { 'panel.spaces': 'github:ir/sm@main' } };
+  const lockText = serializeLock(resolveLock(a, a.apps, stub));
+  const index = buildIndex([{ id: 'base', lockText, label: 'Default' }], { testing: 'base' });
+  assert.deepEqual(index.channels, { testing: 'base' });
+  const parsed = JSON.parse(serializeIndex(index));
+  assert.deepEqual(parsed.channels, { testing: 'base' });
+  // An empty map is omitted (schema-stable for registries without channels).
+  assert.equal('channels' in buildIndex([{ id: 'base', lockText }]), false);
+});
+
+test('validateChannels: dual names and unpublished targets are refused (naming both ids)', () => {
+  validateChannels({ testing: 'base' }, new Set(['base']));
+  assert.throws(() => validateChannels({ base: 'base' }, new Set(['base'])), /also a published release/);
+  assert.throws(() => validateChannels({ testing: 'nope' }, new Set(['base'])), /not a published release/);
+});
+
+test('datedLockName is deterministic per composition+day and moves with either', () => {
+  const text = serializeLock(resolveLock({ id: 'testing', apps: {} }, {}, stub));
+  const d1 = new Date('2026-09-16T10:00:00Z');
+  const d1b = new Date('2026-09-16T23:00:00Z');
+  const d2 = new Date('2026-09-17T00:30:00Z');
+  assert.equal(datedLockName('testing', text, d1), datedLockName('testing', text, d1b));
+  assert.match(datedLockName('testing', text, d1), /^testing-2026-09-16-[0-9a-f]{8}$/);
+  assert.notEqual(datedLockName('testing', text, d1), datedLockName('testing', text, d2));
+  // A changed composition (different lock text) → a different name, same day.
+  const text2 = serializeLock(resolveLock({ id: 'testing', apps: { 'panel.spaces': 'github:ir/sm@main' } }, { 'panel.spaces': 'github:ir/sm@main' }, stub));
+  assert.notEqual(datedLockName('testing', text, d1), datedLockName('testing', text2, d1));
+});
+
+test('pin-release --check keeps historical (authoring-less) locks and validates channels', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pin-release-'));
+  try {
+    writeFixture(dir);
+    // A dated channel target whose authoring is GONE (the workflow's ephemeral
+    // template) + the channel pointing at it.
+    const target = datedLockName('testing', serializeLock(resolveLock({ id: 'testing', apps: {} }, {}, stub)), new Date('2026-09-16T00:00:00Z'));
+    const targetText = serializeLock(resolveLock({ id: 'testing', label: 'Testing', apps: { 'panel.spaces': 'github:ir/sm@main' } }, { 'panel.spaces': 'github:ir/sm@main' }, stub));
+    writeFileSync(join(dir, `${target}.lock.json`), targetText);
+    writeFileSync(
+      join(dir, 'index.json'),
+      serializeIndex(buildIndex([
+        { id: 'base', lockText: readFileSync(join(dir, 'base.lock.json'), 'utf8'), label: 'Default' },
+        { id: target, lockText: targetText, label: 'Testing' },
+      ], { testing: target })),
+    );
+    // base.lock.json's text via the fixture: re-read (written above by writeFixture).
+    const code = await runPinRelease({ positionals: [], flags: { dir, check: true } });
+    assert.equal(code, 0);
+    // Dropping the historical lock from the index strands the channel target → fail.
+    writeFileSync(
+      join(dir, 'index.json'),
+      serializeIndex(buildIndex([{ id: 'base', lockText: readFileSync(join(dir, 'base.lock.json'), 'utf8'), label: 'Default' }], { testing: target })),
+    );
+    const code2 = await runPinRelease({ positionals: [], flags: { dir, check: true } });
+    assert.equal(code2, 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('pin-release --check fails when a channel targets an unpublished release', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pin-release-'));
+  try {
+    writeFixture(dir);
+    writeFileSync(
+      join(dir, 'index.json'),
+      serializeIndex(buildIndex([{ id: 'base', lockText: readFileSync(join(dir, 'base.lock.json'), 'utf8'), label: 'Default' }], { testing: 'ghost' })),
+    );
+    const code = await runPinRelease({ positionals: [], flags: { dir, check: true } });
+    assert.equal(code, 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('pin-release --check coverage: a derived-map region the base lock omits is named', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pin-release-'));
+  try {
+    writeFixture(dir);
+    // site-main gained a region; the export map names it; the base lock does not.
+    writeFileSync(join(dir, 'defaults-map.json'), JSON.stringify({
+      'panel.spaces': 'github:ir/sm@main',
+      'panel.brandnew': 'github:ir/new-app@main',
+    }, null, 2) + '\n');
+    const code = await runPinRelease({ positionals: [], flags: { dir, check: true } });
+    assert.equal(code, 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('pin-release --check fails loudly when the derived map is missing (anti-drift input)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pin-release-'));
+  try {
+    writeFixture(dir);
+    rmSync(join(dir, 'defaults-map.json'));
     const code = await runPinRelease({ positionals: [], flags: { dir, check: true } });
     assert.equal(code, 1);
   } finally {
