@@ -25,8 +25,11 @@ import { join } from 'node:path';
 import { buildCacheZip } from './cacheZip.js';
 import type { ReleaseLockEntry } from '../release.js';
 import type { RepoManifest } from '../manifest.js';
+// The sidecar path literal lives once in @immediately-run/platform-constants
+// (R3-104) — same import cacheZip/manifest use.
+import { CONTRIBUTE_MANIFEST_PATH } from '@immediately-run/platform-constants';
 
-const SIDECAR_PATH = '.immediately.run/contribute-manifest.json';
+const SIDECAR_PATH = CONTRIBUTE_MANIFEST_PATH;
 const ZIP_MAGIC = Buffer.from([0x50, 0x4b, 0x03, 0x04]); // "PK\x03\x04" — a local-file-header zip
 
 const git = (repo: string, args: string[]): string =>
