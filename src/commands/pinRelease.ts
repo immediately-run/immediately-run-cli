@@ -51,7 +51,7 @@ import {
   type ReleaseIndex,
   type ReleaseLock,
 } from '../release.js';
-import { bakeSet, ensureZip, validateResidentZip } from './releaseBake.js';
+import { bakeSet, ensureZip, parseBakeableRepoId, validateResidentZip } from './releaseBake.js';
 
 /** The host's build-default manifest for the §6.1b strip lint (region → repo scope
  *  + first-party-only ceiling). Empty today: the registry's first-party-only set is
@@ -177,16 +177,21 @@ const parseChannelFlag = (raw: string): Record<string, string> => {
 
 /** The committed channel map, if any — write mode PRESERVES it (a plain
  *  republish of base must not wipe the testing channel) and applies --channel
- *  updates on top. A MISSING index is an empty map; a CORRUPT one aborts
- *  naming the file — channels live only in index.json (releases recover from
- *  their lock files), so silently mapping a parse failure to {} would wipe
- *  every committed channel from the rebuilt index, permanently. */
+ *  updates on top. A MISSING index (ENOENT) is an empty map; ANY other read
+ *  failure aborts naming the file — channels live only in index.json
+ *  (releases recover from their lock files), so silently mapping an error to
+ *  {} would drop every committed channel from the rebuilt index. A CORRUPT
+ *  (unparseable) index aborts the same way, below. */
 const readCommittedChannels = (dir: string): Record<string, string> => {
   let text: string;
   try {
     text = readFileSync(join(dir, 'index.json'), 'utf8');
-  } catch {
-    return {}; // absent → an empty map the --channel updates fill
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return {}; // absent → an empty map the --channel updates fill
+    throw new Error(
+      `index.json could not be read (${err instanceof Error ? err.message : String(err)}) — ` +
+        `refusing to rebuild an index that would drop the committed channel map`,
+    );
   }
   try {
     const index = JSON.parse(text) as ReleaseIndex;
@@ -502,16 +507,25 @@ const runCheck = (dir: string, authoring: ReleaseAuthoring[]): number => {
 
   // §3.4/§5-5a: every RESIDENT zip must be valid (magic + the §6.4 sidecar
   // coordinate). Absent zips are counted with a warning, not failed — the
-  // first bake lands them (a repo that has never run a bake has none).
+  // first bake lands them (a repo that has never run a bake has none). An
+  // entry whose repo id the BAKE would refuse is warned by name here (the
+  // same parser decides in both places) — the CI gate must never pass a
+  // registry a bake run would reject.
   const zipsDir = join(dir, 'zips');
   if (existsSync(zipsDir)) {
     let resident = 0;
     let absent = 0;
     for (const l of locks) {
       for (const entry of Object.values((JSON.parse(l.lockText) as ReleaseLock).apps)) {
-        const [, ns, repo] = /^github:(?:([^/]+))\/([^/@]+)$/.exec(entry.repo) ?? [];
-        if (!ns || !repo) continue;
-        const path = join(zipsDir, ns, repo, `${entry.commit}.zip`);
+        const bakeable = parseBakeableRepoId(entry.repo);
+        if (!bakeable) {
+          console.warn(
+            `pin-release --check: ${l.id} region entry ${entry.repo} is not a bakeable repo id — ` +
+              `a bake run will refuse it (only github:owner/repo)`,
+          );
+          continue;
+        }
+        const path = join(zipsDir, bakeable.namespace, bakeable.repository, `${entry.commit}.zip`);
         if (!existsSync(path)) {
           absent++;
           continue;

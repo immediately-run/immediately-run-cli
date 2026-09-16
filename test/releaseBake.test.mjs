@@ -5,7 +5,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, statSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, statSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -114,6 +114,81 @@ test('ensureZip ABORTS on a corrupt resident zip (an interrupted bake must never
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, 'not a zip at all — an interrupted bake left this');
     await assert.rejects(ensureZip(dir, entry), /fails the zip magic check.*aborting/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// The sidecar-leg error cases of validateResidentZip (round-2 review): real
+// zips built with the `zip` binary (the cacheZipBase convention — the same
+// runner dependency the BUILD leg already gates on), each failing one named
+// leg. These also need `unzip` for the sidecar read, so they live in the
+// describeBake guard.
+import { validateResidentZip } from '../dist/commands/releaseBake.js';
+
+const PIN = 'e'.repeat(40);
+const zipFromEntries = (entries) => {
+  // entries: [['path', Buffer|string], …] — built with the `zip` binary (the
+  // cacheZipBase convention; same runner dependency the gate checks).
+  const work = mkdtempSync(join(tmpdir(), 'ir-bake-fixture-'));
+  const out = join(work, 'fixture.zip');
+  try {
+    const names = [];
+    for (const [name, content] of entries) {
+      const target = join(work, name);
+      mkdirSync(dirname(target), { recursive: true });
+      writeFileSync(target, content);
+      names.push(name);
+    }
+    execFileSync('zip', ['-q', '-X', out, ...names], { cwd: work });
+    return readFileSync(out);
+  } finally {
+    rmSync(work, { recursive: true, force: true });
+  }
+};
+const sidecarZip = (manifest) =>
+  zipFromEntries([
+    ['package.json', JSON.stringify({ name: 'app' })],
+    ...(manifest !== null
+      ? [['.immediately.run/contribute-manifest.json', JSON.stringify(manifest)]]
+      : []),
+  ]);
+const sidecarZipRaw = (sidecarBytes) =>
+  zipFromEntries([
+    ['package.json', JSON.stringify({ name: 'app' })],
+    ['.immediately.run/contribute-manifest.json', sidecarBytes],
+  ]);
+
+describeBake('validateResidentZip: each sidecar failure leg aborts with its named reason', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ir-bake-legs-'));
+  try {
+    const entry = { repo: 'github:ir/app', ref: 'main', commit: PIN };
+    const at = (bytes) => {
+      const path = join(dir, 'zips', 'ir', 'app', `${PIN}.zip`);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, bytes);
+      return path;
+    };
+    // A valid zip whose sidecar names a DIFFERENT based-on commit than the
+    // pin → the §6.4 coordinate mismatch (the forged-registry shape). The
+    // validator is synchronous — it THROWS.
+    assert.throws(
+      () => validateResidentZip(at(sidecarZip({ ref: PIN, commitSha: 'f'.repeat(40), namespace: 'ir', repository: 'app' })), entry),
+      /does not name the pin/,
+    );
+    // A valid zip with NO sidecar entry.
+    assert.throws(() => validateResidentZip(at(sidecarZip(null)), entry), /no readable sidecar/);
+    // A valid zip whose sidecar is not JSON.
+    assert.throws(
+      () =>
+        validateResidentZip(
+          at(
+            sidecarZipRaw(Buffer.from('not json', 'utf8')),
+          ),
+          entry,
+        ),
+      /unparseable sidecar/,
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

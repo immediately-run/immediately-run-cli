@@ -94,15 +94,24 @@ export interface BakeResult {
   reused: boolean;
 }
 
+/** Parse a bakeable lock-entry repo id (`github:<owner>/<repo>` — the flat
+ *  first-party shape). One home for the shape; `pinRelease --check`'s zip loop
+ *  routes through the same parser so its skip decision matches the bake's
+ *  refusal exactly. Returns null for any other shape. */
+export const parseBakeableRepoId = (repo: string): { namespace: string; repository: string } | null => {
+  const m = /^github:(?:([^/]+))\/([^/@]+)$/.exec(repo);
+  return m ? { namespace: m[1]!, repository: m[2]! } : null;
+};
+
 /** §3.4/§5-5a immutability guard: a RESIDENT zip is trusted only after
  *  validation — magic bytes always (no dependencies), and the sidecar's
  *  §6.4 coordinate (`ref === commitSha === pin`) whenever `unzip` is
  *  available (the runners always carry it; without it the magic check alone
  *  stands and the sidecar leg is warn-skipped). A zip that fails validation
- *  ABORTS naming the path: the bake writes non-atomically inside
- *  `buildCacheZip`, so an interrupted earlier bake can leave a truncated file
- *  at a content-addressed path — exactly the bytes that must never be
- *  silently reused (the R3-637 review's blocking finding). */
+ *  ABORTS naming the path: an externally corrupted, truncated, or mis-placed
+ *  resident must never be silently reused (this tool's own writes land
+ *  atomically via staging+rename below, so it never leaves a truncated file
+ *  itself — the guard exists for everything else that can touch the tree). */
 export const validateResidentZip = (path: string, entry: ReleaseLockEntry): void => {
   let head: Buffer;
   try {
@@ -146,10 +155,11 @@ export interface BakeOptions {
  *  content-addressing); a new build lands ATOMICALLY (temp file + rename), so
  *  an interrupted bake can never leave a truncated zip at the final path. */
 export const ensureZip = async (dir: string, entry: ReleaseLockEntry, opts: BakeOptions = {}): Promise<BakeResult> => {
-  const [, ns, repo] = /^github:(?:([^/]+))\/([^/@]+)$/.exec(entry.repo) ?? [];
-  if (!ns || !repo) {
+  const bakeable = parseBakeableRepoId(entry.repo);
+  if (!bakeable) {
     throw new Error(`pin-release bake: unsupported repo id "${entry.repo}" (only github:owner/repo is bakeable)`);
   }
+  const { namespace: ns, repository: repo } = bakeable;
   const path = join(dir, 'zips', ns, repo, `${entry.commit}.zip`);
   if (existsSync(path)) {
     validateResidentZip(path, entry);

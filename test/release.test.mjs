@@ -22,6 +22,7 @@ import {
   validateChannels,
 } from '../dist/release.js';
 import { runPinRelease } from '../dist/commands/pinRelease.js';
+import { parseArgs } from '../dist/args.js';
 
 const SHA = 'a'.repeat(40);
 const SHA2 = 'b'.repeat(40);
@@ -436,4 +437,13 @@ test('a corrupt historical lock aborts NAMING the file', async () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// Round-2 review: the parse-level guarantee behind every write-mode test's
+// injected 'no-bake': true — the flag is REGISTERED as boolean, so a real
+// `--no-bake <token>` invocation cannot consume the token (the round-1 bug).
+test('parseArgs: --no-bake is a registered boolean flag (a following token stays a positional)', () => {
+  const parsed = parseArgs(['--no-bake', 'releases']);
+  assert.equal(parsed.flags['no-bake'], true);
+  assert.deepEqual(parsed.positionals, ['releases']);
 });
