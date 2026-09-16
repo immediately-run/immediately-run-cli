@@ -264,3 +264,26 @@ test('substituteDatedTargets resolves the @dated self-reference; other targets p
   const out = substituteDatedTargets({ testing: '@dated', stable: 'stable-2026-09' }, 'testing-2026-09-16-d6fe99a4');
   assert.deepEqual(out, { testing: 'testing-2026-09-16-d6fe99a4', stable: 'stable-2026-09' });
 });
+
+test('pin-release --check: a channel-template authoring needs no plain lock (the name is the channel\'s)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pin-release-'));
+  try {
+    writeFixture(dir);
+    // A dated target + the channel template that produced it (no plain lock).
+    const target = datedLockName('testing', serializeLock(resolveLock({ id: 'testing', apps: {} }, {}, stub)), new Date('2026-09-16T00:00:00Z'));
+    const targetText = serializeLock(resolveLock({ id: 'testing', label: 'Testing', apps: { 'panel.spaces': 'github:ir/sm@main' } }, { 'panel.spaces': 'github:ir/sm@main' }, stub));
+    writeFileSync(join(dir, 'testing.json'), JSON.stringify({ id: 'testing', label: 'Latest of origin/main', extends: 'base', channel: true, apps: {} }, null, 2));
+    writeFileSync(join(dir, `${target}.lock.json`), targetText);
+    writeFileSync(
+      join(dir, 'index.json'),
+      serializeIndex(buildIndex([
+        { id: 'base', lockText: readFileSync(join(dir, 'base.lock.json'), 'utf8'), label: 'Default' },
+        { id: target, lockText: targetText, label: 'Testing' },
+      ], { testing: target })),
+    );
+    const code = await runPinRelease({ positionals: [], flags: { dir, check: true } });
+    assert.equal(code, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

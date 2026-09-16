@@ -313,6 +313,12 @@ export const runPinRelease = async (args: ParsedArgs): Promise<number> => {
     // other authoring's committed lock is HISTORY below (pins frozen — a
     // testing run can never republish base).
     if (onlyId !== undefined && a.id !== onlyId) continue;
+    // A channel TEMPLATE without --dated would write a plain lock under the
+    // CHANNEL's own name — the dual-name rule forbids that shape.
+    if (a.channel && datedId !== a.id) {
+      console.error(`pin-release: "${a.id}" is a channel template (channel: true) — publish it with --dated ${a.id}`);
+      return 1;
+    }
     const lock = resolveLock(a, flattened.get(a.id)!);
     const lockText = serializeLock(lock);
     // §4.4 --dated: the authoring id is a TEMPLATE; the release is published
@@ -399,6 +405,11 @@ const runCheck = (dir: string, authoring: ReleaseAuthoring[]): number => {
 
   const authoringIds = new Set(authoring.map((a) => a.id));
   for (const a of authoring) {
+    // §4.4 channel TEMPLATE: publishes only under dated names — the plain name
+    // belongs to the channel (the dual-name rule forbids a release of the same
+    // name), so no plain lock exists to check. The dated targets themselves are
+    // historical locks, validated below like any other.
+    if (a.channel) continue;
     const lockPath = join(dir, `${a.id}.lock.json`);
     let lockText: string;
     try {

@@ -69,6 +69,11 @@ export interface ReleaseAuthoring {
   label?: string;
   /** Single-level base to inherit `apps` from (overlay wins per region). */
   extends?: string;
+  /** §4.4 channel TEMPLATE marker: this authoring publishes ONLY under dated
+   *  immutable names (`--dated`, the testing workflow) — the plain `<id>` name
+   *  belongs to the CHANNEL, so a plain `<id>.lock.json` must never exist (the
+   *  dual-name rule). `--check` therefore requires no plain lock for it. */
+  channel?: boolean;
   /** region id → canonical id string `provider:ns/repo[@ref]`. */
   apps: Record<string, string>;
 }
