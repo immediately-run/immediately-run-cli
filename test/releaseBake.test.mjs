@@ -13,12 +13,16 @@ import { bakeSet, ensureZip, materializeCommit } from '../dist/commands/releaseB
 
 // The bake leg shells out to `git` AND `zip` (the CLI's documented runner
 // dependencies — cacheZipBase.test.mjs has the same requirement). A machine
-// without them skips the BUILD leg loudly; the reuse/dedup/materialize legs
-// (git-only) always run. CI's ubuntu runners carry both binaries.
-const hasBinary = (name) => spawnSync(name, ['--version'], { stdio: 'ignore' }).status === 0;
+// without them skips the BUILD + sidecar legs loudly; the reuse/dedup/
+// materialize legs (git-only) always run. Presence is probed with
+// `command -v` (PATH lookup) — NOT a `--version` invocation: Info-ZIP's zip
+// and unzip answer `-v`, not `--version`, so a version probe misjudges the CI
+// runners' own binaries as absent and the gated legs skip EVERYWHERE (the
+// round-3 review's finding — a skip-green CI).
+const hasBinary = (name) => spawnSync('sh', ['-c', `command -v ${name}`], { stdio: 'ignore' }).status === 0;
 const describeBake = hasBinary('zip') && hasBinary('unzip') ? test : test.skip;
 if (describeBake === test.skip) {
-  console.warn('SKIP (no zip/unzip on this machine): the releaseBake BUILD leg needs them (CI runners have both)');
+  console.warn('SKIP (no zip/unzip on this machine): the releaseBake BUILD + sidecar legs need them (CI runners have both)');
 }
 
 const makeRemote = () => {
