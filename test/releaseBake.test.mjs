@@ -5,9 +5,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, rmSync, existsSync, statSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import { bakeSet, ensureZip, materializeCommit } from '../dist/commands/releaseBake.js';
 
@@ -104,4 +104,17 @@ test('bakeSet dedups one-repo-many-bindings (UI_AS_APPS §4) per (repo, commit)'
     { apps: { 'panel.spaces': { repo: 'github:ir/sm', ref: 'main', commit: SHA } } },
   ]);
   assert.equal(entries.length, 2);
+});
+
+test('ensureZip ABORTS on a corrupt resident zip (an interrupted bake must never be reused)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ir-bake-corrupt-'));
+  try {
+    const entry = { repo: 'github:ir/app', ref: 'main', commit: 'e'.repeat(40) };
+    const path = join(dir, 'zips', 'ir', 'app', `${entry.commit}.zip`);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, 'not a zip at all — an interrupted bake left this');
+    await assert.rejects(ensureZip(dir, entry), /fails the zip magic check.*aborting/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

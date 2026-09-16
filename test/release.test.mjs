@@ -3,7 +3,7 @@
 // path uses a stub resolver, and the command's --check mode is networkless.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -283,6 +283,156 @@ test('pin-release --check: a channel-template authoring needs no plain lock (the
     );
     const code = await runPinRelease({ positionals: [], flags: { dir, check: true } });
     assert.equal(code, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// --- write mode, offline (commit-pinned authoring short-circuits the resolver;
+
+// --no-bake skips the bake) — the round-1 review's R2 finding ---------------
+
+const PIN_A = 'c'.repeat(40);
+const PIN_B = 'd'.repeat(40);
+
+/** A registry fixture whose authoring is COMMITT-PINNED (no network anywhere):
+ * base.json at PIN_A + its committed lock + index + derived map. */
+const writePinnedFixture = (dir) => {
+  const baseAuthoring = { id: 'base', label: 'Default', apps: { 'panel.spaces': `github:ir/sm#${PIN_A}` } };
+  writeFileSync(join(dir, 'base.json'), JSON.stringify(baseAuthoring, null, 2));
+  // The committed lock must match what write mode derives from the PINNED
+  // authoring (the pin itself — the same short-circuit the default resolver
+  // applies), or the immutability guard refuses the no-op republish.
+  const pinResolver = (b) => b.commit ?? stub(b);
+  const lockText = serializeLock(resolveLock(baseAuthoring, baseAuthoring.apps, pinResolver));
+  writeFileSync(join(dir, 'base.lock.json'), lockText);
+  writeFileSync(join(dir, 'index.json'), serializeIndex(buildIndex([{ id: 'base', lockText, label: 'Default' }])));
+  writeFileSync(join(dir, 'defaults-map.json'), JSON.stringify(baseAuthoring.apps, null, 2) + '\n');
+  return { baseAuthoring, lockText };
+};
+
+test('write mode: --channel repoints ONLY the channel map (the index otherwise byte-identical)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pin-release-'));
+  try {
+    writePinnedFixture(dir);
+    const before = readFileSync(join(dir, 'index.json'), 'utf8');
+    const beforeLock = readFileSync(join(dir, 'base.lock.json'), 'utf8');
+    const code = await runPinRelease({ positionals: [], flags: { dir, 'no-bake': true, channel: 'testing=base' } });
+    assert.equal(code, 0);
+    const after = readFileSync(join(dir, 'index.json'), 'utf8');
+    // The lock is untouched (same content, immutable) and the index differs ONLY
+    // by the channels block.
+    assert.equal(readFileSync(join(dir, 'base.lock.json'), 'utf8'), beforeLock);
+    assert.deepEqual(JSON.parse(after).channels, { testing: 'base' });
+    assert.deepEqual(JSON.parse(after).releases, JSON.parse(before).releases);
+    // And --check agrees the result is consistent.
+    assert.equal(await runPinRelease({ positionals: [], flags: { dir, check: true } }), 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('write mode: --dated + --channel testing=@dated publishes the dated lock and repoints at it', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pin-release-'));
+  try {
+    writePinnedFixture(dir);
+    writeFileSync(
+      join(dir, 'testing.json'),
+      JSON.stringify({ id: 'testing', label: 'Latest of origin/main', extends: 'base', channel: true, apps: {} }, null, 2),
+    );
+    const code = await runPinRelease({
+      positionals: [],
+      flags: { dir, 'no-bake': true, only: 'testing', dated: 'testing', channel: 'testing=@dated' },
+    });
+    assert.equal(code, 0);
+    const index = JSON.parse(readFileSync(join(dir, 'index.json'), 'utf8'));
+    const target = index.channels.testing;
+    assert.match(target, /^testing-\d{4}-\d{2}-\d{2}-[0-9a-f]{8}$/);
+    // The dated lock exists; the plain name does NOT (the dual-name rule).
+    assert.ok(existsSync(join(dir, `${target}.lock.json`)), 'dated lock written');
+    assert.ok(!existsSync(join(dir, 'testing.lock.json')), 'no plain lock for a channel template');
+    // The channel target is a published release in the same index.
+    assert.ok(index.releases[target], 'target indexed');
+    assert.equal(await runPinRelease({ positionals: [], flags: { dir, check: true } }), 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('write mode: --only freezes every other lock (a channel run can never republish base)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pin-release-'));
+  try {
+    const { baseAuthoring } = writePinnedFixture(dir);
+    // The committed base lock is at PIN_B — the AUTHORING would resolve to
+    // PIN_A. A testing run must leave the committed bytes untouched.
+    const driftedAuthoring = { id: 'base', label: 'Default', apps: { 'panel.spaces': `github:ir/sm#${PIN_B}` } };
+    const pinResolver = (b) => b.commit ?? stub(b);
+    const committedLockText = serializeLock(resolveLock(driftedAuthoring, driftedAuthoring.apps, pinResolver));
+    writeFileSync(join(dir, 'base.lock.json'), committedLockText);
+    writeFileSync(join(dir, 'testing.json'), JSON.stringify({ id: 'testing', extends: 'base', channel: true, apps: {} }, null, 2));
+    const code = await runPinRelease({
+      positionals: [],
+      flags: { dir, 'no-bake': true, only: 'testing', dated: 'testing' },
+    });
+    assert.equal(code, 0);
+    assert.equal(readFileSync(join(dir, 'base.lock.json'), 'utf8'), committedLockText);
+    const index = JSON.parse(readFileSync(join(dir, 'index.json'), 'utf8'));
+    assert.equal(index.releases.base.sha256, sha256Hex(committedLockText), 'the COMMITTED lock is the indexed one');
+    // The unpinned-authoring id is still on disk for the next deliberate run.
+    assert.ok(existsSync(join(dir, 'base.json')));
+    void baseAuthoring;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('write mode: a channel template without --dated is refused (the dual-name rule)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pin-release-'));
+  try {
+    writePinnedFixture(dir);
+    writeFileSync(join(dir, 'testing.json'), JSON.stringify({ id: 'testing', extends: 'base', channel: true, apps: {} }, null, 2));
+    const code = await runPinRelease({ positionals: [], flags: { dir, 'no-bake': true } });
+    assert.equal(code, 1);
+    assert.ok(!existsSync(join(dir, 'testing.lock.json')), 'no plain lock written');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('write mode: a corrupt index.json ABORTS instead of wiping the committed channels', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pin-release-'));
+  try {
+    writePinnedFixture(dir);
+    writeFileSync(join(dir, 'index.json'), '{not json');
+    await assert.rejects(
+      runPinRelease({ positionals: [], flags: { dir, 'no-bake': true } }),
+      /index.json is not valid JSON.*channel map/,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('write mode: a bare value-bearing flag is refused, not silently disabled', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pin-release-'));
+  try {
+    writePinnedFixture(dir);
+    const code = await runPinRelease({ positionals: [], flags: { dir, 'no-bake': true, channel: true } });
+    assert.equal(code, 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a corrupt historical lock aborts NAMING the file', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pin-release-'));
+  try {
+    writePinnedFixture(dir);
+    writeFileSync(join(dir, 'ghost-2026-09-16-aaaaaaaa.lock.json'), '{oops');
+    await assert.rejects(
+      runPinRelease({ positionals: [], flags: { dir, check: true } }),
+      /ghost-2026-09-16-aaaaaaaa\.lock\.json: not valid JSON/,
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

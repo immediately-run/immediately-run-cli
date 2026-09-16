@@ -31,7 +31,7 @@
  *     from the committed `index.json`, updated, validated, and rebuilt in.
  */
 
-import { readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
 import { flagValue, type ParsedArgs } from '../args.js';
@@ -51,7 +51,7 @@ import {
   type ReleaseIndex,
   type ReleaseLock,
 } from '../release.js';
-import { bakeSet, ensureZip } from './releaseBake.js';
+import { bakeSet, ensureZip, validateResidentZip } from './releaseBake.js';
 
 /** The host's build-default manifest for the §6.1b strip lint (region → repo scope
  *  + first-party-only ceiling). Empty today: the registry's first-party-only set is
@@ -78,9 +78,13 @@ outputs are <name>.lock.json (fully commit-pinned), zips/<ns>/<repo>/<sha>.zip
 
 Options:
   --dir <path>            Registry directory (default: ./releases)
-  --check                 Validate committed locks/index/zips-consistency without
-                          network or writes (CI): digests, channels, and base-lock
-                          coverage vs the committed derived map
+  --check                 Validate the committed registry without network or
+                          writes (CI): lock digests vs index.json, the channel
+                          map (targets published, no dual names), historical
+                          locks, base coverage vs the derived map, and the
+                          integrity of every RESIDENT zip (magic + sidecar;
+                          absent zips are counted, not failed — the first bake
+                          lands them)
   --republish             Allow overwriting an existing lock whose content changed
   --dated <id>            Write the release <id> under a dated immutable name
                           <id>-<YYYY-MM-DD>-<sha8> (§4.4 — the moving channel's
@@ -173,13 +177,25 @@ const parseChannelFlag = (raw: string): Record<string, string> => {
 
 /** The committed channel map, if any — write mode PRESERVES it (a plain
  *  republish of base must not wipe the testing channel) and applies --channel
- *  updates on top. */
+ *  updates on top. A MISSING index is an empty map; a CORRUPT one aborts
+ *  naming the file — channels live only in index.json (releases recover from
+ *  their lock files), so silently mapping a parse failure to {} would wipe
+ *  every committed channel from the rebuilt index, permanently. */
 const readCommittedChannels = (dir: string): Record<string, string> => {
+  let text: string;
   try {
-    const index = JSON.parse(readFileSync(join(dir, 'index.json'), 'utf8')) as ReleaseIndex;
-    return index.channels && typeof index.channels === 'object' ? { ...index.channels } : {};
+    text = readFileSync(join(dir, 'index.json'), 'utf8');
   } catch {
-    return {}; // absent or unreadable → an empty map the --channel updates fill
+    return {}; // absent → an empty map the --channel updates fill
+  }
+  try {
+    const index = JSON.parse(text) as ReleaseIndex;
+    return index.channels && typeof index.channels === 'object' ? { ...index.channels } : {};
+  } catch (err) {
+    throw new Error(
+      `index.json is not valid JSON (${err instanceof Error ? err.message : String(err)}) — ` +
+        `refusing to rebuild an index that would drop the committed channel map; fix or delete it first`,
+    );
   }
 };
 
@@ -195,8 +211,14 @@ const collectOrphanLocks = (
   for (const f of readdirSync(dir).filter(isLockFile).sort()) {
     const id = f.replace(/\.lock\.json$/, '');
     if (authoringIds.has(id)) continue;
-    const lockText = readFileSync(join(dir, f), 'utf8');
-    const parsed = JSON.parse(lockText) as ReleaseLock;
+    let parsed: ReleaseLock;
+    let lockText: string;
+    try {
+      lockText = readFileSync(join(dir, f), 'utf8');
+      parsed = JSON.parse(lockText) as ReleaseLock;
+    } catch (err) {
+      throw new Error(`${f}: not valid JSON (${err instanceof Error ? err.message : String(err)})`);
+    }
     assertLockValid(parsed, f);
     out.push({ id, lockText, label: parsed.label });
   }
@@ -249,6 +271,17 @@ export const runPinRelease = async (args: ParsedArgs): Promise<number> => {
   const onlyId = flagValue(args.flags, 'only');
   const noBake = args.flags['no-bake'] === true;
   const channelRaw = flagValue(args.flags, 'channel');
+
+  // A value-bearing flag present but BARE (`--channel` with no value) parses to
+  // `true`, which flagValue maps to undefined — the flag would silently
+  // self-disable (a publish exiting 0 with the repoint never performed).
+  // Refuse it loudly instead.
+  for (const name of ['dir', 'dated', 'only', 'channel'] as const) {
+    if (args.flags[name] === true) {
+      console.error(`pin-release: --${name} requires a value`);
+      return 1;
+    }
+  }
 
   let channelUpdates: Record<string, string> = {};
   if (channelRaw !== undefined) {
@@ -408,8 +441,18 @@ const runCheck = (dir: string, authoring: ReleaseAuthoring[]): number => {
     // §4.4 channel TEMPLATE: publishes only under dated names — the plain name
     // belongs to the channel (the dual-name rule forbids a release of the same
     // name), so no plain lock exists to check. The dated targets themselves are
-    // historical locks, validated below like any other.
-    if (a.channel) continue;
+    // historical locks, validated below like any other. A STRAY plain lock
+    // beside the template is the forbidden dual-name shape — fail it (write
+    // mode refuses the same shape via the orphan → index → validateChannels
+    // path; the two gates must agree).
+    if (a.channel) {
+      if (existsSync(join(dir, `${a.id}.lock.json`))) {
+        problems.push(
+          `${a.id}.lock.json exists beside the channel template — the plain name belongs to the channel (dual-name rule)`,
+        );
+      }
+      continue;
+    }
     const lockPath = join(dir, `${a.id}.lock.json`);
     let lockText: string;
     try {
@@ -456,6 +499,36 @@ const runCheck = (dir: string, authoring: ReleaseAuthoring[]): number => {
 
   // §3.1 anti-drift: the base lock covers the committed derived map.
   problems.push(...coverageProblems(dir, locks));
+
+  // §3.4/§5-5a: every RESIDENT zip must be valid (magic + the §6.4 sidecar
+  // coordinate). Absent zips are counted with a warning, not failed — the
+  // first bake lands them (a repo that has never run a bake has none).
+  const zipsDir = join(dir, 'zips');
+  if (existsSync(zipsDir)) {
+    let resident = 0;
+    let absent = 0;
+    for (const l of locks) {
+      for (const entry of Object.values((JSON.parse(l.lockText) as ReleaseLock).apps)) {
+        const [, ns, repo] = /^github:(?:([^/]+))\/([^/@]+)$/.exec(entry.repo) ?? [];
+        if (!ns || !repo) continue;
+        const path = join(zipsDir, ns, repo, `${entry.commit}.zip`);
+        if (!existsSync(path)) {
+          absent++;
+          continue;
+        }
+        try {
+          validateResidentZip(path, entry);
+          resident++;
+        } catch (err) {
+          problems.push(err instanceof Error ? err.message : String(err));
+        }
+      }
+    }
+    if (absent > 0) {
+      console.warn(`pin-release --check: ${absent} pin(s) have no resident zip yet (run a bake to land them)`);
+    }
+    if (resident > 0) console.log(`pin-release --check: ${resident} resident zip(s) valid`);
+  }
 
   if (problems.length) {
     console.error('pin-release --check failed:');
