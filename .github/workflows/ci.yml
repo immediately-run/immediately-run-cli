@@ -107,6 +107,11 @@ jobs:
         run: |
           PKG_NAME=$(node -p "require('./package.json').name")
           PKG_VER=$(node -p "require('./package.json').version")
+          # A skip is benign only when it is a NO-OP: run the parity gate (strict, no
+          # --offline-ok) BEFORE the ::notice:: skip. By this line `npm view` has already
+          # said the version exists, so a registry that stops answering — or a manifest
+          # that drifted without a bump — is a real problem here and must not be skipped.
+          node scripts/check-published-parity.mjs
           if npm view "$PKG_NAME@$PKG_VER" version >/dev/null 2>&1; then
             echo "::notice::$PKG_NAME@$PKG_VER already published — skipping."
             exit 0
