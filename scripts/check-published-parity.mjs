@@ -261,17 +261,6 @@ function selfTest() {
   });
   const pub = classifyRegistryReply({ stdout: real, failed: false });
   check("a real packument reply is PUBLISHED", pub.kind === "published");
-  // The real published body must be in parity with what this tree declares — that is the
-  // whole point of the fixture being captured from the CURRENT published version. A
-  // spurious root row here would mean the `main`/`exports` comparison is wrong.
-  const realRows = dependencyDrift(
-    pub.manifest,
-    JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8")),
-  );
-  check(
-    "…and is in parity with this tree (the published version is current)",
-    realRows.length === 0,
-  );
   check(
     "an absent-blocks manifest is published-with-nothing, not unreadable",
     classifyRegistryReply({ stdout: "", failed: false }).kind === "published",

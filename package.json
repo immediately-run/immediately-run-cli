@@ -35,8 +35,8 @@
   "scripts": {
     "build": "tsc",
     "check:sidecar": "node scripts/check-sidecar-literal.mjs",
-    "test": "npm run build && npm run check:sidecar && npm run check:platform-provided && npm run check:scanner-drift && node --test test/*.test.mjs",
-    "verify": "npm test && npm run build && npm run check:published",
+    "test": "npm run build && npm run check:sidecar && npm run check:platform-provided && npm run check:scanner-drift && npm run check:published && node --test test/*.test.mjs",
+    "verify": "npm test && npm run build",
     "prepublishOnly": "npm run build",
     "check:scanner-drift": "node scripts/check-scanner-drift.mjs --self-test && node scripts/check-scanner-drift.mjs",
     "check:platform-provided": "node scripts/check-platform-provided.mjs --self-test && node scripts/check-platform-provided.mjs",
