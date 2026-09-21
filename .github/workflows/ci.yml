@@ -108,6 +108,13 @@ jobs:
           PKG_NAME=$(node -p "require('./package.json').name")
           PKG_VER=$(node -p "require('./package.json').version")
           if npm view "$PKG_NAME@$PKG_VER" version >/dev/null 2>&1; then
+            # A skip is benign only when it is a NO-OP. Same version with a different
+            # install surface means `main` has drifted from what every consumer installs.
+            # NOT `--offline-ok` here, deliberately — unlike in `verify`, where a network
+            # blip must not redden every PR. By this line `npm view` has already told us
+            # the version EXISTS, so failing to read it now is a real problem and the
+            # release must not proceed on a question nobody answered.
+            node scripts/check-published-parity.mjs
             echo "::notice::$PKG_NAME@$PKG_VER already published — skipping."
             exit 0
           fi
