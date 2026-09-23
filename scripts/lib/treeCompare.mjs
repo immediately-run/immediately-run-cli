@@ -5,11 +5,14 @@
 // tarball vs rebuilt dist). One home (R6); each gate keeps only its own subject
 // and its own exit-code policy.
 //
-// Vendored from `immediately-run-sdk/scripts/lib/treeCompare.mjs` (R3-755), byte
-// for byte: this repo and the SDK are separate packages with no shared runtime
-// dep, and a git-submodule/workspace indirection for 49 stable lines would cost
-// more than the vendoring does. If the core ever changes, change every copy in
-// the same wave — the copies are named in each parity script's header.
+// Vendored from `immediately-run-sdk/scripts/lib/treeCompare.mjs` (R3-755): the
+// code below is identical to the SDK original — only this vendoring note (and
+// this paragraph) is added. This repo and the SDK are separate packages with no
+// shared runtime dep, and a git-submodule/workspace indirection for a few dozen
+// stable lines would cost more than the vendoring does. If the core ever
+// changes, change every copy in the same wave — the copies are named in each
+// parity script's header (grove, sdk root, cli, safe-content); verify a copy's
+// code by diffing below the header, not by whole-file hash.
 //
 // Row fields are named first/second: the reproducible check compares two builds
 // of the same tree and neither side is "published"; the parity check maps them

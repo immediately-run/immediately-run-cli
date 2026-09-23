@@ -29,8 +29,11 @@
  * ## Where it runs
  *
  * `verify` (through `check:reproducible`, after a build — `npm test` builds
- * first, and the check itself builds twice more). Two extra `tsc` builds per
- * run is the price of the proof; this repo's build is seconds.
+ * first, and the check itself builds twice more) AND ci.yml's build-test job
+ * (after `npm test`/`npm run build`), so a non-reproducible build cannot merge
+ * green and first surface in the release job as a confusing payload-drift
+ * error. Two extra `tsc` builds per run is the price of the proof; this repo's
+ * build is seconds.
  *
  * Usage: node scripts/check-build-reproducible.mjs [--self-test]
  * Exit:  0 the two builds are byte-identical (or --self-test passed)

@@ -32,6 +32,11 @@ jobs:
       - run: npm ci
       - run: npm test
       - run: npm run build
+      # The determinism proof the payload-parity gate rests on (R3-756) — a gate
+      # that lives only in `verify` is a gate CI does not have. Runs after the
+      # build steps so the two comparison builds are of a node_modules-complete
+      # tree, exactly as `verify` orders them. Two extra tsc builds, seconds.
+      - run: npm run check:reproducible
 
   # The public-release job: git tag + npm publish. Both are irreversible.
   #
