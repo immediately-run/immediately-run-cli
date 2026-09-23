@@ -1,6 +1,6 @@
 {
   "name": "@immediately-run/cli",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "description": "Command-line tools for immediately.run: build a pre-cached repository zip (with a contribute manifest sidecar) for fast, rate-limit-free loading, and pin UI release locks for the region registry.",
   "type": "module",
   "license": "MIT",
@@ -36,11 +36,12 @@
     "build": "tsc",
     "check:sidecar": "node scripts/check-sidecar-literal.mjs",
     "test": "npm run build && npm run check:sidecar && npm run check:platform-provided && npm run check:scanner-drift && npm run check:published && node --test test/*.test.mjs",
-    "verify": "npm test && npm run build",
+    "verify": "npm test && npm run check:reproducible",
     "prepublishOnly": "npm run build",
     "check:scanner-drift": "node scripts/check-scanner-drift.mjs --self-test && node scripts/check-scanner-drift.mjs",
     "check:platform-provided": "node scripts/check-platform-provided.mjs --self-test && node scripts/check-platform-provided.mjs",
-    "check:published": "node scripts/check-published-parity.mjs --self-test && node scripts/check-published-parity.mjs --offline-ok"
+    "check:published": "node scripts/check-published-parity.mjs --self-test && node scripts/check-published-parity.mjs --offline-ok",
+    "check:reproducible": "node scripts/check-build-reproducible.mjs --self-test && node scripts/check-build-reproducible.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
