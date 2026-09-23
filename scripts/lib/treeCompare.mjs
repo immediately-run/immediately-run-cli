@@ -44,6 +44,11 @@ export function treeDigests(root) {
   return map;
 }
 
+/** A digest row's display form: full when it fits, `(absent)` as-is, long ones cut at 12 hex with an ellipsis. */
+export function shortDigest(d) {
+  return d === '(absent)' ? d : `${d.slice(0, 12)}…`;
+}
+
 /**
  * Compare two digest Maps, per entry. Returns the differences as
  * `{ path, first, second }` rows — empty means the trees are byte-identical. A

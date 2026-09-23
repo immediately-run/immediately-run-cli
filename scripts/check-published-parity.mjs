@@ -88,7 +88,7 @@ import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { digestDrift, treeDigests } from './lib/treeCompare.mjs';
+import { digestDrift, shortDigest, treeDigests } from './lib/treeCompare.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -571,8 +571,7 @@ try {
         `in ${payloadRows.length} file(s). Publishing would be skipped, so the change would never reach npm — bump the version.`,
     );
     for (const r of payloadRows.slice(0, 20)) {
-      const short = (d) => (d === '(absent)' ? d : `${d.slice(0, 12)}…`);
-      console.error(`  ${r.path}: published ${short(r.published)} · here ${short(r.local)}`);
+      console.error(`  ${r.path}: published ${shortDigest(r.published)} · here ${shortDigest(r.local)}`);
     }
     if (payloadRows.length > 20) console.error(`  …and ${payloadRows.length - 20} more.`);
     exitCode = 1;

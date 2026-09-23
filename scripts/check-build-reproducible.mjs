@@ -46,7 +46,7 @@ import { join, dirname } from 'node:path';
 
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
-import { digestDrift, treeDigests } from './lib/treeCompare.mjs';
+import { digestDrift, shortDigest, treeDigests } from './lib/treeCompare.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -59,8 +59,16 @@ function buildInto() {
   // INSIDE the repo: `renameSync` cannot cross filesystems, and /tmp is often
   // another mount. Created, used, and removed by this script alone.
   const dest = mkdtempSync(join(ROOT, '.build-reproducible-'));
-  execFileSync('npm', ['run', 'build'], { cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'], timeout: 600_000 });
-  renameSync(join(ROOT, 'dist'), join(dest, 'dist'));
+  try {
+    execFileSync('npm', ['run', 'build'], { cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'], timeout: 600_000 });
+    renameSync(join(ROOT, 'dist'), join(dest, 'dist'));
+  } catch (e) {
+    // The build died before the rename: dest is unreferenced by the outer finally
+    // (which only knows the dirs buildInto RETURNED), so remove it here or it
+    // leaks inside the repo root as untracked noise.
+    rmSync(dest, { recursive: true, force: true });
+    throw e;
+  }
   return dest;
 }
 
@@ -132,8 +140,7 @@ try {
         `The published-payload gate cannot trust these bytes — fix the build (a timestamp, an absolute path, unordered output).`,
     );
     for (const r of rows.slice(0, 20)) {
-      const short = (d) => (d === '(absent)' ? d : `${d.slice(0, 12)}…`);
-      console.error(`  ${r.path}: first ${short(r.first)} · second ${short(r.second)}`);
+      console.error(`  ${r.path}: first ${shortDigest(r.first)} · second ${shortDigest(r.second)}`);
     }
     if (rows.length > 20) console.error(`  …and ${rows.length - 20} more.`);
     exitCode = 1;
