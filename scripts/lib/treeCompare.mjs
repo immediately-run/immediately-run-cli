@@ -10,9 +10,12 @@
 // this paragraph) is added. This repo and the SDK are separate packages with no
 // shared runtime dep, and a git-submodule/workspace indirection for a few dozen
 // stable lines would cost more than the vendoring does. If the core ever
-// changes, change every copy in the same wave — the copies are named in each
-// parity script's header (grove, sdk root, cli, safe-content); verify a copy's
-// code by diffing below the header, not by whole-file hash.
+// changes, change every copy in the same wave — the copies are the SDK root's
+// `scripts/lib/treeCompare.mjs`, its safe-content vendoring
+// (`safe-content/scripts/lib/treeCompare.mjs`), and this file (grove's parity
+// script predates the extraction and keeps its own inline digest walk, so it is
+// not a copy); verify a copy's code by diffing below the header, not by
+// whole-file hash.
 //
 // Row fields are named first/second: the reproducible check compares two builds
 // of the same tree and neither side is "published"; the parity check maps them
