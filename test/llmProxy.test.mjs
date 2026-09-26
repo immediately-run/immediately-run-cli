@@ -288,8 +288,8 @@ test('collectHeaderFlags: single, repeated, and placeholder values', async () =>
   const { collectHeaderFlags } = await import('../dist/llmProxy.js');
   const single = collectHeaderFlags({ flags: { header: 'x-a=1' }, repeated: {} });
   assert.deepEqual(single, { 'x-a': '1' }); // the venue's documented single-flag shape
-  const repeated = collectHeaderFlags({ flags: { header: 'b=2' }, repeated: { header: ['a=1', 'b=2'] } });
-  assert.deepEqual(repeated, { a: '1', b: '2' }); // every value, last-wins consistent
+  const repeated = collectHeaderFlags({ flags: { header: 'a=2' }, repeated: { header: ['a=1', 'a=2'] } });
+  assert.deepEqual(repeated, { a: '2' }); // every value, LAST wins — pinned with differing values
   const placeholder = collectHeaderFlags({ flags: { header: 'x-opencode-session=$connectionId' }, repeated: {} });
   assert.deepEqual(placeholder, { 'x-opencode-session': '$connectionId' }); // substitution happens downstream
 });
