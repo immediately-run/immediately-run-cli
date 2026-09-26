@@ -281,3 +281,66 @@ test('parseArgs collects repeated value-bearing flags in order, singles stay fla
   assert.deepEqual(repeated.repeated['header'], ['a=1', 'b=2']); // every value, argv order
   assert.equal(repeated.flags['header'], 'b=2'); // last-wins in flags, back-compat
 });
+
+// --- R3-785 round 1: the collectHeaderFlags parse (loud on every bad shape) --------
+
+test('collectHeaderFlags: single, repeated, and placeholder values', async () => {
+  const { collectHeaderFlags } = await import('../dist/llmProxy.js');
+  const single = collectHeaderFlags({ flags: { header: 'x-a=1' }, repeated: {} });
+  assert.deepEqual(single, { 'x-a': '1' }); // the venue's documented single-flag shape
+  const repeated = collectHeaderFlags({ flags: { header: 'b=2' }, repeated: { header: ['a=1', 'b=2'] } });
+  assert.deepEqual(repeated, { a: '1', b: '2' }); // every value, last-wins consistent
+  const placeholder = collectHeaderFlags({ flags: { header: 'x-opencode-session=$connectionId' }, repeated: {} });
+  assert.deepEqual(placeholder, { 'x-opencode-session': '$connectionId' }); // substitution happens downstream
+});
+
+test('collectHeaderFlags: throws on a valueless --header (boolean swallow)', async () => {
+  const { collectHeaderFlags } = await import('../dist/llmProxy.js');
+  assert.throws(() => collectHeaderFlags({ flags: { header: true }, repeated: {} }), /name=value/);
+});
+
+test('collectHeaderFlags: throws on a value with no name=', async () => {
+  const { collectHeaderFlags } = await import('../dist/llmProxy.js');
+  assert.throws(() => collectHeaderFlags({ flags: { header: 'x-a' }, repeated: {} }), /name=value/);
+});
+
+test('collectHeaderFlags: throws on a $-typo placeholder (mirrors the catalogue validator)', async () => {
+  const { collectHeaderFlags } = await import('../dist/llmProxy.js');
+  assert.throws(() => collectHeaderFlags({ flags: { header: 'x-opencode-session=$connectionld' }, repeated: {} }), /\$connectionId/);
+});
+
+// --- R3-785 round 1: the JOIN — a declared header reaches the live upstream, substituted ---
+
+test('a --header value of $connectionId reaches the upstream as the minted id (integration)', async () => {
+  const hitReqs = [];
+  const up = http.createServer((req, res) => {
+    hitReqs.push(req.headers);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+  });
+  await new Promise((r) => up.listen(0, '127.0.0.1', r));
+  const h = await startDevServer({
+    root,
+    origin: ORIGIN,
+    token: TOKEN,
+    port: 0,
+    llm: {
+      baseUrl: `http://127.0.0.1:${up.address().port}`,
+      apiKey: KEY,
+      extraHeaders: { 'x-opencode-session': '$connectionId' },
+      connectionId: '01234567-89ab-cdef-0123-456789abcdef',
+    },
+  });
+  try {
+    const res = await fetch(`http://127.0.0.1:${h.port}/llm/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${TOKEN}` },
+      body: JSON.stringify({ model: 'm', messages: [] }),
+    });
+    assert.equal(res.status, 200);
+    assert.equal(hitReqs[0]['x-opencode-session'], '01234567-89ab-cdef-0123-456789abcdef'); // the minted id, never the placeholder
+  } finally {
+    await h.close();
+    up.close();
+  }
+});

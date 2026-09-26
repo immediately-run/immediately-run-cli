@@ -21,6 +21,7 @@ import { resolve } from 'node:path';
 
 import { startDevServer, runUntilShutdown } from '../devServer.js';
 import { flagValue, type ParsedArgs } from '../args.js';
+import { collectHeaderFlags, CONNECTION_ID_PLACEHOLDER } from '../llmProxy.js';
 import { DEFAULT_ORIGIN, DEFAULT_PORT, isRecognizedOrigin } from './dev.js';
 
 /** Env var the upstream key is read from (preferred over `--api-key`, which
@@ -50,8 +51,8 @@ Options:
                             IMMEDIATELY_RUN_LLM_MODEL). Optional — without it the
                             host uses your configured llm-provider preference.
   --header <name>=<value>   Extra upstream header, repeatable. A value of exactly
-                            $connectionId substitutes a UUID minted once per proxy
-                            process (e.g. OpenCode's x-opencode-session routing header)
+                            ${CONNECTION_ID_PLACEHOLDER} substitutes a UUID minted once per
+                            proxy process (e.g. OpenCode's x-opencode-session routing header)
   --port <n>                Port to listen on (127.0.0.1 only; default: ${DEFAULT_PORT})
   --origin <url>            Allowed browser origin and pairing base
                             (default: ${DEFAULT_ORIGIN})
@@ -128,19 +129,11 @@ export const runLlm = async (args: ParsedArgs): Promise<number> => {
   const model = flagValue(args.flags, 'model') ?? process.env.IMMEDIATELY_RUN_LLM_MODEL;
 
   // R3-785 — extra upstream headers, `--header name=value`, repeatable. A value of
-  // exactly `$connectionId` (the catalogue's requestHeaders vocabulary) substitutes a
+  // exactly the placeholder (the catalogue's requestHeaders vocabulary) substitutes a
   // UUID minted once per proxy process — OpenCode's gateway, for one, 400s any POST
-  // without an x-opencode-session routing header.
-  const headerValues = [
-    ...(args.repeated['header'] ?? []),
-    ...(flagValue(args.flags, 'header') !== undefined ? [flagValue(args.flags, 'header')!] : []),
-  ];
-  const extraHeaders: Record<string, string> = {};
-  for (const raw of headerValues) {
-    const eq = raw.indexOf('=');
-    if (eq <= 0) throw new Error(`--header expects name=value, got "${raw}"`);
-    extraHeaders[raw.slice(0, eq)] = raw.slice(eq + 1);
-  }
+  // without an x-opencode-session routing header. collectHeaderFlags is the loud,
+  // unit-tested parse (valueless, malformed, and $-typo shapes all fail at startup).
+  const extraHeaders = collectHeaderFlags(args);
   const connectionId = randomUUID();
 
   // Per-session token — any local page can reach 127.0.0.1, so every request must

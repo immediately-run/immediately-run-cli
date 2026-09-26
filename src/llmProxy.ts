@@ -18,10 +18,10 @@ import type { IncomingHttpHeaders } from 'node:http';
  *  server-side and is never accepted from, nor echoed to, the caller. */
 export interface LlmUpstream {
   /** The one OpenAI-compatible base URL (e.g. `http://127.0.0.1:11434` for
-   *  Ollama, or a user's gateway). EVERY `/llm` request is pinned to its origin. */
+   * Ollama, or a user's gateway). EVERY `/llm` request is pinned to its origin. */
   baseUrl: string;
   /** The user's key, injected server-side. Optional — local models often need
-   *  none. Never read from the request, never written to a response. */
+   * none. Never read from the request, never written to a response. */
   apiKey?: string;
   /** Header the key is injected into (default `authorization`). */
   authHeader?: string;
@@ -30,14 +30,16 @@ export interface LlmUpstream {
   authScheme?: string;
   /** R3-785 — extra upstream headers the row/gateway demands, declared as
    * `--header name=value` on the CLI (the catalogue row's `requestHeaders`
-   * vocabulary: a value of exactly `$connectionId` is substituted with
-   * {@link connectionId}, minted once per proxy process — never a user
-   * identifier). Example: OpenCode's gateway 400s any POST without
-   * `x-opencode-session`, so its transport runs with
-   * `--header 'x-opencode-session=$connectionId'`. */
+   * vocabulary: a value of exactly {@link CONNECTION_ID_PLACEHOLDER} is
+   * substituted with {@link LlmUpstream.connectionId}). Example: OpenCode's
+   * gateway 400s any POST without `x-opencode-session`, so its transport runs
+   * with `--header 'x-opencode-session=$connectionId'`. */
   extraHeaders?: Record<string, string>;
-  /** The per-process connection id `$connectionId` substitutes to. Minted in
-   * `runLlm`; tests may inject a fixed value. */
+  /** The id {@link CONNECTION_ID_PLACEHOLDER} substitutes to. Minted once per
+   * proxy process in `runLlm` (one process, one pinned upstream, one routing
+   * identity — the transport's reading of "per connection"; site-main's
+   * adapterFor rotates per chat request, both satisfy the gateway's
+   * routing-affinity ask). Tests may inject a fixed value. */
   connectionId?: string;
   /** Injected for tests; defaults to the global `fetch`. */
   fetchImpl?: typeof fetch;
@@ -107,6 +109,50 @@ export function resolveUpstreamTarget(
 }
 
 /**
+ * R3-785 — the ONE placeholder a `--header` value may carry (the same token
+ * site-main's catalogue declares in `requestHeaders`); buildUpstreamHeaders
+ * substitutes it with the process-minted connection id. Exported so the help
+ * text and the guard cannot drift from the substitution.
+ */
+export const CONNECTION_ID_PLACEHOLDER = '$connectionId';
+
+/**
+ * R3-785 — assemble the extra upstream headers from the parsed CLI args, LOUDLY.
+ * Pure (transport-free, per this module's core/glue split). Throws on:
+ *  - a valueless `--header` (a trailing or flag-adjacent `--header` parses as
+ *    boolean `true` and would otherwise silently ship nothing);
+ *  - a value without `name=`;
+ *  - a `$`-bearing value that is not exactly {@link CONNECTION_ID_PLACEHOLDER}
+ *    (the typo class that would ship verbatim upstream as a silent routing
+ *    failure — the same guard site-main's catalogue validator applies to rows).
+ */
+export function collectHeaderFlags(args: {
+  flags: Record<string, string | true>;
+  repeated: Record<string, string[]>;
+}): Record<string, string> {
+  if (args.flags['header'] === true) {
+    throw new Error("--header expects name=value (a value must follow; last flag wins when repeated)");
+  }
+  const values = [
+    ...(args.repeated['header'] ?? []),
+    ...(typeof args.flags['header'] === 'string' ? [args.flags['header']] : []),
+  ];
+  const out: Record<string, string> = {};
+  for (const raw of values) {
+    const eq = raw.indexOf('=');
+    if (eq <= 0) throw new Error(`--header expects name=value, got "${raw}"`);
+    const value = raw.slice(eq + 1);
+    if (value.includes('$') && value !== CONNECTION_ID_PLACEHOLDER) {
+      throw new Error(
+        `--header ${raw.slice(0, eq)}: a '$'-bearing value must be exactly '${CONNECTION_ID_PLACEHOLDER}'`,
+      );
+    }
+    out[raw.slice(0, eq)] = value;
+  }
+  return out;
+}
+
+/**
  * Build the headers for the forwarded upstream request. Forwards ONLY the
  * caller's content-negotiation headers (`content-type`, `accept`) and injects
  * the user's key server-side. The caller's `Authorization` (the localhost bearer
@@ -124,7 +170,8 @@ export function buildUpstreamHeaders(
   const accept = clientHeaders['accept'];
   if (typeof accept === 'string') out['accept'] = accept;
   for (const [name, value] of Object.entries(upstream.extraHeaders ?? {})) {
-    out[name.toLowerCase()] = value === '$connectionId' ? (upstream.connectionId ?? '') : value;
+    out[name.toLowerCase()] =
+      value === CONNECTION_ID_PLACEHOLDER ? (upstream.connectionId ?? '') : value;
   }
   if (upstream.apiKey) {
     const header = (upstream.authHeader ?? 'authorization').toLowerCase();
