@@ -16,7 +16,7 @@
  */
 
 import { existsSync, statSync } from 'node:fs';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
 
 import { startDevServer, runUntilShutdown } from '../devServer.js';
@@ -49,6 +49,9 @@ Options:
   --model <id>              Model the host runs through the proxy (or set
                             IMMEDIATELY_RUN_LLM_MODEL). Optional — without it the
                             host uses your configured llm-provider preference.
+  --header <name>=<value>   Extra upstream header, repeatable. A value of exactly
+                            $connectionId substitutes a UUID minted once per proxy
+                            process (e.g. OpenCode's x-opencode-session routing header)
   --port <n>                Port to listen on (127.0.0.1 only; default: ${DEFAULT_PORT})
   --origin <url>            Allowed browser origin and pairing base
                             (default: ${DEFAULT_ORIGIN})
@@ -124,6 +127,22 @@ export const runLlm = async (args: ParsedArgs): Promise<number> => {
   // Optional model override the host runs (else it uses the user's preference).
   const model = flagValue(args.flags, 'model') ?? process.env.IMMEDIATELY_RUN_LLM_MODEL;
 
+  // R3-785 — extra upstream headers, `--header name=value`, repeatable. A value of
+  // exactly `$connectionId` (the catalogue's requestHeaders vocabulary) substitutes a
+  // UUID minted once per proxy process — OpenCode's gateway, for one, 400s any POST
+  // without an x-opencode-session routing header.
+  const headerValues = [
+    ...(args.repeated['header'] ?? []),
+    ...(flagValue(args.flags, 'header') !== undefined ? [flagValue(args.flags, 'header')!] : []),
+  ];
+  const extraHeaders: Record<string, string> = {};
+  for (const raw of headerValues) {
+    const eq = raw.indexOf('=');
+    if (eq <= 0) throw new Error(`--header expects name=value, got "${raw}"`);
+    extraHeaders[raw.slice(0, eq)] = raw.slice(eq + 1);
+  }
+  const connectionId = randomUUID();
+
   // Per-session token — any local page can reach 127.0.0.1, so every request must
   // present it (spec §8). Identical posture to `dev`/`agent`.
   const token = randomBytes(24).toString('base64url');
@@ -138,6 +157,8 @@ export const runLlm = async (args: ParsedArgs): Promise<number> => {
       apiKey,
       authHeader,
       authScheme,
+      extraHeaders,
+      connectionId,
     },
   });
   const endpoint = `http://127.0.0.1:${handle.port}`;

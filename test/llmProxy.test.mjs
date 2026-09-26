@@ -247,3 +247,37 @@ test('buildLlmDeepLink: appends ir-llm-model when a model is given', () => {
   const url = buildLlmDeepLink('https://immediately.run', 7700, 'tok', 'openai/gpt-4o-mini');
   assert.match(url, /&ir-transport=llm&ir-llm-model=openai%2Fgpt-4o-mini/);
 });
+
+// --- R3-785: extra upstream headers + the $connectionId placeholder -------------
+
+test('buildUpstreamHeaders carries declared extra headers, substituting $connectionId', () => {
+  const h = buildUpstreamHeaders(
+    { 'content-type': 'application/json' },
+    {
+      baseUrl: 'https://opencode.ai',
+      apiKey: 'k',
+      extraHeaders: {
+        'user-agent': 'immediately.run (+https://immediately.run)',
+        'x-opencode-session': '$connectionId',
+      },
+      connectionId: '01234567-89ab-cdef-0123-456789abcdef',
+    },
+  );
+  assert.equal(h['user-agent'], 'immediately.run (+https://immediately.run)'); // static value verbatim
+  assert.equal(h['x-opencode-session'], '01234567-89ab-cdef-0123-456789abcdef'); // the minted id, never the placeholder
+  assert.equal(h['authorization'], 'Bearer k');
+});
+
+test('buildUpstreamHeaders leaves a $connectionId with no minted id EMPTY, never the placeholder', () => {
+  const h = buildUpstreamHeaders({}, { baseUrl: 'https://x', extraHeaders: { 'x-opencode-session': '$connectionId' } });
+  assert.equal(h['x-opencode-session'], ''); // a literal "$connectionId" upstream would be a silent routing failure
+});
+
+test('parseArgs collects repeated value-bearing flags in order, singles stay flags-only (R3-785 --header)', async () => {
+  const { parseArgs } = await import('../dist/args.js');
+  const single = parseArgs(['llm', '--upstream', 'http://x', '--model', 'm']);
+  assert.equal(single.repeated['upstream'], undefined); // single use unchanged
+  const repeated = parseArgs(['llm', '--header', 'a=1', '--header', 'b=2']);
+  assert.deepEqual(repeated.repeated['header'], ['a=1', 'b=2']); // every value, argv order
+  assert.equal(repeated.flags['header'], 'b=2'); // last-wins in flags, back-compat
+});

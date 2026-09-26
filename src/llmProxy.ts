@@ -26,8 +26,19 @@ export interface LlmUpstream {
   /** Header the key is injected into (default `authorization`). */
   authHeader?: string;
   /** Scheme prefix for the injected header (default `Bearer`; empty = raw value,
-   *  e.g. some gateways want `x-api-key: <key>`). */
+   * e.g. some gateways want `x-api-key: <key>`). */
   authScheme?: string;
+  /** R3-785 — extra upstream headers the row/gateway demands, declared as
+   * `--header name=value` on the CLI (the catalogue row's `requestHeaders`
+   * vocabulary: a value of exactly `$connectionId` is substituted with
+   * {@link connectionId}, minted once per proxy process — never a user
+   * identifier). Example: OpenCode's gateway 400s any POST without
+   * `x-opencode-session`, so its transport runs with
+   * `--header 'x-opencode-session=$connectionId'`. */
+  extraHeaders?: Record<string, string>;
+  /** The per-process connection id `$connectionId` substitutes to. Minted in
+   * `runLlm`; tests may inject a fixed value. */
+  connectionId?: string;
   /** Injected for tests; defaults to the global `fetch`. */
   fetchImpl?: typeof fetch;
   /** Request-body cap (bytes); defaults to {@link DEFAULT_LLM_BODY_BYTES}. */
@@ -112,6 +123,9 @@ export function buildUpstreamHeaders(
   if (typeof ct === 'string') out['content-type'] = ct;
   const accept = clientHeaders['accept'];
   if (typeof accept === 'string') out['accept'] = accept;
+  for (const [name, value] of Object.entries(upstream.extraHeaders ?? {})) {
+    out[name.toLowerCase()] = value === '$connectionId' ? (upstream.connectionId ?? '') : value;
+  }
   if (upstream.apiKey) {
     const header = (upstream.authHeader ?? 'authorization').toLowerCase();
     const scheme = upstream.authScheme ?? 'Bearer';
