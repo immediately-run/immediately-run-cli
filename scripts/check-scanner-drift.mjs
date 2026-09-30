@@ -28,7 +28,7 @@ const PAIRS = [
 // The SECOND thing copied out of the sandbox, and the one that cost a live acceptance: the
 // order the runtime resolves relative specifiers in. `RUNTIME_EXTENSIONS` must equal
 // `bundler.ts`'s `extensions` default verbatim, ORDER INCLUDED — `.js` before `.cjs` is the
-// DEFAULT content of the rule (since sandbox#123 / R3-577 the runtime reorders
+// default content of the rule (since R3-577 the runtime reorders
 // importer-side over this same default — the literal this pin reads is unchanged), and a copy that merely holds the same SET resolves
 // `./Omnibox` to the other build and mispairs the interop. Not a missing file; a wrong one.
 const EXT_SOURCE = ['src/bundler/bundler.ts', /extensions: string\[\] = (\[[^\]]*\])/];
@@ -109,10 +109,12 @@ try {
     console.error(`      copy:    ${mine}`);
     console.error(`      sandbox: ${theirs}`);
     console.error('\n  Order is load-bearing: the runtime tries these against a relative');
-    console.error('  specifier in THIS order, so a package shipping both `x.js` and `x.cjs`');
-    console.error('  gets whichever comes first. Resolving to the other one does not fail —');
-    console.error('  it hands a module transpiled against one build to an importer expecting');
-    console.error('  the other ("Element type is invalid: … but got: object").');
+    console.error('  specifier in this default order (R3-577 reorders importer-side: a');
+    console.error('  `.cjs` importer tries `.cjs` first), so a package shipping both `x.js`');
+    console.error('  and `x.cjs` gets whichever its importer-side order meets first. Resolving');
+    console.error('  to the other one does not fail — it hands a module transpiled against');
+    console.error('  one build to an importer expecting the other ("Element type is invalid:');
+    console.error('  … but got: object").');
     process.exit(1);
   }
   console.log(`PASS  RUNTIME_EXTENSIONS matches the sandbox resolver: ${mine}`);

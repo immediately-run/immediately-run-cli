@@ -199,10 +199,13 @@ export function mergeResolved(...sources: readonly (readonly ResolvedDependency[
 const JS_RE = /\.(c|m)?js$/;
 
 /**
- * The extension list the RUNTIME resolves relative specifiers with, in its order.
+ * The default extension list the runtime resolves relative specifiers with, in its
+ * order. (R3-577: a `.cjs` importer reorders a copy of this list `.cjs`-first —
+ * `importerAwareExtensions` — so the per-call order is importer-conditional; THIS is
+ * the default it starts from, and the only literal the drift pin reads.)
  *
  * Single-sourced from `sandbox/src/bundler/bundler.ts` (the `extensions` default that
- * `resolveFromCdnLayout` receives) and checked against it by
+ * resolution starts from) and checked against it by
  * `scripts/check-scanner-drift.mjs`, because a private copy of someone else's resolution
  * order is exactly the kind of thing that silently stops matching.
  */
@@ -213,13 +216,12 @@ export const RUNTIME_EXTENSIONS = ['.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx',
  *
  * ⚠ THIS RETURNS ALL CANDIDATES, NOT THE FIRST, AND THAT IS THE POINT. An earlier cut
  * returned one, picked with node's importer-aware extension order (`.cjs` first from a CJS
- * file). That order is node's; the runtime's DEFAULT is a single list, `.js` before
- * `.cjs` — and since sandbox#123 (R3-577) a `.cjs` importer reorders it to `.cjs`-first
- * (`importerAwareExtensions`), so the order is importer-conditional, not fixed. Picking
- * either one is a bet on which resolver runs — the fast
- * path, the general resolver, or an `exports` map choosing a different entry build — and a
- * lost bet leaves a file the runtime DOES load sitting in the zip as a bare size, which is a
- * blocking unpkg fetch at boot.
+ * file). That order is node's; the runtime's default is a single list, `.js` before
+ * `.cjs`, and R3-577 adds an importer-side reorder on top of it (`.cjs`-first from a
+ * `.cjs` importer, `importerAwareExtensions`). Picking either one is a bet on which
+ * resolver runs — the fast path, the general resolver, or an `exports` map choosing a
+ * different entry build — and a lost bet leaves a file the runtime DOES load sitting in
+ * the zip as a bare size, which is a blocking unpkg fetch at boot.
  *
  * There is nothing to gain by choosing. A dual-published package ships `x.js` and `x.cjs`
  * for the same specifier; carrying both costs bytes (measured: omnibox 3.85x the CDN's
