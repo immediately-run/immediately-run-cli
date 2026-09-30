@@ -148,6 +148,23 @@ export const emitArtifacts = async (
       continue;
     }
 
+    // R3-843: the dep collector reports a DYNAMIC import with a non-literal
+    // specifier (`import(someVar)`) as a non-string (`undefined` in memory,
+    // serialized as `null` in the index) entry in `deps`. Written into the
+    // index verbatim, that one entry fails the runtime's structural validation
+    // (§4.2's isStringArray) and — because the index is validated whole — poisons
+    // EVERY artifact in the zip: the consume side parses, rejects, and seeds 0,
+    // silently. A file with an unresolvable dep cannot be a faithful artifact
+    // anyway (the runtime would wire a null into the module graph), so it is
+    // skipped like any other emission failure: live-transpiled, never cached.
+    if (!result.deps.every((d): d is string => typeof d === 'string')) {
+      console.warn(
+        `Warning: artifact omitted for ${rel} (the dep collector returned a non-string specifier — a dynamic import it could not resolve)`,
+      );
+      skipped.push({ path: rel, reason: 'unresolvable-deps' });
+      continue;
+    }
+
     const out = `transpiled/${rel}.js`;
     files.set(out, result.code);
     indexFiles[`/${rel}`] = { srcSha: entry.sha, out, deps: result.deps };
