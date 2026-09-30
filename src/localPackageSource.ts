@@ -213,9 +213,10 @@ export const RUNTIME_EXTENSIONS = ['.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx',
  *
  * ⚠ THIS RETURNS ALL CANDIDATES, NOT THE FIRST, AND THAT IS THE POINT. An earlier cut
  * returned one, picked with node's importer-aware extension order (`.cjs` first from a CJS
- * file). That order is node's; the runtime's is a single fixed list, `.js` before `.cjs`,
- * the same for every importer (`bundler.ts` `extensions`, consumed by
- * `resolveFromCdnLayout`). Picking either one is a bet on which resolver runs — the fast
+ * file). That order is node's; the runtime's DEFAULT is a single list, `.js` before
+ * `.cjs` — and since sandbox#123 (R3-577) a `.cjs` importer reorders it to `.cjs`-first
+ * (`importerAwareExtensions`), so the order is importer-conditional, not fixed. Picking
+ * either one is a bet on which resolver runs — the fast
  * path, the general resolver, or an `exports` map choosing a different entry build — and a
  * lost bet leaves a file the runtime DOES load sitting in the zip as a bare size, which is a
  * blocking unpkg fetch at boot.
