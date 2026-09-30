@@ -447,3 +447,116 @@ test('parseArgs: --no-bake is a registered boolean flag (a following token stays
   assert.equal(parsed.flags['no-bake'], true);
   assert.deepEqual(parsed.positionals, ['releases']);
 });
+
+// --- R3-823 — the immutable base: a dated name behind channels.base -----------
+
+// The migrated registry's shape: base.json is a channel template (channel: true),
+// NO plain base.lock.json exists (the dual-name rule), and the current base is a
+// dated immutable lock that channels.base points at.
+const writeChannelBaseFixture = (dir, apps = { 'panel.spaces': 'github:ir/sm@main' }) => {
+  const baseAuthoring = { id: 'base', label: 'Default composition', channel: true, apps };
+  writeFileSync(join(dir, 'base.json'), JSON.stringify(baseAuthoring, null, 2) + '\n');
+  const lock = resolveLock(baseAuthoring, apps, stub);
+  const lockText = serializeLock(lock);
+  const dated = datedLockName('base', lockText, new Date('2026-09-30T00:00:00Z'));
+  writeFileSync(join(dir, `${dated}.lock.json`), lockText);
+  writeFileSync(
+    join(dir, 'index.json'),
+    serializeIndex(buildIndex([{ id: dated, lockText, label: 'Default composition' }], { base: dated })),
+  );
+  writeFileSync(join(dir, 'defaults-map.json'), JSON.stringify(apps, null, 2) + '\n');
+  return dated;
+};
+
+test('pin-release --check passes on the migrated channel-base shape (R3-823)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pin-release-'));
+  try {
+    writeChannelBaseFixture(dir);
+    const code = await runPinRelease({ positionals: [], flags: { dir, check: true } });
+    assert.equal(code, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('pin-release --check: the base COVERAGE assertion reads through channels.base (R3-823)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pin-release-'));
+  try {
+    // The dated base omits a region the derived map names → the check must fail
+    // naming the dated lock (the pointer is followed, not skipped).
+    writeChannelBaseFixture(dir);
+    writeFileSync(
+      join(dir, 'defaults-map.json'),
+      JSON.stringify({ 'panel.spaces': 'github:ir/sm@main', 'panel.files': 'github:ir/fe@main' }, null, 2) + '\n',
+    );
+    const code = await runPinRelease({ positionals: [], flags: { dir, check: true } });
+    assert.equal(code, 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("--republish no longer lifts a content change (R3-823; the spec's byte-identical rule)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pin-release-'));
+  try {
+    writePinnedFixture(dir); // commit-pinned — no network anywhere
+    // Change the authoring so the re-resolved lock DIFFERS from the committed one.
+    writeFileSync(
+      join(dir, 'base.json'),
+      JSON.stringify({ id: 'base', label: 'Default', apps: { 'panel.spaces': `github:ir/sm#${PIN_B}` } }, null, 2) + '\n',
+    );
+    const before = readFileSync(join(dir, 'base.lock.json'), 'utf8');
+    const code = await runPinRelease({ positionals: [], flags: { dir, republish: true } });
+    assert.equal(code, 1); // refused even WITH --republish
+    assert.equal(readFileSync(join(dir, 'base.lock.json'), 'utf8'), before); // untouched
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a changed composition is refused with NO flag too (the two-member refusal class, R3-823)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pin-release-'));
+  try {
+    writePinnedFixture(dir);
+    writeFileSync(
+      join(dir, 'base.json'),
+      JSON.stringify({ id: 'base', label: 'Default', apps: { 'panel.spaces': `github:ir/sm#${PIN_B}` } }, null, 2) + '\n',
+    );
+    const before = readFileSync(join(dir, 'base.lock.json'), 'utf8');
+    const code = await runPinRelease({ positionals: [], flags: { dir } }); // no --republish
+    assert.equal(code, 1);
+    assert.equal(readFileSync(join(dir, 'base.lock.json'), 'utf8'), before);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('pin-release --check fails loudly on a STALE channels.base pointer (the target lock missing)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pin-release-'));
+  try {
+    const dated = writeChannelBaseFixture(dir);
+    rmSync(join(dir, `${dated}.lock.json`)); // the pointer's target vanishes
+    // Assert the FAILURE NAMES the stale target (the coverage branch the field
+    // is for) — validateChannels and the index-equality check would turn the
+    // same fixture red without ever running it, so exit-1 alone is not the pin.
+    const errs = [];
+    const origError = console.error;
+    console.error = (...a) => void errs.push(a.join(' '));
+    let code;
+    try {
+      code = await runPinRelease({ positionals: [], flags: { dir, check: true } });
+    } finally {
+      console.error = origError;
+    }
+    assert.equal(code, 1);
+    assert.ok(
+      // The COVERAGE branch's own phrasing — validateChannels also names the
+      // target, so naming alone does not pin the branch (review round 3's
+      // regression probe: deleting the branch kept this suite green).
+      errs.some((line) => line.includes("channels.base's target")),
+      `expected the coverage branch's own refusal (channels.base's target); got: ${errs.join(' | ').slice(0, 300)}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

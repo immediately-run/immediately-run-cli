@@ -11,7 +11,8 @@
  *     dated channel targets, §4.4: their locks are the history the channels
  *     repoint away from, and a rebuild that dropped them would strand every
  *     older target). Immutable by name — re-pinning an existing name to
- *     different content is refused unless --republish.
+ *     different content is refused — a changed composition gets a new name
+ *     (§3.3/§5 step 6; --republish is a vestigial no-op since 0.9.3, R3-823).
  *   - --check (CI): no network, no writes. Verify the committed locks parse and
  *     are SHA-pinned, that `index.json` exactly matches the locks' digests,
  *     that the channel map is sound (§4.4: every target published, no dual
@@ -85,7 +86,8 @@ Options:
                           integrity of every RESIDENT zip (magic + sidecar;
                           absent zips are counted, not failed — the first bake
                           lands them)
-  --republish             Allow overwriting an existing lock whose content changed
+  --republish             Deprecated no-op: names are immutable; a changed composition
+                          is refused either way. Kept accepted so old scripts do not break.
   --dated <id>            Write the release <id> under a dated immutable name
                           <id>-<YYYY-MM-DD>-<sha8> (§4.4 — the moving channel's
                           fresh target; the plain <id> lock is not written)
@@ -241,12 +243,21 @@ const coverageProblems = (dir: string, locks: { id: string; lockText: string }[]
   } catch {
     return [`${DERIVED_MAP_FILE} missing or unreadable — run site-main's export:release-base and commit it`];
   }
-  const base = locks.find((l) => l.id === BASE_RELEASE_ID);
-  if (!base) return [`no "${BASE_RELEASE_ID}" lock — the coverage assertion needs the base release`];
+  // R3-823: `base` is a dated immutable name behind the channels.base pointer
+  // (the only mutable write) — resolve through it when no plain lock exists.
+  const channels = readCommittedChannels(dir);
+  const baseName = channels[BASE_RELEASE_ID] ?? BASE_RELEASE_ID;
+  const base = locks.find((l) => l.id === BASE_RELEASE_ID) ?? locks.find((l) => l.id === channels[BASE_RELEASE_ID]);
+  if (!base)
+    return [
+      channels[BASE_RELEASE_ID]
+        ? `no "${channels[BASE_RELEASE_ID]}" lock (channels.${BASE_RELEASE_ID}'s target) — the coverage assertion needs the base release`
+        : `no "${BASE_RELEASE_ID}" lock and no channels.${BASE_RELEASE_ID} pointer — the coverage assertion needs the base release`,
+    ];
   const baseRegions = new Set(Object.keys((JSON.parse(base.lockText) as ReleaseLock).apps));
   const missing = Object.keys(map).filter((r) => !baseRegions.has(r));
   if (missing.length) {
-    return [`${BASE_RELEASE_ID}.lock.json omits ${missing.length} region(s) the derived map names: ${missing.join(', ')}`];
+    return [`${baseName}.lock.json omits ${missing.length} region(s) the derived map names: ${missing.join(', ')}`];
   }
   const extra = [...baseRegions].filter((r) => !(r in map));
   if (extra.length) {
@@ -272,6 +283,11 @@ export const runPinRelease = async (args: ParsedArgs): Promise<number> => {
   const dir = resolve(flagValue(args.flags, 'dir') ?? 'releases');
   const check = args.flags.check === true;
   const republish = args.flags.republish === true;
+  if (republish) {
+    // R3-823: vestigial since 0.9.3 — content changes are refused either way
+    // (UI_RELEASES_SPEC §5 step 6). Warn so callers notice rather than assume.
+    console.warn('pin-release: --republish is deprecated and has no effect — names are immutable; publish a changed composition under a new name.');
+  }
   const datedId = flagValue(args.flags, 'dated');
   const onlyId = flagValue(args.flags, 'only');
   const noBake = args.flags['no-bake'] === true;
@@ -370,11 +386,15 @@ export const runPinRelease = async (args: ParsedArgs): Promise<number> => {
     } catch {
       existing = undefined;
     }
-    if (existing !== undefined && existing !== lockText && !republish) {
+    // UI_RELEASES_SPEC §5 step 6 (as amended 2026-09-30, R3-823): a name is
+    // NEVER mutated on a content change — a changed composition gets a new
+    // name. --republish is a vestigial no-op (the byte-identical case writes
+    // nothing anyway): kept accepted so old scripts keep running.
+    if (existing !== undefined && existing !== lockText) {
       console.error(
         `pin-release: "${name}" would change but is immutable.\n` +
           `  A published release name is frozen (UI_RELEASES_SPEC §3.3). To pin a\n` +
-          `  new composition, add a new name; to correct this one, pass --republish.`,
+          `  new composition, publish a new name (the dated flow: --dated ${name} --channel <channel>=@dated).`,
       );
       return 1;
     }

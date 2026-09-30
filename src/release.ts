@@ -11,7 +11,8 @@
  *
  * Locks are DETERMINISTIC (no wall-clock field) so their sha-256 is reproducible
  * and "immutable by name" is enforceable: re-pinning a name to different content
- * is refused unless --republish.
+ * is refused (a changed composition gets a new name; --republish is a vestigial
+ * no-op since cli 0.9.3, R3-823).
  */
 
 import { execFileSync } from 'node:child_process';
