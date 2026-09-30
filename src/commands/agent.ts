@@ -46,7 +46,8 @@ Arguments:
 
 Options:
   --port <n>                Bridge port to listen on (127.0.0.1 only; default: 7700)
-  --origin <url>            Allowed browser origin and pairing base
+  --origin <url>            Allowed browser origin and pairing base (for the hosted
+                            origins, the site's mediator origin is admitted with it)
                             (default: https://immediately.run). Only
                             immediately.run, loopback, and preview origins are
                             accepted without --origin-unsafe.

@@ -14,7 +14,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { basename, resolve } from 'node:path';
 
-import { startDevServer, runUntilShutdown, type DevServerOptions } from '../devServer.js';
+import { startDevServer, runUntilShutdown, DEFAULT_ORIGIN, type DevServerOptions } from '../devServer.js';
 import type { LlmUpstream } from '../llmProxy.js';
 import { flagValue, type ParsedArgs } from '../args.js';
 import { resolveTailscaleCert, tailscaleSelf } from '../tailscale.js';
@@ -49,8 +49,12 @@ Options:
                             is used for the private key. Default: look for
                             <host>.crt/.key, else mint via \`tailscale cert\`.
   --origin <url>            Allowed browser origin and deep-link base
-                            (default: https://immediately.run; use e.g.
-                            http://localhost:3000 against a local site build).
+                            (default: https://immediately.run; use
+                            https://local.immediately.run against the local stack).
+                            For immediately.run, staging and local, the site's
+                            local-development mediator origin is admitted with it;
+                            a loopback site build has no mediator and cannot
+                            reach the dev server.
                             Only immediately.run, loopback, and preview origins
                             are accepted without --origin-unsafe.
   --origin-unsafe           Allow an --origin outside the recognized set
@@ -81,7 +85,8 @@ Options:
   -h, --help                Show this help`;
 
 export const DEFAULT_PORT = 7700;
-export const DEFAULT_ORIGIN = 'https://immediately.run';
+// Its one home is devServer.ts, beside the mediator table keyed on it.
+export { DEFAULT_ORIGIN };
 
 // LD-3 (LOCAL_DEVELOPMENT_SPEC §8, decision §6a#24b): `--origin` must not let one
 // careless flag silently disable the Origin defense. These values are accepted
@@ -356,7 +361,7 @@ export const runDev = async (args: ParsedArgs): Promise<number> => {
   // the bare project name (`local/<name>-<hash8>/<name>/live`). R3-422 `--fresh`
   // salts it with per-run entropy so the host mints a brand-new appKey (no prior
   // grants/overlay) without the tree having to be copied.
-  const freshSalt = args.flags.fresh === true ? ` fresh:${randomBytes(8).toString('hex')}` : '';
+  const freshSalt = args.flags.fresh === true ? `\u0000fresh:${randomBytes(8).toString('hex')}` : '';
   const namespace = `${projectName}-${identityHash8(root, freshSalt)}`;
   // The endpoint the iPhone/browser connects to: real https tailnet URL under a
   // tailnet bind, loopback http otherwise.

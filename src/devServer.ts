@@ -364,6 +364,38 @@ export const isAllowedHost = (
   return true;
 };
 
+/** The default `--origin`: the production site. */
+export const DEFAULT_ORIGIN = 'https://immediately.run';
+
+/**
+ * R3-470 (HOST_ORIGIN_HARDENING §2.1). The hosted site no longer fetches this server
+ * itself: its local-development mediator page does, on its own origin, so every browser
+ * request arrives with the mediator's Origin rather than the host's. Each recognized host
+ * origin is paired with the mediator origin that site-main's config names for it
+ * (`config.devBridgeOrigin`), and the server admits exactly that pair. An origin with no
+ * entry (a loopback site build, a preview channel) keeps the single-origin rule.
+ */
+export const DEV_BRIDGE_ORIGINS: Readonly<Record<string, string>> = Object.freeze({
+  [DEFAULT_ORIGIN]: 'https://immediately-run-devbridge.web.app',
+  'https://staging.immediately.run': 'https://staging-immediately-run-devbridge.web.app',
+  'https://local.immediately.run': 'https://staging-immediately-run-devbridge.web.app',
+});
+
+/** The browser Origins the server admits for `--origin`: the host origin and its mediator. */
+export const admittedOrigins = (origin: string): ReadonlySet<string> => {
+  // The serialized origin, as a browser sends it: lower-case host, default port dropped,
+  // no trailing slash. `--origin` is checked by isRecognizedOrigin, which accepts those
+  // other spellings, so without this they would miss the table and every request 403.
+  let host: string;
+  try {
+    host = new URL(origin).origin;
+  } catch {
+    host = origin.replace(/\/+$/, '');
+  }
+  const bridge = DEV_BRIDGE_ORIGINS[host];
+  return new Set(bridge ? [host, bridge] : [host]);
+};
+
 const corsHeaders = (origin: string): Record<string, string> => ({
   'Access-Control-Allow-Origin': origin,
   Vary: 'Origin',
@@ -474,6 +506,7 @@ export const startDevServer = (opts: DevServerOptions): Promise<DevServerHandle>
     return n;
   };
 
+  const origins = admittedOrigins(opts.origin);
   const handler: http.RequestListener = (req, res) => {
     const url = new URL(req.url ?? '/', 'http://127.0.0.1');
     const requestOrigin = req.headers.origin;
@@ -485,14 +518,15 @@ export const startDevServer = (opts: DevServerOptions): Promise<DevServerHandle>
       return;
     }
 
-    // Origin allowlist: browser requests always carry Origin — it must match
-    // exactly. Token-bearing curl/agent requests carry none and are admitted
-    // (the token is the gate; never echo ACAO for a foreign origin).
-    if (requestOrigin !== undefined && requestOrigin !== opts.origin) {
+    // Origin allowlist: browser requests always carry Origin — it must match one of
+    // the admitted origins exactly (the host's, or its mediator's; R3-470).
+    // Token-bearing curl/agent requests carry none and are admitted (the token is the
+    // gate; never echo ACAO for a foreign origin).
+    if (requestOrigin !== undefined && !origins.has(requestOrigin)) {
       sendJson(res, 403, { error: 'origin not allowed' });
       return;
     }
-    const cors = requestOrigin === opts.origin ? corsHeaders(opts.origin) : {};
+    const cors = requestOrigin !== undefined ? corsHeaders(requestOrigin) : {};
 
     // CORS + Private Network Access preflight (spec §8). Chrome preflights the
     // Authorization-carrying GETs and adds Access-Control-Request-Private-Network
