@@ -149,7 +149,8 @@ export const emitArtifacts = async (
     }
 
     // R3-843: the dep collector reports a DYNAMIC import with a non-literal
-    // specifier (`import(someVar)`) as a `null` entry in `deps`. Written into the
+    // specifier (`import(someVar)`) as a non-string (`undefined` in memory,
+    // serialized as `null` in the index) entry in `deps`. Written into the
     // index verbatim, that one entry fails the runtime's structural validation
     // (§4.2's isStringArray) and — because the index is validated whole — poisons
     // EVERY artifact in the zip: the consume side parses, rejects, and seeds 0,

@@ -358,6 +358,9 @@ test('a file whose deps contain a non-string specifier is omitted, not indexed (
       `drill.mjs skipped with the named reason (got: ${JSON.stringify(emission.skipped)})`,
     );
     assert.equal(emission.index.files['/scripts/drill.mjs'], undefined);
+    // …and the artifact FILE is withheld too — an entry in one map without the
+    // other is the inconsistency class this guard exists against.
+    assert.ok(!emission.files.has('transpiled/scripts/drill.mjs.js'), 'the artifact file is withheld');
     // The healthy file still emits — one bad file must not cost the repo its artifacts.
     assert.ok(emission.index.files['/src/App.tsx'], 'App.tsx still emitted');
     for (const [k, v] of Object.entries(emission.index.files)) {
