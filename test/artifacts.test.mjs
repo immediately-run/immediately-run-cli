@@ -340,3 +340,30 @@ test('emitMdxMetadata output is accepted by the shared validator, entry for entr
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+// R3-843 — a dynamic import with a non-literal specifier makes the dep collector
+// emit `null` in deps; written into the index that one entry fails the runtime's
+// whole-index structural validation (§4.2 isStringArray) and poisons EVERY artifact
+// in the zip (grove's zip carried exactly this landmine: docs/drills/*.mjs).
+test('a file whose deps contain a non-string specifier is omitted, not indexed (R3-843)', async () => {
+  const root = makeRepo({
+    'src/App.tsx': APP_TSX,
+    'scripts/drill.mjs':
+      "const P = '/tmp/x.js';\nconst { default: p } = await import(P);\nexport const y = 1;\n",
+  });
+  try {
+    const emission = await emitArtifacts(root, treeEntries(root));
+    assert.ok(
+      emission.skipped.some((sk) => sk.path === 'scripts/drill.mjs' && sk.reason === 'unresolvable-deps'),
+      `drill.mjs skipped with the named reason (got: ${JSON.stringify(emission.skipped)})`,
+    );
+    assert.equal(emission.index.files['/scripts/drill.mjs'], undefined);
+    // The healthy file still emits — one bad file must not cost the repo its artifacts.
+    assert.ok(emission.index.files['/src/App.tsx'], 'App.tsx still emitted');
+    for (const [k, v] of Object.entries(emission.index.files)) {
+      assert.ok(v.deps.every((d) => typeof d === 'string'), `${k}: every dep is a string`);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
