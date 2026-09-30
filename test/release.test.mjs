@@ -550,8 +550,11 @@ test('pin-release --check fails loudly on a STALE channels.base pointer (the tar
     }
     assert.equal(code, 1);
     assert.ok(
-      errs.some((line) => line.includes(dated)),
-      `expected the failure to name the stale target ${dated}; got: ${errs.join(' | ').slice(0, 300)}`,
+      // The COVERAGE branch's own phrasing — validateChannels also names the
+      // target, so naming alone does not pin the branch (review round 3's
+      // regression probe: deleting the branch kept this suite green).
+      errs.some((line) => line.includes("channels.base's target")),
+      `expected the coverage branch's own refusal (channels.base's target); got: ${errs.join(' | ').slice(0, 300)}`,
     );
   } finally {
     rmSync(dir, { recursive: true, force: true });
