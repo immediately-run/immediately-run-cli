@@ -364,6 +364,9 @@ export const isAllowedHost = (
   return true;
 };
 
+/** The default `--origin`: the production site. */
+export const DEFAULT_ORIGIN = 'https://immediately.run';
+
 /**
  * R3-470 (HOST_ORIGIN_HARDENING §2.1). The hosted site no longer fetches this server
  * itself: its local-development mediator page does, on its own origin, so every browser
@@ -372,9 +375,6 @@ export const isAllowedHost = (
  * (`config.devBridgeOrigin`), and the server admits exactly that pair. An origin with no
  * entry (a loopback site build, a preview channel) keeps the single-origin rule.
  */
-/** The default `--origin`: the production site. */
-export const DEFAULT_ORIGIN = 'https://immediately.run';
-
 export const DEV_BRIDGE_ORIGINS: Readonly<Record<string, string>> = Object.freeze({
   [DEFAULT_ORIGIN]: 'https://immediately-run-devbridge.web.app',
   'https://staging.immediately.run': 'https://staging-immediately-run-devbridge.web.app',
