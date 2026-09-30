@@ -48,7 +48,8 @@ Options:
   --cert <path>             TLS cert (.crt) for --bind tailscale; its .key sibling
                             is used for the private key. Default: look for
                             <host>.crt/.key, else mint via \`tailscale cert\`.
-  --origin <url>            Allowed browser origin and deep-link base
+  --origin <url>            Allowed browser origin and deep-link base (the site's
+                            local-development mediator origin is admitted with it)
                             (default: https://immediately.run; use e.g.
                             http://localhost:3000 against a local site build).
                             Only immediately.run, loopback, and preview origins

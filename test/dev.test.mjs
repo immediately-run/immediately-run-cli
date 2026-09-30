@@ -16,6 +16,7 @@ import {
   listWorkingTreeFiles,
   resolveSafe,
   isAllowedHost,
+  admittedOrigins,
   DEV_PROTOCOL_VERSION,
 } from '../dist/devServer.js';
 import {
@@ -190,6 +191,59 @@ test('allowed Origin is echoed in CORS headers', async () => {
   const res = await authed('/tree', { headers: { Origin: ORIGIN } });
   assert.equal(res.status, 200);
   assert.equal(res.headers.get('access-control-allow-origin'), ORIGIN);
+});
+
+// R3-470: the hosted site reaches this server through its mediator page, whose requests
+// carry the mediator's Origin. Each host origin admits exactly its own mediator.
+test('R3-470: admittedOrigins pairs each host origin with its own mediator, and nothing else', () => {
+  assert.deepEqual([...admittedOrigins('https://immediately.run')], [
+    'https://immediately.run',
+    'https://immediately-run-devbridge.web.app',
+  ]);
+  assert.deepEqual([...admittedOrigins('https://staging.immediately.run/')], [
+    'https://staging.immediately.run',
+    'https://staging-immediately-run-devbridge.web.app',
+  ]);
+  assert.deepEqual([...admittedOrigins('https://local.immediately.run')], [
+    'https://local.immediately.run',
+    'https://staging-immediately-run-devbridge.web.app',
+  ]);
+  // A loopback site build or preview channel has no mediator: the single-origin rule.
+  assert.deepEqual([...admittedOrigins(ORIGIN)], [ORIGIN]);
+  assert.deepEqual([...admittedOrigins('https://pr-1--x.web.app')], ['https://pr-1--x.web.app']);
+});
+
+test('R3-470: the paired mediator origin is admitted and echoed; another environment\'s is refused', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'ir-bridge-origin-'));
+  writeFileSync(join(root, 'a.txt'), 'x');
+  const srv = await startDevServer({ root, origin: 'https://immediately.run', token: TOKEN, port: 0 });
+  const at = `http://127.0.0.1:${srv.port}`;
+  try {
+    const bridge = 'https://immediately-run-devbridge.web.app';
+    const ok = await fetch(`${at}/tree`, { headers: { Authorization: `Bearer ${TOKEN}`, Origin: bridge } });
+    assert.equal(ok.status, 200);
+    assert.equal(ok.headers.get('access-control-allow-origin'), bridge);
+    const pre = await fetch(`${at}/tree`, {
+      method: 'OPTIONS',
+      headers: { Origin: bridge, 'Access-Control-Request-Method': 'GET', 'Access-Control-Request-Private-Network': 'true' },
+    });
+    assert.equal(pre.status, 204);
+    assert.equal(pre.headers.get('access-control-allow-origin'), bridge);
+    assert.equal(pre.headers.get('access-control-allow-private-network'), 'true');
+    // The host origin itself still works (no flag day for an older site release).
+    const host = await fetch(`${at}/tree`, {
+      headers: { Authorization: `Bearer ${TOKEN}`, Origin: 'https://immediately.run' },
+    });
+    assert.equal(host.headers.get('access-control-allow-origin'), 'https://immediately.run');
+    for (const foreign of ['https://staging-immediately-run-devbridge.web.app', 'https://evil-devbridge.web.app']) {
+      const res = await fetch(`${at}/tree`, { headers: { Authorization: `Bearer ${TOKEN}`, Origin: foreign } });
+      assert.equal(res.status, 403, foreign);
+      assert.equal(res.headers.get('access-control-allow-origin'), null, foreign);
+    }
+  } finally {
+    await srv.close();
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('OPTIONS preflight carries CORS + Private Network Access headers', async () => {
