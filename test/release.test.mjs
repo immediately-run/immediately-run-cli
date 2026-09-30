@@ -513,3 +513,32 @@ test("--republish no longer lifts a content change (R3-823; the spec's byte-iden
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('a changed composition is refused with NO flag too (the two-member refusal class, R3-823)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pin-release-'));
+  try {
+    writePinnedFixture(dir);
+    writeFileSync(
+      join(dir, 'base.json'),
+      JSON.stringify({ id: 'base', label: 'Default', apps: { 'panel.spaces': `github:ir/sm#${PIN_B}` } }, null, 2) + '\n',
+    );
+    const before = readFileSync(join(dir, 'base.lock.json'), 'utf8');
+    const code = await runPinRelease({ positionals: [], flags: { dir } }); // no --republish
+    assert.equal(code, 1);
+    assert.equal(readFileSync(join(dir, 'base.lock.json'), 'utf8'), before);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('pin-release --check fails loudly on a STALE channels.base pointer (the target lock missing)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pin-release-'));
+  try {
+    const dated = writeChannelBaseFixture(dir);
+    rmSync(join(dir, `${dated}.lock.json`)); // the pointer's target vanishes
+    const code = await runPinRelease({ positionals: [], flags: { dir, check: true } });
+    assert.equal(code, 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

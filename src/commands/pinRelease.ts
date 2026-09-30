@@ -12,7 +12,7 @@
  *     repoint away from, and a rebuild that dropped them would strand every
  *     older target). Immutable by name — re-pinning an existing name to
  *     different content is refused — a changed composition gets a new name
- *     (§3.3/§5 step 6; --republish is the vestigial repair hatch, R3-823).
+ *     (§3.3/§5 step 6; --republish is a vestigial no-op since 0.9.3, R3-823).
  *   - --check (CI): no network, no writes. Verify the committed locks parse and
  *     are SHA-pinned, that `index.json` exactly matches the locks' digests,
  *     that the channel map is sound (§4.4: every target published, no dual
@@ -387,10 +387,9 @@ export const runPinRelease = async (args: ParsedArgs): Promise<number> => {
       existing = undefined;
     }
     // UI_RELEASES_SPEC §5 step 6 (as amended 2026-09-30, R3-823): a name is
-    // mutated ONLY when the content is byte-identical (a repair rewrite of a
-    // missing/corrupted artifact) — --republish no longer lifts a CONTENT
-    // change (it never should have: a changed base under a pinned name breaks
-    // every digest pin against it). A changed composition gets a new name.
+    // NEVER mutated on a content change — a changed composition gets a new
+    // name. --republish is a vestigial no-op (the byte-identical case writes
+    // nothing anyway): kept accepted so old scripts keep running.
     if (existing !== undefined && existing !== lockText) {
       console.error(
         `pin-release: "${name}" would change but is immutable.\n` +
