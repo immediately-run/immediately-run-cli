@@ -555,7 +555,13 @@ test('the runtime enters a dual package through `require`, and that decides whic
 
   assert.notEqual(typeof CDN.f['dist/index.cjs'], 'number', 'the CJS entry the `require` condition selects carries content');
   const target = resolveLike('dist/index.cjs', './Omnibox');
-  assert.equal(target, 'dist/Omnibox.js', 'a `.cjs` importer still resolves `.js` first — the order is not importer-aware');
+  // NOTE: resolveLike is a HAND COPY of the runtime's default order — it never calls the
+  // real resolver. Since R3-577 the runtime reorders importer-side (`.cjs`-first from a
+  // `.cjs` importer), so the runtime's own answer to this exact call is `Omnibox.cjs`;
+  // this assertion pins the DEFAULT order the hand copy models, not the runtime's
+  // per-importer answer. If the default literal changes, check-scanner-drift.mjs is the
+  // guard; if the reorder's shape changes, this message goes stale — check both.
+  assert.equal(target, 'dist/Omnibox.js', 'the default extension order resolves `.js` first (the runtime reorders per importer — R3-577)');
   assert.equal(typeof CDN.f[target], 'number', 'and the CDN ships that file SIZE-ONLY: a blocking unpkg fetch at boot');
 
   // This builder ships it with content instead — the whole point — and lands on the same file.
