@@ -54,8 +54,8 @@ Options:
                             ${CONNECTION_ID_PLACEHOLDER} substitutes a UUID minted once per
                             proxy process (e.g. OpenCode's x-opencode-session routing header)
   --port <n>                Port to listen on (127.0.0.1 only; default: ${DEFAULT_PORT})
-  --origin <url>            Allowed browser origin and pairing base (the site's
-                            local-development mediator origin is admitted with it)
+  --origin <url>            Allowed browser origin and pairing base (for the hosted
+                            origins, the site's mediator origin is admitted with it)
                             (default: ${DEFAULT_ORIGIN})
   --origin-unsafe           Allow an --origin outside the recognized set
                             (the per-session token still gates every request)

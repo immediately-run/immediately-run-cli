@@ -372,15 +372,26 @@ export const isAllowedHost = (
  * (`config.devBridgeOrigin`), and the server admits exactly that pair. An origin with no
  * entry (a loopback site build, a preview channel) keeps the single-origin rule.
  */
+/** The default `--origin`: the production site. */
+export const DEFAULT_ORIGIN = 'https://immediately.run';
+
 export const DEV_BRIDGE_ORIGINS: Readonly<Record<string, string>> = Object.freeze({
-  'https://immediately.run': 'https://immediately-run-devbridge.web.app',
+  [DEFAULT_ORIGIN]: 'https://immediately-run-devbridge.web.app',
   'https://staging.immediately.run': 'https://staging-immediately-run-devbridge.web.app',
   'https://local.immediately.run': 'https://staging-immediately-run-devbridge.web.app',
 });
 
 /** The browser Origins the server admits for `--origin`: the host origin and its mediator. */
 export const admittedOrigins = (origin: string): ReadonlySet<string> => {
-  const host = origin.replace(/\/+$/, '');
+  // The serialized origin, as a browser sends it: lower-case host, default port dropped,
+  // no trailing slash. `--origin` is checked by isRecognizedOrigin, which accepts those
+  // other spellings, so without this they would miss the table and every request 403.
+  let host: string;
+  try {
+    host = new URL(origin).origin;
+  } catch {
+    host = origin.replace(/\/+$/, '');
+  }
   const bridge = DEV_BRIDGE_ORIGINS[host];
   return new Set(bridge ? [host, bridge] : [host]);
 };

@@ -208,6 +208,11 @@ test('R3-470: admittedOrigins pairs each host origin with its own mediator, and 
     'https://local.immediately.run',
     'https://staging-immediately-run-devbridge.web.app',
   ]);
+  // Other spellings isRecognizedOrigin accepts are normalized to the browser's Origin.
+  assert.deepEqual([...admittedOrigins('https://IMMEDIATELY.RUN:443')], [
+    'https://immediately.run',
+    'https://immediately-run-devbridge.web.app',
+  ]);
   // A loopback site build or preview channel has no mediator: the single-origin rule.
   assert.deepEqual([...admittedOrigins(ORIGIN)], [ORIGIN]);
   assert.deepEqual([...admittedOrigins('https://pr-1--x.web.app')], ['https://pr-1--x.web.app']);
