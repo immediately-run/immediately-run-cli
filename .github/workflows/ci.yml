@@ -25,11 +25,14 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
-          node-version: '24'
-          package-manager-cache: false  # never use caching in release builds
+          node-version: "24"
+          package-manager-cache: false # never use caching in release builds
       # Trusted publishing requires npm >= 11.5.1
       - run: npm install -g npm@11
       - run: npm ci
+      # R3-869 — the manifest↔lock version sync (check:publish-version checks
+      # the registry, never the lock).
+      - run: npm run check:lock-version
       - run: npm test
       - run: npm run build
       # The determinism proof the payload-parity gate rests on (R3-756) — a gate
@@ -56,9 +59,9 @@ jobs:
     runs-on: ubuntu-latest
     environment: production
     permissions:
-      contents: write   # pushing the release tag
-      id-token: write   # npm trusted publishing (OIDC)
-      actions: read     # read THIS run's approval history (the assertion below)
+      contents: write # pushing the release tag
+      id-token: write # npm trusted publishing (OIDC)
+      actions: read # read THIS run's approval history (the assertion below)
     steps:
       # Fail-closed authority gate (ways_of_working §2 "authority gates fail
       # closed"): a run that reached here without a recorded `production`
@@ -79,9 +82,9 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
-          node-version: '24'
-          registry-url: 'https://registry.npmjs.org'
-          package-manager-cache: false  # never use caching in release builds
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false # never use caching in release builds
       - run: npm install -g npm@11
       - run: npm ci
       # A fresh build in the release job: jobs share no filesystem. `npm test` is
