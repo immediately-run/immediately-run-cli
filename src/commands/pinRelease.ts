@@ -284,7 +284,7 @@ export const runPinRelease = async (args: ParsedArgs): Promise<number> => {
   const check = args.flags.check === true;
   const republish = args.flags.republish === true;
   if (republish) {
-    // R3-823: vestigial since 0.9.2 — content changes are refused either way
+    // R3-823: vestigial since 0.9.3 — content changes are refused either way
     // (UI_RELEASES_SPEC §5 step 6). Warn so callers notice rather than assume.
     console.warn('pin-release: --republish is deprecated and has no effect — names are immutable; publish a changed composition under a new name.');
   }

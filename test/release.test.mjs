@@ -536,8 +536,23 @@ test('pin-release --check fails loudly on a STALE channels.base pointer (the tar
   try {
     const dated = writeChannelBaseFixture(dir);
     rmSync(join(dir, `${dated}.lock.json`)); // the pointer's target vanishes
-    const code = await runPinRelease({ positionals: [], flags: { dir, check: true } });
+    // Assert the FAILURE NAMES the stale target (the coverage branch the field
+    // is for) — validateChannels and the index-equality check would turn the
+    // same fixture red without ever running it, so exit-1 alone is not the pin.
+    const errs = [];
+    const origError = console.error;
+    console.error = (...a) => void errs.push(a.join(' '));
+    let code;
+    try {
+      code = await runPinRelease({ positionals: [], flags: { dir, check: true } });
+    } finally {
+      console.error = origError;
+    }
     assert.equal(code, 1);
+    assert.ok(
+      errs.some((line) => line.includes(dated)),
+      `expected the failure to name the stale target ${dated}; got: ${errs.join(' | ').slice(0, 300)}`,
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
