@@ -493,6 +493,14 @@ export const buildCacheZip = async (opts: CacheZipOptions): Promise<CacheZipResu
     artifactsSummary = `${emission.transpiledCount} files${skip}, ${formatBytes(
       emission.sourceBytes,
     )} → ${formatBytes(emission.artifactBytes)}`;
+    // R3-843: the stamp is the consume-side gate (§4.4) and it was observable NOWHERE
+    // at build time — the pipeline stamped a stale toolchain for months while every
+    // runtime silently seeded 0. The CI log is the one record every zip build keeps,
+    // so the stamp goes in it, in the same shape the runtime's boot line prints.
+    const tc = emission.index.toolchain;
+    console.log(
+      `  · toolchain stamp: ${tc.transpiler} ${tc.version} (hash ${tc.toolchainHash.slice(0, 12)}…), preset ${tc.preset}`,
+    );
   }
 
   // 2b) Frontmatter content-collection sidecar (MDX_CONTENT_COLLECTIONS_SPEC §1.3) —

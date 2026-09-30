@@ -89,3 +89,28 @@ test("every sidecar blob entry's bytes are in the zip and hash-match (verifyZipB
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('cache-zip prints the toolchain stamp it embedded (R3-843 — the build-side observable)', async () => {
+  const root = makeRepo();
+  const lines = [];
+  const orig = console.log;
+  console.log = (...a) => lines.push(a.join(' '));
+  try {
+    // artifacts ON (the default), lockset off — hermetic: the transpile is local.
+    await buildCacheZip({
+      repoPath: root,
+      owner: 'o',
+      repository: 'r',
+      ref: 'main',
+      defaultBranch: 'main',
+      out: join(root, 'out.zip'),
+      lockset: false,
+    });
+  } finally {
+    console.log = orig;
+    rmSync(root, { recursive: true, force: true });
+  }
+  const stamp = lines.find((l) => l.includes('toolchain stamp:'));
+  assert.ok(stamp, 'the stamp line is printed');
+  assert.match(stamp, /@immediately-run\/transpiler \d+\.\d+\.\d+ \(hash [0-9a-f]{12}…\), preset react/);
+});
