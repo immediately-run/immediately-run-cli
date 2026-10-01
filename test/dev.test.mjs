@@ -30,6 +30,7 @@ import {
   buildRegionDeepLink,
   parsePreviewPath,
   defaultPreviewPath,
+  regionPreviewWarning,
   identityHash8,
   isRecognizedOrigin,
   resolveDevLlmConfig,
@@ -338,6 +339,20 @@ test('unit: defaultPreviewPath picks edit/new for chrome regions, landing for pa
   assert.equal(defaultPreviewPath('modal.share'), 'edit/new');
   // a full-page region IS the page → host default landing (empty path)
   assert.equal(defaultPreviewPath('page.landing'), '');
+});
+
+test('unit: regionPreviewWarning names the invisible-override trap (R3-867)', () => {
+  // a panel.* region on a present route loads invisibly — the §6.8 trap
+  const w = regionPreviewWarning('panel.files', 'present/github/immediately-run/todo/main/');
+  assert.ok(w && w.includes('panel.files') && w.includes('invisibly') && w.includes('edit/'));
+  // the owner/repo --preview form resolves to a present route → same warning
+  const w2 = regionPreviewWarning('panel.files', parsePreviewPath('immediately-run/todo'));
+  assert.ok(w2 && w2.includes('invisibly'));
+  // an edit route is fine — the region renders there
+  assert.equal(regionPreviewWarning('panel.files', 'edit/new'), null);
+  assert.equal(regionPreviewWarning('panel.files', 'edit/github/acme/notes/main/'), null);
+  // a page.* region IS the present page — no warning
+  assert.equal(regionPreviewWarning('page.landing', 'present/github/acme/notes/main/'), null);
 });
 
 test('unit: parsePreviewPath rejects a malformed locator (§6.8)', () => {
@@ -1182,4 +1197,80 @@ test('resolveDevLlmConfig: custom auth header/scheme pass through (incl. raw)', 
   );
   assert.equal(cfg.upstream.authHeader, 'x-api-key');
   assert.equal(cfg.upstream.authScheme, '');
+});
+
+test('R3-867: dev --region panel.files --preview owner/repo WARNS on stderr (the wiring, not just the decision)', async () => {
+  // The decision (regionPreviewWarning) is unit-tested above; this drives the
+  // REAL trigger — a dev invocation whose --preview resolves to a present
+  // route — and observes the emission, so a wiring regression (e.g. passing
+  // the raw flag instead of the parsed path) cannot ship with a green suite.
+  const proc = spawn(
+    process.execPath,
+    [
+      CLI_ENTRY,
+      'dev',
+      root,
+      '--json',
+      '--port',
+      '0',
+      '--origin',
+      ORIGIN,
+      '--region',
+      'panel.files',
+      '--preview',
+      'immediately-run/todo',
+    ],
+    { stdio: ['ignore', 'pipe', 'pipe'] },
+  );
+  try {
+    const { stdoutLine, stderrText } = await new Promise((resolve, reject) => {
+      let out = '';
+      let err = '';
+      let line = null;
+      proc.stdout.on('data', (c) => {
+        out += c;
+        const nl = out.indexOf('\n');
+        if (nl !== -1) line = out.slice(0, nl);
+      });
+      proc.stderr.on('data', (c) => {
+        err += c;
+      });
+      proc.on('error', reject);
+      const t = setInterval(() => {
+        if (line !== null && (err.includes('invisibly') || err.length > 4000)) {
+          clearInterval(t);
+          resolve({ stdoutLine: line, stderrText: err });
+        }
+      }, 25);
+      setTimeout(() => {
+        clearInterval(t);
+        reject(new Error(`no JSON line + warning within 8s (stderr: ${err.slice(0, 300)})`));
+      }, 8000);
+    });
+    // stdout stays machine-readable: exactly one JSON line with the deep link…
+    const { url } = JSON.parse(stdoutLine);
+    assert.match(url, /present\/github\/immediately-run\/todo\/main\/#.*ir-dev-region=panel\.files/);
+    // …and the warning rides stderr, naming the region and the fix.
+    assert.ok(stderrText.includes('panel.files'), 'warning names the region');
+    assert.ok(stderrText.includes('invisibly'), 'warning says what happens');
+    assert.ok(stderrText.includes('edit/'), 'warning names the fix');
+  } finally {
+    proc.kill('SIGKILL');
+  }
+});
+
+test('R3-867 rounds 1-2: chrome is every kind but page.* and stage.*', () => {
+  // the host registry's real chrome kinds all warn on a present route —
+  // panel.*, modal.*, mainpane.*, widget.*, task.* (round-2 finding:
+  // enumerating two left the rest silently trapped)
+  for (const region of ['panel.files', 'modal.contribute', 'mainpane.tools', 'widget.theme', 'task.review']) {
+    assert.ok(
+      regionPreviewWarning(region, 'present/github/acme/notes/main/') !== null,
+      `${region} is chrome — must warn`,
+    );
+  }
+  // stage.* is where a present route's previewed app MOUNTS — the rule does
+  // not hold there (round-1 finding), and a page.* region IS the page
+  assert.equal(regionPreviewWarning('stage.main', 'present/github/acme/notes/main/'), null);
+  assert.equal(regionPreviewWarning('page.landing', 'present/github/acme/notes/main/'), null);
 });
