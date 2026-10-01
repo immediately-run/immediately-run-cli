@@ -5,7 +5,12 @@
  *
  * An operator/CI runs this to pre-grant an app's capabilities + net:fetch hosts
  * (and mounts) so a later headless/`immediately.run dev`/CI run boots with NO
- * consent modal. It is a THIN token-authenticated HTTP client: it POSTs the
+ * consent modal. The PRINCIPAL (decided 2026-10-01, R3-795): the operator's own
+ * account, carrying the 'operator' Firebase custom claim — the token passed here
+ * is still a user token, and once the backend's PREAUTH_OPERATOR_REQUIRED is on,
+ * the backend refuses any token without the claim (the claim is minted by the
+ * backend's 'npm run set-operator-claim -- --uid=<operatorUid>'). It is a THIN
+ * token-authenticated HTTP client: it POSTs the
  * policy to the backend `POST /api/v1/preauth` executor, which runs the ONE §8.9
  * target check + mint path site-main's in-browser M1 uses. The CLI holds no
  * Firestore creds and no grant logic of its own — it cannot mint anything the
@@ -54,7 +59,14 @@ Options:
   --net-fetch <o1,o2>       Comma-separated net:fetch host ORIGINS to pre-grant
                             (overrides the policy file's netFetchHosts).
   --token <idToken>         Firebase ID token of the signed-in user the grant is
-                            minted for (or set ${ID_TOKEN_ENV}).
+                            minted for (or set ${ID_TOKEN_ENV}). This is the
+                            OPERATOR'S OWN token: when the backend enforces the
+                            operator gate (PREAUTH_OPERATOR_REQUIRED=1), the
+                            account this token belongs to must carry the
+                            'operator' custom claim or the backend answers 403.
+                            An operator mints the claim on their account once:
+                            in immediately-run-backend, 'npm run
+                            set-operator-claim -- --uid=<operatorUid>'.
   --origin <url>            immediately.run origin to POST to and attest as
                             (default: ${DEFAULT_ORIGIN}). Only immediately.run,
                             loopback, and preview origins are accepted without
