@@ -1198,3 +1198,71 @@ test('resolveDevLlmConfig: custom auth header/scheme pass through (incl. raw)', 
   assert.equal(cfg.upstream.authHeader, 'x-api-key');
   assert.equal(cfg.upstream.authScheme, '');
 });
+
+test('R3-867: dev --region panel.files --preview owner/repo WARNS on stderr (the wiring, not just the decision)', async () => {
+  // The decision (regionPreviewWarning) is unit-tested above; this drives the
+  // REAL trigger — a dev invocation whose --preview resolves to a present
+  // route — and observes the emission, so a wiring regression (e.g. passing
+  // the raw flag instead of the parsed path) cannot ship with a green suite.
+  const proc = spawn(
+    process.execPath,
+    [
+      CLI_ENTRY,
+      'dev',
+      root,
+      '--json',
+      '--port',
+      '0',
+      '--origin',
+      ORIGIN,
+      '--region',
+      'panel.files',
+      '--preview',
+      'immediately-run/todo',
+    ],
+    { stdio: ['ignore', 'pipe', 'pipe'] },
+  );
+  try {
+    const { stdoutLine, stderrText } = await new Promise((resolve, reject) => {
+      let out = '';
+      let err = '';
+      let line = null;
+      proc.stdout.on('data', (c) => {
+        out += c;
+        const nl = out.indexOf('\n');
+        if (nl !== -1) line = out.slice(0, nl);
+      });
+      proc.stderr.on('data', (c) => {
+        err += c;
+      });
+      proc.on('error', reject);
+      const t = setInterval(() => {
+        if (line !== null && (err.includes('invisibly') || err.length > 4000)) {
+          clearInterval(t);
+          resolve({ stdoutLine: line, stderrText: err });
+        }
+      }, 25);
+      setTimeout(() => {
+        clearInterval(t);
+        reject(new Error(`no JSON line + warning within 8s (stderr: ${err.slice(0, 300)})`));
+      }, 8000);
+    });
+    // stdout stays machine-readable: exactly one JSON line with the deep link…
+    const { url } = JSON.parse(stdoutLine);
+    assert.match(url, /present\/github\/immediately-run\/todo\/main\/#.*ir-dev-region=panel\.files/);
+    // …and the warning rides stderr, naming the region and the fix.
+    assert.ok(stderrText.includes('panel.files'), 'warning names the region');
+    assert.ok(stderrText.includes('invisibly'), 'warning says what happens');
+    assert.ok(stderrText.includes('edit/'), 'warning names the fix');
+  } finally {
+    proc.kill('SIGKILL');
+  }
+});
+
+test('R3-867 round-1: the warning covers the established chrome kinds only', () => {
+  // modal.* is chrome — warns on a present route
+  assert.ok(regionPreviewWarning('modal.share', 'present/github/acme/notes/main/') !== null);
+  // stage.* is where a present route's previewed app MOUNTS — the rule is not
+  // established for it, so no warning (round-1 finding: don't sweep it in)
+  assert.equal(regionPreviewWarning('stage.main', 'present/github/acme/notes/main/'), null);
+});

@@ -60,7 +60,7 @@ Options:
   --origin-unsafe           Allow an --origin outside the recognized set
                             (the per-session token still gates every request)
   --region <regionId>       Serve the working tree as a UI region (e.g.
-                            panel.files, page.landing, the editor) instead of the
+                            panel.files, modal.share, page.landing) instead of the
                             previewed app; the preview then loads from GitHub (§6.8).
   --preview <locator>       With --region, the GitHub app to preview:
                             owner/repo[@ref] (a present route) or a verbatim
@@ -238,19 +238,30 @@ export const parsePreviewPath = (spec: string): string => {
   return `present/github/${owner}/${repo}/${ref}/`;
 };
 
+const isPageRegion = (region: string): boolean => region.startsWith('page.');
+
 // When `--preview` is omitted, pick a default route that actually SHOWS the
 // overridden region: editor-chrome regions (panel.*, modal.*, …) only render inside
 // an /edit/ view, so default to a blank editor (`edit/new`); a full-page `page.*`
 // region IS the page, so the host's default landing (empty path) shows it.
 export const defaultPreviewPath = (region: string): string =>
-  region.startsWith('page.') ? '' : 'edit/new';
+  isPageRegion(region) ? '' : 'edit/new';
+
+// The page/chrome taxonomy, ONE home (R6): a `page.*` region IS the page a
+// present route shows; the established chrome kinds are panel.* and modal.*
+// (the spec's 2026-10-01 route-correction note). `stage.*` is deliberately NOT
+// swept in — the stage is where a present route's previewed app mounts, so a
+// stage override there is plausibly VISIBLE and the rule is not established
+// for it (round-1 finding: warn only for what the rule covers).
+const isChromeRegion = (region: string): boolean =>
+  region.startsWith('panel.') || region.startsWith('modal.');
 
 // R3-867 — a present route renders NO editor-chrome region, so a `panel.*`
-// (or `modal.*`, …) override on one loads invisibly: the dev server serves the
+// (or `modal.*`) override on one loads invisibly: the dev server serves the
 // tree, the host binds the region, and nothing appears — the exact trap §6.8's
 // original worked example fell into. Pure so the warning is unit-testable.
 export const regionPreviewWarning = (region: string, previewPath: string): string | null => {
-  if (region.startsWith('page.')) return null; // a page.* region IS the present page
+  if (!isChromeRegion(region)) return null;
   if (!previewPath.startsWith('present/')) return null;
   return (
     `warning: --region ${region} on a present route loads invisibly — present mode renders no ` +
@@ -329,8 +340,9 @@ export const runDev = async (args: ParsedArgs): Promise<number> => {
   }
 
   // §6.8: serve the working tree as a UI *region* (not the previewed app). The
-  // preview then loads from GitHub; --preview selects it (default: platform
-  // landing). --preview without --region is meaningless and refused.
+  // preview then loads from GitHub; --preview selects it (default: edit/new for
+  // chrome regions, the platform landing for page.*). --preview without
+  // --region is meaningless and refused.
   const region = flagValue(args.flags, 'region');
   const previewFlag = flagValue(args.flags, 'preview');
   if (previewFlag !== undefined && region === undefined) {
