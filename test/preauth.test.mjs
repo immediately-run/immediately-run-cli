@@ -8,6 +8,7 @@ import {
   preAuthUrl,
   reportOutcome,
   PREAUTH_USAGE,
+  OPERATOR_CLAIM_MINT_CMD,
   ID_TOKEN_ENV,
 } from '../dist/commands/preauth.js';
 
@@ -183,4 +184,16 @@ test('preauth --help documents the policy shape and the --origin override', asyn
   assert.ok(help.includes('--policy'));
   assert.ok(help.includes('--origin'));
   assert.ok(help.includes('capabilities'));
+});
+
+test('preauth --help documents the operator principal (R3-795)', async () => {
+  const { deps, log } = baseDeps();
+  const code = await runPreAuth(parseArgs(['--help']), deps);
+  assert.equal(code, 0);
+  const help = log.out.join('\n');
+  // The rendered help — not the constant it was built from — must name the
+  // principal, the 403 consequence, and the one-time mint command.
+  assert.ok(help.includes('OPERATOR'), 'the help names the operator principal');
+  assert.ok(/answers 403/.test(help), 'the help names the 403 consequence');
+  assert.ok(help.includes(OPERATOR_CLAIM_MINT_CMD), 'the help carries the exact mint command');
 });

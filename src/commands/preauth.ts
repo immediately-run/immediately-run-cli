@@ -8,8 +8,8 @@
  * consent modal. The PRINCIPAL (decided 2026-10-01, R3-795): the operator's own
  * account, carrying the 'operator' Firebase custom claim — the token passed here
  * is still a user token, and once the backend's PREAUTH_OPERATOR_REQUIRED is on,
- * the backend refuses any token without the claim (the claim is minted by the
- * backend's 'npm run set-operator-claim -- --uid=<operatorUid>'). It is a THIN
+ * the backend refuses any token without the claim (minted by the backend's
+ * OPERATOR_CLAIM_MINT_CMD below). It is a THIN
  * token-authenticated HTTP client: it POSTs the
  * policy to the backend `POST /api/v1/preauth` executor, which runs the ONE §8.9
  * target check + mint path site-main's in-browser M1 uses. The CLI holds no
@@ -34,6 +34,11 @@ const API_PREFIX = '/api/v1';
 /** The env var an operator/CI sets to supply the Firebase ID token (the backend
  *  verifies it like `/net-fetch`), as an alternative to `--token`. */
 export const ID_TOKEN_ENV = 'IMMEDIATELY_RUN_ID_TOKEN';
+
+/** The one spelling of the backend-side command that mints the operator claim
+ *  (R3-795's decision) — the string R3-894's operator copies, so it lives once
+ *  and the usage interpolates it. */
+export const OPERATOR_CLAIM_MINT_CMD = "npm run set-operator-claim -- --uid=<operatorUid>";
 
 export const PREAUTH_USAGE = `Usage: immediately.run preauth <app> [options]
 
@@ -64,9 +69,8 @@ Options:
                             operator gate (PREAUTH_OPERATOR_REQUIRED=1), the
                             account this token belongs to must carry the
                             'operator' custom claim or the backend answers 403.
-                            An operator mints the claim on their account once:
-                            in immediately-run-backend, 'npm run
-                            set-operator-claim -- --uid=<operatorUid>'.
+                            An operator mints the claim on their account once,
+                            in immediately-run-backend: ${OPERATOR_CLAIM_MINT_CMD}.
   --origin <url>            immediately.run origin to POST to and attest as
                             (default: ${DEFAULT_ORIGIN}). Only immediately.run,
                             loopback, and preview origins are accepted without
