@@ -36,8 +36,9 @@ const API_PREFIX = '/api/v1';
 export const ID_TOKEN_ENV = 'IMMEDIATELY_RUN_ID_TOKEN';
 
 /** The one spelling of the backend-side command that mints the operator claim
- *  (R3-795's decision) — the string R3-894's operator copies, so it lives once
- *  and the usage interpolates it. */
+ *  (R3-795's decision), in src — the string R3-894's operator copies; the usage
+ *  interpolates it, and the README's copy is pinned to it by test (the two
+ *  homes cannot drift silently). */
 export const OPERATOR_CLAIM_MINT_CMD = "npm run set-operator-claim -- --uid=<operatorUid>";
 
 export const PREAUTH_USAGE = `Usage: immediately.run preauth <app> [options]

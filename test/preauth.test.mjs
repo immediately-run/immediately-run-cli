@@ -1,4 +1,5 @@
 import { test } from 'node:test';
+import { readFile } from 'node:fs/promises';
 import assert from 'node:assert/strict';
 
 import { parseArgs } from '../dist/args.js';
@@ -195,5 +196,17 @@ test('preauth --help documents the operator principal (R3-795)', async () => {
   // principal, the 403 consequence, and the one-time mint command.
   assert.ok(help.includes('OPERATOR'), 'the help names the operator principal');
   assert.ok(/answers 403/.test(help), 'the help names the 403 consequence');
-  assert.ok(help.includes(OPERATOR_CLAIM_MINT_CMD), 'the help carries the exact mint command');
+  // The const assertion only pins the interpolation wiring; the VALUE is
+  // pinned by the typed literal beside it (a typo'd const must fail here).
+  assert.ok(help.includes(OPERATOR_CLAIM_MINT_CMD), 'the help interpolates the mint-command const');
+  assert.ok(
+    help.includes('set-operator-claim -- --uid=<operatorUid>'),
+    'the help carries the real mint command, spelled out',
+  );
+});
+
+test('the README documents the same operator principal and mint command (R3-795)', async () => {
+  const readme = await readFile(new URL('../README.md', import.meta.url), 'utf8');
+  assert.ok(/operator's own/i.test(readme), 'README names the operator principal');
+  assert.ok(readme.includes('set-operator-claim -- --uid=<operatorUid>'), 'README carries the mint command');
 });
