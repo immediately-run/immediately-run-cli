@@ -63,9 +63,13 @@ Options:
                             panel.files, page.landing, the editor) instead of the
                             previewed app; the preview then loads from GitHub (§6.8).
   --preview <locator>       With --region, the GitHub app to preview:
-                            owner/repo[@ref] or a verbatim present/… route.
-                            Default: a blank editor (edit/new) for chrome regions
-                            (panel.*, modal.*); the platform landing for page.*.
+                            owner/repo[@ref] (a present route) or a verbatim
+                            present/… or edit/… route. Chrome regions
+                            (panel.*, modal.*) render only in edit views — a
+                            present route with one loads invisibly (R3-867), so
+                            prefer edit/… there. Default: a blank editor
+                            (edit/new) for chrome regions; the platform landing
+                            for page.*.
   --llm-url <baseUrl>       Enable the localhost LLM proxy: forward llm.chat to this
                             single OpenAI-compatible upstream (the host appends
                             /v1/chat/completions), with the key injected server-side
@@ -241,6 +245,20 @@ export const parsePreviewPath = (spec: string): string => {
 export const defaultPreviewPath = (region: string): string =>
   region.startsWith('page.') ? '' : 'edit/new';
 
+// R3-867 — a present route renders NO editor-chrome region, so a `panel.*`
+// (or `modal.*`, …) override on one loads invisibly: the dev server serves the
+// tree, the host binds the region, and nothing appears — the exact trap §6.8's
+// original worked example fell into. Pure so the warning is unit-testable.
+export const regionPreviewWarning = (region: string, previewPath: string): string | null => {
+  if (region.startsWith('page.')) return null; // a page.* region IS the present page
+  if (!previewPath.startsWith('present/')) return null;
+  return (
+    `warning: --region ${region} on a present route loads invisibly — present mode renders no ` +
+    `${region} panel. Use --preview edit/… (or drop --preview: chrome regions default to ` +
+    `edit/new).`
+  );
+};
+
 // §6.8 flipped deep link: the PATH is the previewed (GitHub) app — or empty for
 // the host default landing — and the local source rides the fragment as a
 // dev-override directive (`ir-dev-region`/`ir-dev-source`) alongside the §6.4
@@ -329,6 +347,10 @@ export const runDev = async (args: ParsedArgs): Promise<number> => {
       : region !== undefined
         ? defaultPreviewPath(region)
         : '';
+  // R3-867: name the invisible-override trap instead of serving it silently.
+  const previewWarn =
+    region !== undefined ? regionPreviewWarning(region, previewPath) : null;
+  if (previewWarn !== null) console.error(previewWarn);
 
   // Per-session secret: any web page can fetch the dev server, so every request
   // must present this token (spec §8) — the load-bearing control on both binds.

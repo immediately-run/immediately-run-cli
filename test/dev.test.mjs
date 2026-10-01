@@ -30,6 +30,7 @@ import {
   buildRegionDeepLink,
   parsePreviewPath,
   defaultPreviewPath,
+  regionPreviewWarning,
   identityHash8,
   isRecognizedOrigin,
   resolveDevLlmConfig,
@@ -338,6 +339,20 @@ test('unit: defaultPreviewPath picks edit/new for chrome regions, landing for pa
   assert.equal(defaultPreviewPath('modal.share'), 'edit/new');
   // a full-page region IS the page → host default landing (empty path)
   assert.equal(defaultPreviewPath('page.landing'), '');
+});
+
+test('unit: regionPreviewWarning names the invisible-override trap (R3-867)', () => {
+  // a panel.* region on a present route loads invisibly — the §6.8 trap
+  const w = regionPreviewWarning('panel.files', 'present/github/immediately-run/todo/main/');
+  assert.ok(w && w.includes('panel.files') && w.includes('invisibly') && w.includes('edit/'));
+  // the owner/repo --preview form resolves to a present route → same warning
+  const w2 = regionPreviewWarning('panel.files', parsePreviewPath('immediately-run/todo'));
+  assert.ok(w2 && w2.includes('invisibly'));
+  // an edit route is fine — the region renders there
+  assert.equal(regionPreviewWarning('panel.files', 'edit/new'), null);
+  assert.equal(regionPreviewWarning('panel.files', 'edit/github/acme/notes/main/'), null);
+  // a page.* region IS the present page — no warning
+  assert.equal(regionPreviewWarning('page.landing', 'present/github/acme/notes/main/'), null);
 });
 
 test('unit: parsePreviewPath rejects a malformed locator (§6.8)', () => {
