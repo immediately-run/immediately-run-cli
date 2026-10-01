@@ -1259,10 +1259,18 @@ test('R3-867: dev --region panel.files --preview owner/repo WARNS on stderr (the
   }
 });
 
-test('R3-867 round-1: the warning covers the established chrome kinds only', () => {
-  // modal.* is chrome — warns on a present route
-  assert.ok(regionPreviewWarning('modal.share', 'present/github/acme/notes/main/') !== null);
-  // stage.* is where a present route's previewed app MOUNTS — the rule is not
-  // established for it, so no warning (round-1 finding: don't sweep it in)
+test('R3-867 rounds 1-2: chrome is every kind but page.* and stage.*', () => {
+  // the host registry's real chrome kinds all warn on a present route —
+  // panel.*, modal.*, mainpane.*, widget.*, task.* (round-2 finding:
+  // enumerating two left the rest silently trapped)
+  for (const region of ['panel.files', 'modal.contribute', 'mainpane.tools', 'widget.theme', 'task.review']) {
+    assert.ok(
+      regionPreviewWarning(region, 'present/github/acme/notes/main/') !== null,
+      `${region} is chrome — must warn`,
+    );
+  }
+  // stage.* is where a present route's previewed app MOUNTS — the rule does
+  // not hold there (round-1 finding), and a page.* region IS the page
   assert.equal(regionPreviewWarning('stage.main', 'present/github/acme/notes/main/'), null);
+  assert.equal(regionPreviewWarning('page.landing', 'present/github/acme/notes/main/'), null);
 });
