@@ -30,6 +30,8 @@ jobs:
       # Trusted publishing requires npm >= 11.5.1
       - run: npm install -g npm@11
       - run: npm ci
+      # R3-869 — the manifest↔lock version sync.
+      - run: npm run check:lock-version
       - run: npm test
       - run: npm run build
       # The determinism proof the payload-parity gate rests on (R3-756) — a gate
