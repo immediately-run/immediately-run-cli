@@ -87,6 +87,15 @@ environment variable. The endpoint is `https://immediately.run` by default
 (`--origin` to override; non-immediately.run/loopback/preview origins need
 `--origin-unsafe`).
 
+**The operator principal** (decided 2026-10-01, TRUST_AND_SAFETY TS-13): the
+token is the **operator's own** ID token. Once the backend enforces the operator
+gate (`PREAUTH_OPERATOR_REQUIRED=1`), the account behind the token must carry
+the `operator` Firebase custom claim or the backend answers 403. An operator
+mints the claim on their own account once, in the
+[`immediately-run-backend`](https://github.com/immediately-run/immediately-run-backend)
+repo: `npm run set-operator-claim -- --uid=<operatorUid>`. See
+`preauth --help` for the same note in the command itself.
+
 **Security:** an over-broad (broad-elevated) or unknown capability makes the
 backend refuse the **whole** policy (HTTP 422) and mint **nothing** — the command
 prints each `{capability, reason}` and **exits non-zero**, so a CI step fails on a
