@@ -146,6 +146,11 @@ export interface CacheZipResult {
   // Human-readable bundled-package outcome: "<n> packages, <bytes>", "omitted
   // (not requested)", or "omitted (<reason>)".
   bundledPackagesSummary: string;
+  // The same two outcomes as data, for a caller that must decide on them rather than
+  // print them: how many dependencies the committed package.json declares, and how
+  // many packages were bundled (null when the bundle was omitted, for any reason).
+  declaredDependencyCount: number;
+  bundledPackageCount: number | null;
 }
 
 // Modules the app resolves from a self-hosted/registry source at its pinned
@@ -577,6 +582,8 @@ export const buildCacheZip = async (opts: CacheZipOptions): Promise<CacheZipResu
     mdxMetadataSummary,
     locksetSummary,
     bundledPackagesSummary,
+    declaredDependencyCount: Object.keys(headDependencies(repo).deps).length,
+    bundledPackageCount: packages ? packages.length : null,
   };
 };
 
