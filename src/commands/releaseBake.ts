@@ -148,12 +148,45 @@ export interface BakeOptions {
   /** Overrides `https://github.com/<ns>/<repo>.git` (tests bake against a
    *  local `file://` fixture). */
   remoteUrl?: string;
+  /** Module CDN root for the lockset and bundled packages (tests point it at
+   *  a dead port so the bake resolves from the checkout alone). */
+  cdnRoot?: string;
 }
+
+/** Populate the checkout's `node_modules` the way `cache.yml` does before it
+ *  runs `cache-zip`: the builder fills the CDN's gaps from the installed tree,
+ *  and a registry zip must not be thinner than the app repo's own Pages zip.
+ *  Conditional on a lockfile and non-fatal here — a failed install leaves the
+ *  builder on the CDN, and `ensureZip` refuses the zip if that leaves it
+ *  without its packages. `--ignore-scripts`: this populates a directory, it
+ *  never runs a pinned repo's postinstall on the runner that pushes the
+ *  registry. Returns whether an install ran and succeeded. */
+export const installDependencies = (checkout: string): boolean => {
+  if (!existsSync(join(checkout, 'package-lock.json'))) return false;
+  try {
+    execFileSync('npm', ['ci', '--ignore-scripts', '--no-audit', '--no-fund'], {
+      cwd: checkout,
+      stdio: ['ignore', 'ignore', 'pipe'],
+    });
+    return true;
+  } catch (err) {
+    // execFileSync's message is only the command line; npm's reason is on stderr.
+    const stderr = String((err as { stderr?: unknown }).stderr ?? '').trim();
+    // npm states the cause first and its usage text last, so the head is the useful part.
+    const said = stderr.split('\n').filter((line) => line.replace(/^npm (error|ERR!)/, '').trim() !== '');
+    const reason = said.length ? said.slice(0, 4).join(' | ') : err instanceof Error ? err.message : String(err);
+    console.warn(`pin-release bake: npm ci failed in ${checkout} (${reason}); falling back to the package CDN`);
+    return false;
+  }
+};
 
 /** Ensure the registry zip for one lock entry exists, building it only when
  *  absent. A resident zip is VALIDATED then reused (never rebuilt — §3.4
  *  content-addressing); a new build lands ATOMICALLY (temp file + rename), so
- *  an interrupted bake can never leave a truncated zip at the final path. */
+ *  an interrupted bake can never leave a truncated zip at the final path.
+ *  Because a resident zip is never rebuilt, a build whose packages could not be
+ *  bundled is refused rather than landed: the path stays absent and the next
+ *  run retries, where landing it would serve the thin zip for good. */
 export const ensureZip = async (dir: string, entry: ReleaseLockEntry, opts: BakeOptions = {}): Promise<BakeResult> => {
   const bakeable = parseBakeableRepoId(entry.repo);
   if (!bakeable) {
@@ -171,7 +204,8 @@ export const ensureZip = async (dir: string, entry: ReleaseLockEntry, opts: Bake
   // content-addressed path must only ever hold a complete zip.
   const staging = `${path}.baking-${process.pid}-${Date.now().toString(36)}`;
   try {
-    await buildCacheZip({
+    installDependencies(checkout);
+    const built = await buildCacheZip({
       repoPath: checkout,
       owner: ns,
       repository: repo,
@@ -180,7 +214,19 @@ export const ensureZip = async (dir: string, entry: ReleaseLockEntry, opts: Bake
       ref: entry.commit,
       defaultBranch: remoteDefaultBranch(ns, repo, opts.remoteUrl),
       out: staging,
+      // The same bundling as `cache.yml`'s `--bundle-packages`: without it a
+      // cold boot on a pinned release fetches every dependency live.
+      bundlePackages: true,
+      cdnRoot: opts.cdnRoot,
     });
+    if (built.declaredDependencyCount > 0 && built.bundledPackageCount === null) {
+      const n = built.declaredDependencyCount;
+      throw new Error(
+        `pin-release bake: ${ns}/${repo}@${entry.commit} declares ${n} ${n === 1 ? 'dependency' : 'dependencies'} ` +
+          `but none were bundled (lockset: ${built.locksetSummary}; bundled pkgs: ${built.bundledPackagesSummary}) — ` +
+          'not landing a zip that would be reused without them; re-run the bake if that cause was transient',
+      );
+    }
     renameSync(staging, path);
   } finally {
     rmSync(checkout, { recursive: true, force: true });

@@ -5,11 +5,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, statSync, readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, statSync, readFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
-import { bakeSet, ensureZip, materializeCommit } from '../dist/commands/releaseBake.js';
+import { bakeSet, ensureZip, installDependencies, materializeCommit } from '../dist/commands/releaseBake.js';
+import { bakeCommittedLocks, runPinRelease } from '../dist/commands/pinRelease.js';
+import { parseArgs } from '../dist/args.js';
+import { buildIndex, resolveLock, serializeIndex, serializeLock } from '../dist/release.js';
 
 // The bake leg shells out to `git` AND `zip` (the CLI's documented runner
 // dependencies — cacheZipBase.test.mjs has the same requirement). A machine
@@ -195,5 +199,283 @@ describeBake('validateResidentZip: each sidecar failure leg aborts with its name
     );
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// A registry zip must carry the same pre-bundled dependencies as the app repo's
+// own `cache.yml` zip, or a cold boot on a pinned release fetches them live.
+//
+// Everything below is offline. The fixture app declares `tiny-dep@1.0.0` by
+// version, and its lockfile resolves that to a tarball committed in the repo
+// (`file:vendor/…`), so `npm ci` — the real one, as the bake runs it — installs
+// it with no registry. The CDN root is a dead port, so whatever is bundled came
+// from the installed tree and this CLI's own platform-provided tree.
+const DEAD_CDN = 'http://127.0.0.1:9';
+const hasNpm = hasBinary('npm');
+
+/** A bare remote holding one commit of an app that depends on `tiny-dep`.
+ *  `lock: 'good'` commits a lockfile npm can install offline, `'corrupt'` one it
+ *  cannot parse, `'none'` no lockfile. `node_modules` is never committed. */
+const makeAppRemote = (lock) => {
+  const work = mkdtempSync(join(tmpdir(), 'ir-bake-deps-work-'));
+  const bare = mkdtempSync(join(tmpdir(), 'ir-bake-deps-bare-'));
+  const dep = mkdtempSync(join(tmpdir(), 'ir-bake-deps-dep-'));
+  const g = (args) => execFileSync('git', ['-C', work, ...args], { stdio: 'pipe' });
+  g(['init', '-q', '-b', 'main']);
+  g(['config', 'user.email', 'test@example.com']);
+  g(['config', 'user.name', 'Test']);
+  writeFileSync(join(work, 'index.tsx'), "import dep from 'tiny-dep';\nexport const x = dep;\n");
+  const root = { name: 'app', version: '1.0.0', dependencies: { 'tiny-dep': '1.0.0' } };
+  writeFileSync(join(work, 'package.json'), JSON.stringify(root));
+  if (lock === 'good') {
+    writeFileSync(join(dep, 'package.json'), JSON.stringify({ name: 'tiny-dep', version: '1.0.0', main: 'index.js' }));
+    writeFileSync(join(dep, 'index.js'), 'module.exports = 1;\n');
+    mkdirSync(join(work, 'vendor'));
+    execFileSync('npm', ['pack', '--silent', '--pack-destination', join(work, 'vendor')], { cwd: dep, stdio: 'pipe' });
+    const tgz = readFileSync(join(work, 'vendor/tiny-dep-1.0.0.tgz'));
+    writeFileSync(
+      join(work, 'package-lock.json'),
+      JSON.stringify({
+        name: 'app',
+        version: '1.0.0',
+        lockfileVersion: 3,
+        requires: true,
+        packages: {
+          '': root,
+          'node_modules/tiny-dep': {
+            version: '1.0.0',
+            resolved: 'file:vendor/tiny-dep-1.0.0.tgz',
+            integrity: `sha512-${createHash('sha512').update(tgz).digest('base64')}`,
+          },
+        },
+      }),
+    );
+  } else if (lock === 'corrupt') {
+    writeFileSync(join(work, 'package-lock.json'), '{ this is not a lockfile');
+  }
+  g(['add', '.']);
+  g(['commit', '-q', '-m', 'app with a dependency']);
+  const commit = g(['rev-parse', 'HEAD']).toString().trim();
+  execFileSync('git', ['clone', '-q', '--bare', work, bare]);
+  rmSync(work, { recursive: true, force: true });
+  rmSync(dep, { recursive: true, force: true });
+  return { url: `file://${bare}`, bare, commit };
+};
+
+const bundledIn = (zip) =>
+  execFileSync('unzip', ['-Z1', zip], { encoding: 'utf8' })
+    .split('\n')
+    .filter((p) => p.startsWith('.immediately.run/packages/') && !p.endsWith('/'));
+
+const captureWarnings = (fn) => {
+  const seen = [];
+  const original = console.warn;
+  console.warn = (...args) => seen.push(args.join(' '));
+  try {
+    fn();
+  } finally {
+    console.warn = original;
+  }
+  return seen;
+};
+
+const testNpm = hasNpm ? test : test.skip;
+const describeBakeNpm = hasNpm ? describeBake : test.skip;
+
+testNpm('installDependencies: no lockfile is skipped, a lockfile is installed, a failed install warns with npm\'s reason', () => {
+  const none = makeAppRemote('none');
+  const good = makeAppRemote('good');
+  const corrupt = makeAppRemote('corrupt');
+  const checkouts = [];
+  try {
+    const at = (r) => {
+      const c = materializeCommit('ir', 'app', r.commit, r.url);
+      checkouts.push(c);
+      return c;
+    };
+    const plain = at(none);
+    assert.equal(installDependencies(plain), false);
+    assert.equal(existsSync(join(plain, 'node_modules')), false, 'no lockfile: nothing is installed');
+
+    const installable = at(good);
+    assert.equal(installDependencies(installable), true);
+    assert.equal(
+      JSON.parse(readFileSync(join(installable, 'node_modules/tiny-dep/package.json'), 'utf8')).version,
+      '1.0.0',
+    );
+
+    const broken = at(corrupt);
+    let result;
+    const warnings = captureWarnings(() => {
+      result = installDependencies(broken);
+    });
+    assert.equal(result, false, 'a failed install is non-fatal');
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /npm ci failed/);
+    // npm's own words, not just the command line execFileSync puts in err.message.
+    assert.match(warnings[0], /npm error|npm ERR!/);
+  } finally {
+    for (const d of [...checkouts, none.bare, good.bare, corrupt.bare]) rmSync(d, { recursive: true, force: true });
+  }
+});
+
+describeBakeNpm('ensureZip installs the pin\'s dependencies and bundles them under .immediately.run/packages/', async () => {
+  const { url, bare, commit } = makeAppRemote('good');
+  const dir = mkdtempSync(join(tmpdir(), 'ir-bake-deps-registry-'));
+  try {
+    // The default path: `install` is left on, and nothing is installed in the remote.
+    const r = await ensureZip(dir, { repo: 'github:ir/app', ref: 'main', commit }, { remoteUrl: url, cdnRoot: DEAD_CDN });
+    const bundled = bundledIn(r.path);
+    assert.ok(
+      bundled.some((p) => p.includes('tiny-dep')),
+      `the declared dependency is bundled; .immediately.run/packages/ holds: ${bundled.join(', ') || '(nothing)'}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(bare, { recursive: true, force: true });
+  }
+});
+
+describeBake('ensureZip refuses to land a zip whose declared dependencies were not bundled', async () => {
+  // No lockfile and no reachable CDN: nothing can supply `tiny-dep`. A resident zip is
+  // reused for good, so landing this one would serve the thin zip on every later run.
+  const { url, bare, commit } = makeAppRemote('none');
+  const dir = mkdtempSync(join(tmpdir(), 'ir-bake-thin-registry-'));
+  try {
+    const entry = { repo: 'github:ir/app', ref: 'main', commit };
+    await assert.rejects(
+      ensureZip(dir, entry, { remoteUrl: url, cdnRoot: DEAD_CDN }),
+      /declares 1 dependency but none were bundled/,
+    );
+    const zipDir = join(dir, 'zips/ir/app');
+    assert.deepEqual(existsSync(zipDir) ? readdirSync(zipDir) : [], [], 'neither the zip nor a staging file is left');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(bare, { recursive: true, force: true });
+  }
+});
+
+// `--bake-only` lands the zips of pins that already exist. It is the one path that
+// builds a zip without resolving a ref, so what it must not do matters as much as
+// what it does: no lock and no index may change.
+describeBake('bakeCommittedLocks bakes every committed lock\'s pins once, reuses resident zips, and writes nothing else', async () => {
+  const { url, first, second, bare } = makeRemote();
+  const dir = mkdtempSync(join(tmpdir(), 'ir-bake-only-registry-'));
+  try {
+    const lockOf = (id, apps) => serializeLock(resolveLock({ id, apps }, apps, (b) => b.commit));
+    // Two locks: `base` pins the first commit in two regions, `next` pins both commits.
+    const base = lockOf('base', { 'panel.a': `github:ir/app#${first}`, 'panel.b': `github:ir/app#${first}` });
+    const next = lockOf('next', { 'panel.a': `github:ir/app#${first}`, 'panel.b': `github:ir/app#${second}` });
+    writeFileSync(join(dir, 'base.lock.json'), base);
+    writeFileSync(join(dir, 'next.lock.json'), next);
+    const index = serializeIndex(buildIndex([{ id: 'base', lockText: base }, { id: 'next', lockText: next }]));
+    writeFileSync(join(dir, 'index.json'), index);
+
+    const bake = (d, entry) => ensureZip(d, entry, { remoteUrl: url, cdnRoot: DEAD_CDN });
+    assert.deepEqual(await bakeCommittedLocks(dir, bake), { baked: 2, reused: 0 });
+    assert.deepEqual(readdirSync(join(dir, 'zips/ir/app')).sort(), [`${first}.zip`, `${second}.zip`].sort());
+    // A second run finds both resident.
+    assert.deepEqual(await bakeCommittedLocks(dir, bake), { baked: 0, reused: 2 });
+    // One deleted zip is the only one built again.
+    rmSync(join(dir, 'zips/ir/app', `${second}.zip`));
+    assert.deepEqual(await bakeCommittedLocks(dir, bake), { baked: 1, reused: 1 });
+
+    assert.equal(readFileSync(join(dir, 'base.lock.json'), 'utf8'), base);
+    assert.equal(readFileSync(join(dir, 'next.lock.json'), 'utf8'), next);
+    assert.equal(readFileSync(join(dir, 'index.json'), 'utf8'), index);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(bare, { recursive: true, force: true });
+  }
+});
+
+test('bakeCommittedLocks stops at the first pin that cannot be baked', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ir-bake-only-fail-'));
+  try {
+    const a = 'a'.repeat(40);
+    const b = 'b'.repeat(40);
+    const apps = { 'panel.a': `github:ir/app#${a}`, 'panel.b': `github:ir/other#${b}` };
+    writeFileSync(join(dir, 'base.lock.json'), serializeLock(resolveLock({ id: 'base', apps }, apps, (x) => x.commit)));
+    const asked = [];
+    await assert.rejects(
+      bakeCommittedLocks(dir, async (_d, entry) => {
+        asked.push(entry.commit);
+        throw new Error(`cannot bake ${entry.commit}`);
+      }),
+      /cannot bake/,
+    );
+    assert.equal(asked.length, 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('pin-release --bake-only refuses the flags that contradict it', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ir-bake-only-flags-'));
+  const errors = [];
+  const original = console.error;
+  console.error = (...args) => errors.push(args.join(' '));
+  try {
+    for (const extra of [{ check: true }, { 'no-bake': true }, { dated: 'testing' }, { only: 'base' }, { channel: 'testing=base' }]) {
+      const code = await runPinRelease({ positionals: [], flags: { dir, 'bake-only': true, ...extra } });
+      assert.equal(code, 1, `--bake-only with ${Object.keys(extra)[0]} is refused`);
+    }
+    assert.equal(errors.length, 5);
+    for (const e of errors) assert.match(e, /--bake-only cannot be combined with/);
+  } finally {
+    console.error = original;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('--bake-only parses as a bare flag, and a valued form is refused rather than run as write mode', async () => {
+  // Registered as a boolean: the next token is the registry dir, not the flag's value.
+  assert.deepEqual(parseArgs(['--bake-only', 'releases']).flags, { 'bake-only': true });
+  assert.deepEqual(parseArgs(['--dir', 'r', '--bake-only']).flags, { dir: 'r', 'bake-only': true });
+  const dir = mkdtempSync(join(tmpdir(), 'ir-bake-only-valued-'));
+  const errors = [];
+  const original = console.error;
+  console.error = (...args) => errors.push(args.join(' '));
+  try {
+    const code = await runPinRelease({ positionals: [], flags: { dir, ...parseArgs(['--bake-only=true']).flags } });
+    assert.equal(code, 1);
+    assert.match(errors[0], /--bake-only takes no value/);
+  } finally {
+    console.error = original;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// The command itself, offline: a resident zip needs no remote, so both exits are reachable.
+describeBake('pin-release --bake-only: exit 0 over resident zips with nothing rewritten, exit 1 on a corrupt one', async () => {
+  const { url, first, bare } = makeRemote();
+  const dir = mkdtempSync(join(tmpdir(), 'ir-bake-only-cmd-'));
+  const logs = [];
+  const errors = [];
+  const original = { log: console.log, error: console.error };
+  console.log = (...args) => logs.push(args.join(' '));
+  console.error = (...args) => errors.push(args.join(' '));
+  try {
+    const authoring = { id: 'base', label: 'Default', apps: { 'panel.a': `github:ir/app#${first}` } };
+    const lock = serializeLock(resolveLock(authoring, authoring.apps, (b) => b.commit));
+    const index = serializeIndex(buildIndex([{ id: 'base', lockText: lock, label: 'Default' }]));
+    writeFileSync(join(dir, 'base.json'), JSON.stringify(authoring));
+    writeFileSync(join(dir, 'base.lock.json'), lock);
+    writeFileSync(join(dir, 'index.json'), index);
+    const zip = (await ensureZip(dir, { repo: 'github:ir/app', ref: 'main', commit: first }, { remoteUrl: url, cdnRoot: DEAD_CDN })).path;
+
+    assert.equal(await runPinRelease(parseArgs(['--dir', dir, '--bake-only'])), 0);
+    assert.match(logs.join('\n'), /0 baked, 1 reused \(no lock or index written\)/);
+    assert.equal(readFileSync(join(dir, 'base.lock.json'), 'utf8'), lock);
+    assert.equal(readFileSync(join(dir, 'index.json'), 'utf8'), index);
+
+    writeFileSync(zip, 'not a zip');
+    assert.equal(await runPinRelease(parseArgs(['--dir', dir, '--bake-only'])), 1);
+    assert.match(errors.join('\n'), /fails the zip magic check/);
+  } finally {
+    console.log = original.log;
+    console.error = original.error;
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(bare, { recursive: true, force: true });
   }
 });

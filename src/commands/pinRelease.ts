@@ -51,8 +51,9 @@ import {
   type ReleaseAuthoring,
   type ReleaseIndex,
   type ReleaseLock,
+  type ReleaseLockEntry,
 } from '../release.js';
-import { bakeSet, ensureZip, parseBakeableRepoId, validateResidentZip } from './releaseBake.js';
+import { bakeSet, ensureZip, parseBakeableRepoId, validateResidentZip, type BakeResult } from './releaseBake.js';
 
 /** The host's build-default manifest for the §6.1b strip lint (region → repo scope
  *  + first-party-only ceiling). Empty today: the registry's first-party-only set is
@@ -100,6 +101,9 @@ Options:
                           or the literal @dated for this run's --dated lock)
   --no-bake               Skip the §5 5a zip bake (authoring iterations; the
                           registry workflow never skips it)
+  --bake-only             Bake the zips of every committed lock and change
+                          nothing else: no ref is resolved, no lock or index is
+                          written (lands absent zips for existing pins)
   -h, --help              Show this help`;
 
 const COMMIT_RE = /^[0-9a-f]{40}$/i;
@@ -206,6 +210,36 @@ const readCommittedChannels = (dir: string): Record<string, string> => {
   }
 };
 
+type Bake = (dir: string, entry: ReleaseLockEntry) => Promise<BakeResult>;
+
+/** §5 5a — ensure the registry zip of every pin the given locks carry
+ *  (deduplicated; a resident zip is reused, never rebuilt). The first failure
+ *  propagates: a publish must not continue past a pin it could not bake. */
+export const bakeLocks = async (
+  dir: string,
+  locks: ReleaseLock[],
+  bake: Bake = ensureZip,
+): Promise<{ baked: number; reused: number }> => {
+  let baked = 0;
+  let reused = 0;
+  for (const entry of bakeSet(locks)) {
+    const r = await bake(dir, entry);
+    r.reused ? reused++ : baked++;
+  }
+  return { baked, reused };
+};
+
+/** `--bake-only`: bake the zips of every committed lock and change nothing
+ *  else — no ref is resolved, no lock or index is written. It is how absent
+ *  zips are landed for pins that already exist: after a bake was refused, or
+ *  when resident zips were deleted to be built again by a newer bake. */
+export const bakeCommittedLocks = (dir: string, bake: Bake = ensureZip): Promise<{ baked: number; reused: number }> =>
+  bakeLocks(
+    dir,
+    collectOrphanLocks(dir, new Set()).map((l) => JSON.parse(l.lockText) as ReleaseLock),
+    bake,
+  );
+
 /** Lock files in the dir whose names have no authoring present — the dated
  *  channel targets' immutable history. Read verbatim (label carried from the
  *  lock document itself, so the index rebuild reproduces it exactly); they are
@@ -291,6 +325,7 @@ export const runPinRelease = async (args: ParsedArgs): Promise<number> => {
   const datedId = flagValue(args.flags, 'dated');
   const onlyId = flagValue(args.flags, 'only');
   const noBake = args.flags['no-bake'] === true;
+  const bakeOnly = args.flags['bake-only'] === true;
   const channelRaw = flagValue(args.flags, 'channel');
 
   // A value-bearing flag present but BARE (`--channel` with no value) parses to
@@ -300,6 +335,23 @@ export const runPinRelease = async (args: ParsedArgs): Promise<number> => {
   for (const name of ['dir', 'dated', 'only', 'channel'] as const) {
     if (args.flags[name] === true) {
       console.error(`pin-release: --${name} requires a value`);
+      return 1;
+    }
+  }
+
+  // A --bake-only that did not parse to a bare flag (`--bake-only=true`) would
+  // fall through to write mode, which resolves refs and writes locks — the one
+  // thing the flag exists to avoid.
+  if (args.flags['bake-only'] !== undefined && !bakeOnly) {
+    console.error('pin-release: --bake-only takes no value');
+    return 1;
+  }
+  // --bake-only writes zips and nothing else, so a flag that asks for a lock,
+  // an index or no zips at all contradicts it; refusing beats ignoring one.
+  if (bakeOnly) {
+    const clash = (['check', 'no-bake', 'dated', 'only', 'channel'] as const).filter((n) => args.flags[n] !== undefined);
+    if (clash.length) {
+      console.error(`pin-release: --bake-only cannot be combined with ${clash.map((n) => `--${n}`).join(', ')}`);
       return 1;
     }
   }
@@ -358,6 +410,17 @@ export const runPinRelease = async (args: ParsedArgs): Promise<number> => {
   }
 
   if (check) return runCheck(dir, authoring);
+
+  if (bakeOnly) {
+    try {
+      const { baked, reused } = await bakeCommittedLocks(dir);
+      console.log(`pin-release: zips — ${baked} baked, ${reused} reused (no lock or index written)`);
+      return 0;
+    } catch (err) {
+      console.error(`pin-release: ${err instanceof Error ? err.message : String(err)}`);
+      return 1;
+    }
+  }
 
   // ---- write mode: resolve refs → commits, write locks, bake, rebuild index --
   const written: { id: string; lockText: string; label?: string }[] = [];
@@ -426,21 +489,16 @@ export const runPinRelease = async (args: ParsedArgs): Promise<number> => {
 
   // §5 5a — bake the registry zips for EVERY pin the index will carry
   // (deduplicated; existing paths reused, never rebuilt).
-  let baked = 0;
-  let reused = 0;
+  let zips = { baked: 0, reused: 0 };
   if (!noBake) {
-    const allLocks = [
-      ...written.map((w) => JSON.parse(w.lockText) as ReleaseLock),
-      ...orphans.map((o) => JSON.parse(o.lockText) as ReleaseLock),
-    ];
-    for (const entry of bakeSet(allLocks)) {
-      try {
-        const r = await ensureZip(dir, entry);
-        r.reused ? reused++ : baked++;
-      } catch (err) {
-        console.error(`pin-release: ${err instanceof Error ? err.message : String(err)}`);
-        return 1;
-      }
+    try {
+      zips = await bakeLocks(dir, [
+        ...written.map((w) => JSON.parse(w.lockText) as ReleaseLock),
+        ...orphans.map((o) => JSON.parse(o.lockText) as ReleaseLock),
+      ]);
+    } catch (err) {
+      console.error(`pin-release: ${err instanceof Error ? err.message : String(err)}`);
+      return 1;
     }
   }
 
@@ -453,7 +511,7 @@ export const runPinRelease = async (args: ParsedArgs): Promise<number> => {
   }
   if (orphans.length) console.log(`pin-release: kept ${orphans.length} historical lock(s) in the index`);
   for (const [c, t] of Object.entries(channels)) console.log(`  channel ${c} → ${t}`);
-  if (!noBake) console.log(`pin-release: zips — ${baked} baked, ${reused} reused`);
+  if (!noBake) console.log(`pin-release: zips — ${zips.baked} baked, ${zips.reused} reused`);
   return 0;
 };
 

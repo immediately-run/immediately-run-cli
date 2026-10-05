@@ -25,6 +25,7 @@ const BOOLEAN_FLAGS = new Set([
   'open',
   'no-lockset',
   'no-bake',
+  'bake-only',
   'bundle-packages',
   'check',
   'republish',
