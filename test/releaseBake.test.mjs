@@ -197,3 +197,47 @@ describeBake('validateResidentZip: each sidecar failure leg aborts with its name
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// R3-824 — a registry zip must carry the same pre-bundled dependencies as the
+// app repo's own `cache.yml` zip, or a cold boot on a pinned release fetches
+// them live. Offline: the dependency is committed into the fixture's
+// `node_modules` (so the materialized checkout has an installed tree) and the
+// CDN root is a dead port, so everything bundled comes from the checkout and
+// this CLI's own platform-provided tree.
+describeBake('ensureZip bundles packages (.immediately.run/packages/) for an app that declares dependencies', async () => {
+  const work = mkdtempSync(join(tmpdir(), 'ir-bake-deps-work-'));
+  const bare = mkdtempSync(join(tmpdir(), 'ir-bake-deps-bare-'));
+  const dir = mkdtempSync(join(tmpdir(), 'ir-bake-deps-registry-'));
+  try {
+    const g = (args) => execFileSync('git', ['-C', work, ...args], { stdio: 'pipe' });
+    g(['init', '-q', '-b', 'main']);
+    g(['config', 'user.email', 'test@example.com']);
+    g(['config', 'user.name', 'Test']);
+    writeFileSync(join(work, 'index.tsx'), "import dep from 'tiny-dep';\nexport const x = dep;\n");
+    writeFileSync(join(work, 'package.json'), JSON.stringify({ name: 'app', dependencies: { 'tiny-dep': '1.0.0' } }));
+    mkdirSync(join(work, 'node_modules/tiny-dep'), { recursive: true });
+    writeFileSync(
+      join(work, 'node_modules/tiny-dep/package.json'),
+      JSON.stringify({ name: 'tiny-dep', version: '1.0.0', main: 'index.js' }),
+    );
+    writeFileSync(join(work, 'node_modules/tiny-dep/index.js'), 'module.exports = 1;\n');
+    g(['add', '-f', '.']);
+    g(['commit', '-q', '-m', 'app with a dependency']);
+    const commit = g(['rev-parse', 'HEAD']).toString().trim();
+    execFileSync('git', ['clone', '-q', '--bare', work, bare]);
+
+    const r = await ensureZip(
+      dir,
+      { repo: 'github:ir/app', ref: 'main', commit },
+      { remoteUrl: `file://${bare}`, cdnRoot: 'http://127.0.0.1:9', install: false },
+    );
+    const listing = execFileSync('unzip', ['-Z1', r.path], { encoding: 'utf8' }).split('\n');
+    const bundled = listing.filter((p) => p.startsWith('.immediately.run/packages/') && !p.endsWith('/'));
+    assert.ok(
+      bundled.some((p) => p.includes('tiny-dep')),
+      `the declared dependency is bundled; .immediately.run/packages/ holds: ${bundled.join(', ') || '(nothing)'}`,
+    );
+  } finally {
+    for (const d of [work, bare, dir]) rmSync(d, { recursive: true, force: true });
+  }
+});

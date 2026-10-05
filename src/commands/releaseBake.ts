@@ -148,7 +148,35 @@ export interface BakeOptions {
   /** Overrides `https://github.com/<ns>/<repo>.git` (tests bake against a
    *  local `file://` fixture). */
   remoteUrl?: string;
+  /** Module CDN root for the lockset and bundled packages (tests point it at
+   *  a dead port so the bake resolves from the checkout alone). */
+  cdnRoot?: string;
+  /** Run `npm ci` in the materialized checkout before building (default true;
+   *  tests turn it off to stay offline). */
+  install?: boolean;
 }
+
+/** Populate the checkout's `node_modules` the way `cache.yml` does before it
+ *  runs `cache-zip` (R3-567): the builder fills the CDN's gaps from the
+ *  installed tree, and a registry zip must not be thinner than the app repo's
+ *  own Pages zip. NON-FATAL and conditional on a lockfile — a failed or absent
+ *  install leaves the builder on the CDN, exactly as in `cache.yml`.
+ *  `--ignore-scripts`: this populates a directory, it never runs a pinned
+ *  repo's postinstall on the runner that pushes the registry. */
+export const installDependencies = (checkout: string): void => {
+  if (!existsSync(join(checkout, 'package-lock.json'))) return;
+  try {
+    execFileSync('npm', ['ci', '--ignore-scripts', '--no-audit', '--no-fund'], {
+      cwd: checkout,
+      stdio: ['ignore', 'ignore', 'pipe'],
+    });
+  } catch (err) {
+    console.warn(
+      `pin-release bake: npm ci failed in ${checkout} (${err instanceof Error ? err.message.split('\n')[0] : String(err)}); ` +
+        'the zip falls back to the package CDN',
+    );
+  }
+};
 
 /** Ensure the registry zip for one lock entry exists, building it only when
  *  absent. A resident zip is VALIDATED then reused (never rebuilt — §3.4
@@ -171,6 +199,7 @@ export const ensureZip = async (dir: string, entry: ReleaseLockEntry, opts: Bake
   // content-addressed path must only ever hold a complete zip.
   const staging = `${path}.baking-${process.pid}-${Date.now().toString(36)}`;
   try {
+    if (opts.install !== false) installDependencies(checkout);
     await buildCacheZip({
       repoPath: checkout,
       owner: ns,
@@ -180,6 +209,10 @@ export const ensureZip = async (dir: string, entry: ReleaseLockEntry, opts: Bake
       ref: entry.commit,
       defaultBranch: remoteDefaultBranch(ns, repo, opts.remoteUrl),
       out: staging,
+      // The same bundling as `cache.yml`'s `--bundle-packages` (R3-824): without
+      // it a cold boot on a pinned release fetches every dependency live.
+      bundlePackages: true,
+      cdnRoot: opts.cdnRoot,
     });
     renameSync(staging, path);
   } finally {
