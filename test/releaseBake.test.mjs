@@ -12,6 +12,7 @@ import { dirname, join } from 'node:path';
 
 import { bakeSet, ensureZip, installDependencies, materializeCommit } from '../dist/commands/releaseBake.js';
 import { bakeCommittedLocks, runPinRelease } from '../dist/commands/pinRelease.js';
+import { parseArgs } from '../dist/args.js';
 import { buildIndex, resolveLock, serializeIndex, serializeLock } from '../dist/release.js';
 
 // The bake leg shells out to `git` AND `zip` (the CLI's documented runner
@@ -344,7 +345,7 @@ describeBake('ensureZip refuses to land a zip whose declared dependencies were n
     const entry = { repo: 'github:ir/app', ref: 'main', commit };
     await assert.rejects(
       ensureZip(dir, entry, { remoteUrl: url, cdnRoot: DEAD_CDN }),
-      /declares 1 dependencies but none were bundled/,
+      /declares 1 dependency but none were bundled/,
     );
     const zipDir = join(dir, 'zips/ir/app');
     assert.deepEqual(existsSync(zipDir) ? readdirSync(zipDir) : [], [], 'neither the zip nor a staging file is left');
@@ -424,5 +425,57 @@ test('pin-release --bake-only refuses the flags that contradict it', async () =>
   } finally {
     console.error = original;
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('--bake-only parses as a bare flag, and a valued form is refused rather than run as write mode', async () => {
+  // Registered as a boolean: the next token is the registry dir, not the flag's value.
+  assert.deepEqual(parseArgs(['--bake-only', 'releases']).flags, { 'bake-only': true });
+  assert.deepEqual(parseArgs(['--dir', 'r', '--bake-only']).flags, { dir: 'r', 'bake-only': true });
+  const dir = mkdtempSync(join(tmpdir(), 'ir-bake-only-valued-'));
+  const errors = [];
+  const original = console.error;
+  console.error = (...args) => errors.push(args.join(' '));
+  try {
+    const code = await runPinRelease({ positionals: [], flags: { dir, ...parseArgs(['--bake-only=true']).flags } });
+    assert.equal(code, 1);
+    assert.match(errors[0], /--bake-only takes no value/);
+  } finally {
+    console.error = original;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// The command itself, offline: a resident zip needs no remote, so both exits are reachable.
+describeBake('pin-release --bake-only: exit 0 over resident zips with nothing rewritten, exit 1 on a corrupt one', async () => {
+  const { url, first, bare } = makeRemote();
+  const dir = mkdtempSync(join(tmpdir(), 'ir-bake-only-cmd-'));
+  const logs = [];
+  const errors = [];
+  const original = { log: console.log, error: console.error };
+  console.log = (...args) => logs.push(args.join(' '));
+  console.error = (...args) => errors.push(args.join(' '));
+  try {
+    const authoring = { id: 'base', label: 'Default', apps: { 'panel.a': `github:ir/app#${first}` } };
+    const lock = serializeLock(resolveLock(authoring, authoring.apps, (b) => b.commit));
+    const index = serializeIndex(buildIndex([{ id: 'base', lockText: lock, label: 'Default' }]));
+    writeFileSync(join(dir, 'base.json'), JSON.stringify(authoring));
+    writeFileSync(join(dir, 'base.lock.json'), lock);
+    writeFileSync(join(dir, 'index.json'), index);
+    const zip = (await ensureZip(dir, { repo: 'github:ir/app', ref: 'main', commit: first }, { remoteUrl: url, cdnRoot: DEAD_CDN })).path;
+
+    assert.equal(await runPinRelease(parseArgs(['--dir', dir, '--bake-only'])), 0);
+    assert.match(logs.join('\n'), /0 baked, 1 reused \(no lock or index written\)/);
+    assert.equal(readFileSync(join(dir, 'base.lock.json'), 'utf8'), lock);
+    assert.equal(readFileSync(join(dir, 'index.json'), 'utf8'), index);
+
+    writeFileSync(zip, 'not a zip');
+    assert.equal(await runPinRelease(parseArgs(['--dir', dir, '--bake-only'])), 1);
+    assert.match(errors.join('\n'), /fails the zip magic check/);
+  } finally {
+    console.log = original.log;
+    console.error = original.error;
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(bare, { recursive: true, force: true });
   }
 });

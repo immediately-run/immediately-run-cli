@@ -151,9 +151,6 @@ export interface BakeOptions {
   /** Module CDN root for the lockset and bundled packages (tests point it at
    *  a dead port so the bake resolves from the checkout alone). */
   cdnRoot?: string;
-  /** Run `npm ci` in the materialized checkout before building (default true;
-   *  tests turn it off to stay offline). */
-  install?: boolean;
 }
 
 /** Populate the checkout's `node_modules` the way `cache.yml` does before it
@@ -207,7 +204,7 @@ export const ensureZip = async (dir: string, entry: ReleaseLockEntry, opts: Bake
   // content-addressed path must only ever hold a complete zip.
   const staging = `${path}.baking-${process.pid}-${Date.now().toString(36)}`;
   try {
-    if (opts.install !== false) installDependencies(checkout);
+    installDependencies(checkout);
     const built = await buildCacheZip({
       repoPath: checkout,
       owner: ns,
@@ -223,10 +220,11 @@ export const ensureZip = async (dir: string, entry: ReleaseLockEntry, opts: Bake
       cdnRoot: opts.cdnRoot,
     });
     if (built.declaredDependencyCount > 0 && built.bundledPackageCount === null) {
+      const n = built.declaredDependencyCount;
       throw new Error(
-        `pin-release bake: ${ns}/${repo}@${entry.commit} declares ${built.declaredDependencyCount} ` +
-          `dependencies but none were bundled (lockset: ${built.locksetSummary}; bundled pkgs: ` +
-          `${built.bundledPackagesSummary}) — not landing a zip that would be reused without them; re-run the bake`,
+        `pin-release bake: ${ns}/${repo}@${entry.commit} declares ${n} ${n === 1 ? 'dependency' : 'dependencies'} ` +
+          `but none were bundled (lockset: ${built.locksetSummary}; bundled pkgs: ${built.bundledPackagesSummary}) — ` +
+          'not landing a zip that would be reused without them; re-run the bake if that cause was transient',
       );
     }
     renameSync(staging, path);

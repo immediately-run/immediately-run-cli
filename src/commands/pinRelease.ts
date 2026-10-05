@@ -339,6 +339,13 @@ export const runPinRelease = async (args: ParsedArgs): Promise<number> => {
     }
   }
 
+  // A --bake-only that did not parse to a bare flag (`--bake-only=true`) would
+  // fall through to write mode, which resolves refs and writes locks — the one
+  // thing the flag exists to avoid.
+  if (args.flags['bake-only'] !== undefined && !bakeOnly) {
+    console.error('pin-release: --bake-only takes no value');
+    return 1;
+  }
   // --bake-only writes zips and nothing else, so a flag that asks for a lock,
   // an index or no zips at all contradicts it; refusing beats ignoring one.
   if (bakeOnly) {
