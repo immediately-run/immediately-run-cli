@@ -195,8 +195,9 @@ test('pin-release --check keeps historical (authoring-less) locks and validates 
     writeFixture(dir);
     // A dated channel target whose authoring is GONE (the workflow's ephemeral
     // template) + the channel pointing at it.
-    const target = datedLockName('testing', serializeLock(resolveLock({ id: 'testing', apps: {} }, {}, stub)), new Date('2026-09-16T00:00:00Z'));
     const targetText = serializeLock(resolveLock({ id: 'testing', label: 'Testing', apps: { 'panel.spaces': 'github:ir/sm@main' } }, { 'panel.spaces': 'github:ir/sm@main' }, stub));
+    // R3-999: the dated name's digest suffix is computed from the WRITTEN bytes.
+    const target = datedLockName('testing', targetText, new Date('2026-09-16T00:00:00Z'));
     writeFileSync(join(dir, `${target}.lock.json`), targetText);
     writeFileSync(
       join(dir, 'index.json'),
@@ -273,8 +274,9 @@ test('pin-release --check: a channel-template authoring needs no plain lock (the
   try {
     writeFixture(dir);
     // A dated target + the channel template that produced it (no plain lock).
-    const target = datedLockName('testing', serializeLock(resolveLock({ id: 'testing', apps: {} }, {}, stub)), new Date('2026-09-16T00:00:00Z'));
     const targetText = serializeLock(resolveLock({ id: 'testing', label: 'Testing', apps: { 'panel.spaces': 'github:ir/sm@main' } }, { 'panel.spaces': 'github:ir/sm@main' }, stub));
+    // R3-999: the dated name's digest suffix is computed from the WRITTEN bytes.
+    const target = datedLockName('testing', targetText, new Date('2026-09-16T00:00:00Z'));
     writeFileSync(join(dir, 'testing.json'), JSON.stringify({ id: 'testing', label: 'Latest of origin/main', extends: 'base', channel: true, apps: {} }, null, 2));
     writeFileSync(join(dir, `${target}.lock.json`), targetText);
     writeFileSync(
@@ -704,6 +706,100 @@ test('--check refuses an authoring-less unpinned lock unless it is a dated testi
     );
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// --- R3-999: the dated name's digest suffix is the file's own sha256 --------
+
+test('--check refuses a forged digest suffix on an unpinned dated lock', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pin-release-'));
+  try {
+    writeFixture(dir);
+    const lockText = serializeLock({
+      schemaVersion: 1,
+      id: 'testing',
+      unpinned: true,
+      apps: { 'panel.spaces': { repo: 'github:evil/x', ref: 'main' } },
+    });
+    // Name and id are both right; only the digest is forged.
+    writeFileSync(join(dir, 'testing-2026-10-07-deadbeef.lock.json'), lockText);
+    await assert.rejects(
+      runPinRelease({ positionals: [], flags: { dir, check: true } }),
+      /testing-2026-10-07-deadbeef\.lock\.json: a dated lock's name must be testing-2026-10-07-[0-9a-f]{8}\.lock\.json/,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('--check refuses a forged digest suffix on a PINNED dated lock (the rule is not unpinned-only)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pin-release-'));
+  try {
+    writeFixture(dir);
+    const lockText = serializeLock({
+      schemaVersion: 1,
+      id: 'base',
+      apps: { 'panel.spaces': { repo: 'github:ir/sm', ref: 'main', commit: SHA } },
+    });
+    writeFileSync(join(dir, 'base-2026-10-07-deadbeef.lock.json'), lockText);
+    await assert.rejects(
+      runPinRelease({ positionals: [], flags: { dir, check: true } }),
+      /base-2026-10-07-deadbeef\.lock\.json: a dated lock's name must be base-2026-10-07-[0-9a-f]{8}\.lock\.json/,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Each half of isUnpinnedChannelTarget is probed on its own, with the OTHER
+// half satisfied — so deleting either one fails a test (cli#53 review R2).
+// Both refusals carry the same message, so a refusal is attributable to the
+// rule, not to which half happened to fire.
+test("--check refuses the unpinned name rule's halves independently, with the same message", async () => {
+  const message = /an unpinned lock may only be a dated target of testing/;
+  // id right, name wrong: a `testing` lock under a non-dated name.
+  {
+    const dir = mkdtempSync(join(tmpdir(), 'pin-release-'));
+    try {
+      writeFixture(dir);
+      const lockText = serializeLock({
+        schemaVersion: 1,
+        id: 'testing',
+        unpinned: true,
+        apps: { 'panel.spaces': { repo: 'github:evil/x', ref: 'main' } },
+      });
+      writeFileSync(join(dir, 'testing-evil.lock.json'), lockText);
+      await assert.rejects(runPinRelease({ positionals: [], flags: { dir, check: true } }), (err) => {
+        assert.match(err.message, /testing-evil\.lock\.json/);
+        assert.match(err.message, message);
+        return true;
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+  // name right, id wrong: a dated-shaped name with a CORRECT digest, but the
+  // lock's id is not an unpinned channel's.
+  {
+    const dir = mkdtempSync(join(tmpdir(), 'pin-release-'));
+    try {
+      writeFixture(dir);
+      const lockText = serializeLock({
+        schemaVersion: 1,
+        id: 'monaco',
+        unpinned: true,
+        apps: { 'panel.spaces': { repo: 'github:evil/x', ref: 'main' } },
+      });
+      const name = datedLockName('monaco', lockText, new Date('2026-10-07T00:00:00Z'));
+      writeFileSync(join(dir, `${name}.lock.json`), lockText);
+      await assert.rejects(runPinRelease({ positionals: [], flags: { dir, check: true } }), (err) => {
+        assert.match(err.message, new RegExp(`${name}\\.lock\\.json`));
+        assert.match(err.message, message);
+        return true;
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   }
 });
 
