@@ -49,6 +49,7 @@ import {
   firstPartyStripWarnings,
   flattenAuthoring,
   parseBindingId,
+  parseDatedLockName,
   UNPINNED_CHANNELS,
   resolveLock,
   serializeIndex,
@@ -196,22 +197,20 @@ const assertLockValid = (lock: ReleaseLock, name: string): void => {
 };
 
 /** R3-658 — the name the dated flow gives an unpinned channel template's lock:
- *  `<channel>-YYYY-MM-DD-<sha8>` (`datedLockName`), its `id` the channel's. */
+ *  `<channel>-YYYY-MM-DD-<sha8>` (`datedLockName`), its `id` the channel's. The
+ *  shape is parsed by release.ts's `parseDatedLockName` — one home, beside the
+ *  producer, so the two cannot drift. */
 const isUnpinnedChannelTarget = (name: string, lockId: string): boolean =>
-  UNPINNED_CHANNELS.includes(lockId) && new RegExp(`^${lockId}-\\d{4}-\\d{2}-\\d{2}-[0-9a-f]{8}$`).test(name);
-
-/** R3-999 — the dated name shape, parsed rather than anchored at a lock id so
- *  a prefix that is not the lock's own id is caught by the same rule. */
-const DATED_TARGET_RE = /^(.+)-(\d{4}-\d{2}-\d{2})-([0-9a-f]{8})$/;
+  UNPINNED_CHANNELS.includes(lockId) && parseDatedLockName(name)?.id === lockId;
 
 /** R3-999 — a dated lock's name is `datedLockName`'s output, so its `<sha8>`
  *  suffix is the digest of the file's OWN bytes, not an arbitrary label: a
  *  forged suffix (or a prefix that is not the lock's id) is a hand-written
  *  history entry the index would otherwise happily carry (cli#53 review R1). */
 const datedNameProblem = (name: string, lockId: string, lockText: string): string | undefined => {
-  const dated = DATED_TARGET_RE.exec(name);
+  const dated = parseDatedLockName(name);
   if (!dated) return undefined;
-  const expected = `${lockId}-${dated[2]}-${sha256Hex(lockText).slice(0, 8)}`;
+  const expected = `${lockId}-${dated.date}-${sha256Hex(lockText).slice(0, 8)}`;
   return name === expected
     ? undefined
     : `a dated lock's name must be ${expected}.lock.json — <id>-YYYY-MM-DD-<sha256(lock)[:8]> of the file's own bytes (datedLockName)`;

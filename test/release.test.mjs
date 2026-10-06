@@ -18,6 +18,7 @@ import {
   sha256Hex,
   firstPartyStripWarnings,
   datedLockName,
+  parseDatedLockName,
   substituteDatedTargets,
   validateChannels,
   UNPINNED_CHANNELS,
@@ -261,6 +262,17 @@ test('pin-release --check fails loudly when the derived map is missing (anti-dri
     assert.equal(code, 1);
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('parseDatedLockName round-trips datedLockName and refuses every other shape', () => {
+  const text = serializeLock(resolveLock({ id: 'testing', apps: {} }, {}, stub));
+  const name = datedLockName('testing', text, new Date('2026-09-16T00:00:00Z'));
+  assert.deepEqual(parseDatedLockName(name), { id: 'testing', date: '2026-09-16', sha8: sha256Hex(text).slice(0, 8) });
+  // An id that itself carries dashes parses greedily at the LAST date+sha8 pair.
+  assert.deepEqual(parseDatedLockName('my-channel-2026-09-16-01234567'), { id: 'my-channel', date: '2026-09-16', sha8: '01234567' });
+  for (const not of ['testing', 'testing-evil', 'testing-2026-09-16', 'testing-2026-09-16-012345678', 'testing-2026-09-16-0123456g']) {
+    assert.equal(parseDatedLockName(not), undefined, not);
   }
 });
 
