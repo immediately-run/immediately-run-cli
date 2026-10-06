@@ -20,6 +20,7 @@ import {
   datedLockName,
   substituteDatedTargets,
   validateChannels,
+  UNPINNED_CHANNELS,
 } from '../dist/release.js';
 import { runPinRelease } from '../dist/commands/pinRelease.js';
 import { bakeSet } from '../dist/commands/releaseBake.js';
@@ -633,28 +634,55 @@ test('"unpinned" outside a channel template is refused', async () => {
   }
 });
 
-test('base and stable may never target an unpinned lock — write mode and --check both refuse', async () => {
+test('only testing may target an unpinned lock — base, stable and any other channel are refused in both modes', async () => {
+  assert.deepEqual(UNPINNED_CHANNELS, ['testing']);
+  for (const channel of ['base', 'stable', 'canary']) {
+    const dir = mkdtempSync(join(tmpdir(), 'pin-release-'));
+    try {
+      writePinnedFixture(dir);
+      writeFileSync(join(dir, 'testing.json'), JSON.stringify(unpinnedTesting, null, 2));
+      const publish = (channelFlag) =>
+        runPinRelease({
+          positionals: [],
+          flags: { dir, 'no-bake': true, only: 'testing', dated: 'testing', channel: channelFlag },
+        });
+      assert.equal(await publish('testing=@dated'), 0);
+      const target = JSON.parse(readFileSync(join(dir, 'index.json'), 'utf8')).channels.testing;
+      // write mode
+      assert.equal(await publish(`${channel}=${target}`), 1, `write mode lets ${channel} target an unpinned lock`);
+      // --check over a hand-edited index carrying the same shape
+      const index = JSON.parse(readFileSync(join(dir, 'index.json'), 'utf8'));
+      index.channels[channel] = target;
+      writeFileSync(join(dir, 'index.json'), serializeIndex(index));
+      assert.equal(
+        await runPinRelease({ positionals: [], flags: { dir, check: true } }),
+        1,
+        `--check lets ${channel} target an unpinned lock`,
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test('--check refuses an unpinned lock under a plain (non-channel) authoring release', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'pin-release-'));
   try {
-    writePinnedFixture(dir);
-    writeFileSync(join(dir, 'testing.json'), JSON.stringify(unpinnedTesting, null, 2));
-    assert.equal(
-      await runPinRelease({
-        positionals: [],
-        flags: { dir, 'no-bake': true, only: 'testing', dated: 'testing', channel: 'testing=@dated' },
-      }),
-      0,
+    writeFixture(dir);
+    const monaco = { id: 'monaco', extends: 'base', apps: { 'panel.spaces': 'github:evil/x@main' } };
+    writeFileSync(join(dir, 'monaco.json'), JSON.stringify(monaco, null, 2));
+    const lockText = serializeLock({
+      schemaVersion: 1,
+      id: 'monaco',
+      unpinned: true,
+      apps: { 'panel.spaces': { repo: 'github:evil/x', ref: 'main' } },
+    });
+    writeFileSync(join(dir, 'monaco.lock.json'), lockText);
+    const baseText = readFileSync(join(dir, 'base.lock.json'), 'utf8');
+    writeFileSync(
+      join(dir, 'index.json'),
+      serializeIndex(buildIndex([{ id: 'base', lockText: baseText, label: 'Default' }, { id: 'monaco', lockText }])),
     );
-    const target = JSON.parse(readFileSync(join(dir, 'index.json'), 'utf8')).channels.testing;
-    // write mode
-    assert.equal(
-      await runPinRelease({ positionals: [], flags: { dir, 'no-bake': true, only: 'testing', dated: 'testing', channel: `stable=${target}` } }),
-      1,
-    );
-    // --check over a hand-edited index carrying the same shape
-    const index = JSON.parse(readFileSync(join(dir, 'index.json'), 'utf8'));
-    index.channels.stable = target;
-    writeFileSync(join(dir, 'index.json'), serializeIndex(index));
     assert.equal(await runPinRelease({ positionals: [], flags: { dir, check: true } }), 1);
   } finally {
     rmSync(dir, { recursive: true, force: true });

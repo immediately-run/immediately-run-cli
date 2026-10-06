@@ -235,10 +235,11 @@ export const ensureZip = async (dir: string, entry: PinnedEntry, opts: BakeOptio
   return { path, reused: false };
 };
 
-/** Deduplicated (namespace, repository, commit) set across a lock's entries —
- *  one-repo-many-bindings (UI_AS_APPS §4) must bake once, not per region. */
 /** A lock entry with its commit — the only kind a zip is baked for (R3-658). */
 export type PinnedEntry = ReleaseLockEntry & { commit: string };
+
+/** Deduplicated (namespace, repository, commit) set across a lock's entries —
+ *  one-repo-many-bindings (UI_AS_APPS §4) must bake once, not per region. */
 
 export const bakeSet = (locks: { apps: Record<string, ReleaseLockEntry> }[]): PinnedEntry[] => {
   const seen = new Set<string>();

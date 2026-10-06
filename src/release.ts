@@ -6,8 +6,10 @@
  *
  * Flow: read sparse authoring files (`<name>.json`, with an optional `extends`
  * base) → flatten → resolve each `repo@ref` to an immutable commit via
- * `git ls-remote` → emit a fully-pinned `<name>.lock.json` plus a registry
- * `index.json` carrying each lock's sha-256 (the integrity anchor, R1).
+ * `git ls-remote` → emit a commit-pinned `<name>.lock.json` plus a registry
+ * `index.json` carrying each lock's sha-256 (the integrity anchor, R1). The one
+ * exception (R3-658, §5 step 4): an `"unpinned": true` channel template emits a
+ * ref-following lock — `{ repo, ref }` entries, no resolution, no commit.
  *
  * Locks are DETERMINISTIC (no wall-clock field) so their sha-256 is reproducible
  * and "immutable by name" is enforceable: re-pinning a name to different content
@@ -100,9 +102,11 @@ export interface ReleaseLock {
   apps: Record<string, ReleaseLockEntry>;
 }
 
-/** R3-658 — the channels that serve production-facing compositions: neither may
- *  ever target an unpinned lock (UI_RELEASES_SPEC §4.4). */
-export const PINNED_ONLY_CHANNELS: readonly string[] = ['base', 'stable'];
+/** R3-658 — the ONLY channels that may target an unpinned lock (UI_RELEASES_SPEC
+ *  §3.2: "only the `testing` channel targets one"). An allowlist, so a channel
+ *  added later — `stable`, `base`, or one a deployment selects — stays pinned
+ *  unless it is named here deliberately. */
+export const UNPINNED_CHANNELS: readonly string[] = ['testing'];
 
 export interface ReleaseIndexEntry {
   label?: string;
@@ -264,7 +268,8 @@ export const resolveRemoteCommit = (binding: BindingId): string => {
   return pick.sha.toLowerCase();
 };
 
-/** Resolve a flattened authoring app-map into a fully-pinned lock. */
+/** Resolve a flattened authoring app-map into a commit-pinned lock — or, for an
+ *  `unpinned` channel template (R3-658), a ref-following one with no commits. */
 export const resolveLock = (
   authoring: ReleaseAuthoring,
   flatApps: Record<string, string>,

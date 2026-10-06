@@ -1,6 +1,7 @@
 /*
  * `immediately.run pin-release` — resolve the UI release authoring files in a
- * registry directory into fully-pinned, immutable lock artifacts plus a
+ * registry directory into commit-pinned, immutable lock artifacts (or, for an
+ * `"unpinned": true` channel template, a ref-following lock — R3-658) plus a
  * registry `index.json` (UI_RELEASES_SPEC §5).
  *
  * Modes:
@@ -14,7 +15,8 @@
  *     different content is refused — a changed composition gets a new name
  *     (§3.3/§5 step 6; --republish is a vestigial no-op since 0.9.3, R3-823).
  *   - --check (CI): no network, no writes. Verify the committed locks parse and
- *     are SHA-pinned, that `index.json` exactly matches the locks' digests,
+ *     are SHA-pinned (commit-less entries only in an unpinned channel lock),
+ *     that `index.json` exactly matches the locks' digests,
  *     that the channel map is sound (§4.4: every target published, no dual
  *     names), and that the base lock covers every region the committed derived
  *     map names (§3.1 anti-drift). This is what the gh-pages publish workflow
@@ -47,7 +49,7 @@ import {
   firstPartyStripWarnings,
   flattenAuthoring,
   parseBindingId,
-  PINNED_ONLY_CHANNELS,
+  UNPINNED_CHANNELS,
   resolveLock,
   serializeIndex,
   serializeLock,
@@ -87,8 +89,10 @@ export const PIN_RELEASE_USAGE = `Usage: immediately.run pin-release [options]
 
 Resolve UI release authoring files into pinned lock artifacts + a registry index
 (UI_RELEASES_SPEC §5). Authoring files are <name>.json in the registry dir; the
-outputs are <name>.lock.json (fully commit-pinned), zips/<ns>/<repo>/<sha>.zip
-(the §3.4 registry-hosted bytes), and index.json.
+outputs are <name>.lock.json (commit-pinned), zips/<ns>/<repo>/<sha>.zip
+(the §3.4 registry-hosted bytes), and index.json. A channel template with
+"unpinned": true instead publishes a ref-following lock (no commits, no zips)
+that only the testing channel may target (§3.2).
 
 Options:
   --dir <path>            Registry directory (default: ./releases)
@@ -185,8 +189,9 @@ const assertLockValid = (lock: ReleaseLock, name: string): void => {
   }
 };
 
-/** R3-658 (§4.4) — `base` and `stable` serve production-facing compositions, so
- *  neither may target an unpinned lock. Shared by write mode and `--check`. */
+/** R3-658 (§3.2) — only a channel in UNPINNED_CHANNELS (`testing`) may target an
+ *  unpinned lock; every other channel, `base`/`stable` included, stays pinned.
+ *  Shared by write mode and `--check`. */
 const unpinnedChannelProblems = (
   channels: Record<string, string>,
   locks: readonly { id: string; lockText: string }[],
@@ -194,9 +199,12 @@ const unpinnedChannelProblems = (
   const unpinned = new Set(
     locks.filter((l) => (JSON.parse(l.lockText) as ReleaseLock).unpinned === true).map((l) => l.id),
   );
-  return PINNED_ONLY_CHANNELS.filter((c) => channels[c] !== undefined && unpinned.has(channels[c]!)).map(
-    (c) => `channel "${c}" targets "${channels[c]}", an unpinned lock — ${c} must stay pinned (§4.4)`,
-  );
+  return Object.entries(channels)
+    .filter(([c, target]) => unpinned.has(target) && !UNPINNED_CHANNELS.includes(c))
+    .map(
+      ([c, target]) =>
+        `channel "${c}" targets "${target}", an unpinned lock — only ${UNPINNED_CHANNELS.join(', ')} may (§3.2)`,
+    );
 };
 
 /** Parse `--channel a=b,c=d` (comma-separated pairs; the args parser keeps the
@@ -583,7 +591,16 @@ const runCheck = (dir: string, authoring: ReleaseAuthoring[]): number => {
       continue;
     }
     try {
-      assertLockValid(JSON.parse(lockText) as ReleaseLock, `${a.id}.lock.json`);
+      const lock = JSON.parse(lockText) as ReleaseLock;
+      assertLockValid(lock, `${a.id}.lock.json`);
+      // R3-658 (§5 step 4): only an unpinned CHANNEL template publishes an
+      // unpinned lock, and it does so under dated names — so a plain release's
+      // lock that says `unpinned` is a hand-written moving ref. Write mode can't
+      // produce it; the review gate (this) refuses it.
+      if (lock.unpinned === true) {
+        problems.push(`${a.id}.lock.json is unpinned, but "${a.id}" is not an unpinned channel template`);
+        continue;
+      }
     } catch (err) {
       problems.push(err instanceof Error ? err.message : String(err));
       continue;
