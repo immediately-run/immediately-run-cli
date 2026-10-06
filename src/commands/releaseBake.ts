@@ -187,7 +187,7 @@ export const installDependencies = (checkout: string): boolean => {
  *  Because a resident zip is never rebuilt, a build whose packages could not be
  *  bundled is refused rather than landed: the path stays absent and the next
  *  run retries, where landing it would serve the thin zip for good. */
-export const ensureZip = async (dir: string, entry: ReleaseLockEntry, opts: BakeOptions = {}): Promise<BakeResult> => {
+export const ensureZip = async (dir: string, entry: PinnedEntry, opts: BakeOptions = {}): Promise<BakeResult> => {
   const bakeable = parseBakeableRepoId(entry.repo);
   if (!bakeable) {
     throw new Error(`pin-release bake: unsupported repo id "${entry.repo}" (only github:owner/repo is bakeable)`);
@@ -235,17 +235,23 @@ export const ensureZip = async (dir: string, entry: ReleaseLockEntry, opts: Bake
   return { path, reused: false };
 };
 
+/** A lock entry with its commit — the only kind a zip is baked for (R3-658). */
+export type PinnedEntry = ReleaseLockEntry & { commit: string };
+
 /** Deduplicated (namespace, repository, commit) set across a lock's entries —
  *  one-repo-many-bindings (UI_AS_APPS §4) must bake once, not per region. */
-export const bakeSet = (locks: { apps: Record<string, ReleaseLockEntry> }[]): ReleaseLockEntry[] => {
+
+export const bakeSet = (locks: { apps: Record<string, ReleaseLockEntry> }[]): PinnedEntry[] => {
   const seen = new Set<string>();
-  const out: ReleaseLockEntry[] = [];
+  const out: PinnedEntry[] = [];
   for (const lock of locks) {
     for (const entry of Object.values(lock.apps)) {
+      // R3-658: an unpinned entry has no commit, so nothing to bake (§3.2).
+      if (!entry.commit) continue;
       const key = `${entry.repo}#${entry.commit}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      out.push(entry);
+      out.push(entry as PinnedEntry);
     }
   }
   return out;

@@ -6,8 +6,10 @@
  *
  * Flow: read sparse authoring files (`<name>.json`, with an optional `extends`
  * base) → flatten → resolve each `repo@ref` to an immutable commit via
- * `git ls-remote` → emit a fully-pinned `<name>.lock.json` plus a registry
- * `index.json` carrying each lock's sha-256 (the integrity anchor, R1).
+ * `git ls-remote` → emit a commit-pinned `<name>.lock.json` plus a registry
+ * `index.json` carrying each lock's sha-256 (the integrity anchor, R1). The one
+ * exception (R3-658, §5 step 4): an `"unpinned": true` channel template emits a
+ * ref-following lock — `{ repo, ref }` entries, no resolution, no commit.
  *
  * Locks are DETERMINISTIC (no wall-clock field) so their sha-256 is reproducible
  * and "immutable by name" is enforceable: re-pinning a name to different content
@@ -75,6 +77,11 @@ export interface ReleaseAuthoring {
    *  belongs to the CHANNEL, so a plain `<id>.lock.json` must never exist (the
    *  dual-name rule). `--check` therefore requires no plain lock for it. */
   channel?: boolean;
+  /** R3-658 (UI_RELEASES_SPEC §3.2/§5 step 4): publish an UNPINNED lock — each
+   *  entry keeps its ref and no commit, so the region follows the branch head.
+   *  Only a channel template may carry it (`--check` and write mode refuse it
+   *  otherwise), and a `base`/`stable` channel may never target the result. */
+  unpinned?: boolean;
   /** region id → canonical id string `provider:ns/repo[@ref]`. */
   apps: Record<string, string>;
 }
@@ -82,15 +89,24 @@ export interface ReleaseAuthoring {
 export interface ReleaseLockEntry {
   repo: string;
   ref?: string;
-  commit: string;
+  /** Absent only in a lock marked `unpinned` (R3-658). */
+  commit?: string;
 }
 
 export interface ReleaseLock {
   schemaVersion: typeof RELEASE_SCHEMA_VERSION;
   id: string;
   label?: string;
+  /** R3-658 — entries follow refs, not commits; no zips are baked for it. */
+  unpinned?: true;
   apps: Record<string, ReleaseLockEntry>;
 }
+
+/** R3-658 — the ONLY channels that may target an unpinned lock (UI_RELEASES_SPEC
+ *  §3.2: "only the `testing` channel targets one"). An allowlist, so a channel
+ *  added later — `stable`, `base`, or one a deployment selects — stays pinned
+ *  unless it is named here deliberately. */
+export const UNPINNED_CHANNELS: readonly string[] = ['testing'];
 
 export interface ReleaseIndexEntry {
   label?: string;
@@ -252,7 +268,8 @@ export const resolveRemoteCommit = (binding: BindingId): string => {
   return pick.sha.toLowerCase();
 };
 
-/** Resolve a flattened authoring app-map into a fully-pinned lock. */
+/** Resolve a flattened authoring app-map into a commit-pinned lock — or, for an
+ *  `unpinned` channel template (R3-658), a ref-following one with no commits. */
 export const resolveLock = (
   authoring: ReleaseAuthoring,
   flatApps: Record<string, string>,
@@ -261,6 +278,16 @@ export const resolveLock = (
   const apps: Record<string, ReleaseLockEntry> = {};
   for (const region of Object.keys(flatApps).sort()) {
     const binding = parseBindingId(flatApps[region]!);
+    if (authoring.unpinned === true) {
+      // §5 step 4's one exception: no ref resolution — the entry follows its ref.
+      if (!binding.ref || binding.commit) {
+        throw new Error(
+          `release "${authoring.id}" region "${region}": an unpinned release names a ref and no commit (${flatApps[region]})`,
+        );
+      }
+      apps[region] = { repo: appKey(binding), ref: binding.ref };
+      continue;
+    }
     const commit = resolver(binding);
     apps[region] = {
       repo: appKey(binding),
@@ -272,6 +299,7 @@ export const resolveLock = (
     schemaVersion: RELEASE_SCHEMA_VERSION,
     id: authoring.id,
     ...(authoring.label ? { label: authoring.label } : {}),
+    ...(authoring.unpinned === true ? { unpinned: true as const } : {}),
     apps,
   };
 };
@@ -284,12 +312,13 @@ export const serializeLock = (lock: ReleaseLock): string => {
     schemaVersion: lock.schemaVersion,
     id: lock.id,
     ...(lock.label ? { label: lock.label } : {}),
+    ...(lock.unpinned ? { unpinned: true as const } : {}),
     apps: Object.fromEntries(
       Object.keys(lock.apps)
         .sort()
         .map((region) => {
           const e = lock.apps[region]!;
-          return [region, { repo: e.repo, ...(e.ref ? { ref: e.ref } : {}), commit: e.commit }];
+          return [region, { repo: e.repo, ...(e.ref ? { ref: e.ref } : {}), ...(e.commit ? { commit: e.commit } : {}) }];
         }),
     ),
   };

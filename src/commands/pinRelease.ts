@@ -1,6 +1,7 @@
 /*
  * `immediately.run pin-release` — resolve the UI release authoring files in a
- * registry directory into fully-pinned, immutable lock artifacts plus a
+ * registry directory into commit-pinned, immutable lock artifacts (or, for an
+ * `"unpinned": true` channel template, a ref-following lock — R3-658) plus a
  * registry `index.json` (UI_RELEASES_SPEC §5).
  *
  * Modes:
@@ -14,7 +15,8 @@
  *     different content is refused — a changed composition gets a new name
  *     (§3.3/§5 step 6; --republish is a vestigial no-op since 0.9.3, R3-823).
  *   - --check (CI): no network, no writes. Verify the committed locks parse and
- *     are SHA-pinned, that `index.json` exactly matches the locks' digests,
+ *     are SHA-pinned (commit-less entries only in an unpinned channel lock),
+ *     that `index.json` exactly matches the locks' digests,
  *     that the channel map is sound (§4.4: every target published, no dual
  *     names), and that the base lock covers every region the committed derived
  *     map names (§3.1 anti-drift). This is what the gh-pages publish workflow
@@ -30,6 +32,11 @@
  *   - `--channel <name>=<release>[,<name2>=<release2>...]` repoints the index's
  *     channel map — the ONLY mutable write this flow performs. The map is read
  *     from the committed `index.json`, updated, validated, and rebuilt in.
+ *   - R3-658: a channel template marked `"unpinned": true` is written as an
+ *     UNPINNED lock (`unpinned: true`, `{ repo, ref }` entries): no ref is
+ *     resolved and no zip baked — the regions follow their branch heads. Both
+ *     modes refuse `"unpinned"` outside a channel template, and a `base` or
+ *     `stable` channel targeting an unpinned lock.
  */
 
 import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -42,6 +49,7 @@ import {
   firstPartyStripWarnings,
   flattenAuthoring,
   parseBindingId,
+  UNPINNED_CHANNELS,
   resolveLock,
   serializeIndex,
   serializeLock,
@@ -51,9 +59,15 @@ import {
   type ReleaseAuthoring,
   type ReleaseIndex,
   type ReleaseLock,
-  type ReleaseLockEntry,
 } from '../release.js';
-import { bakeSet, ensureZip, parseBakeableRepoId, validateResidentZip, type BakeResult } from './releaseBake.js';
+import {
+  bakeSet,
+  ensureZip,
+  parseBakeableRepoId,
+  validateResidentZip,
+  type BakeResult,
+  type PinnedEntry,
+} from './releaseBake.js';
 
 /** The host's build-default manifest for the §6.1b strip lint (region → repo scope
  *  + first-party-only ceiling). Empty today: the registry's first-party-only set is
@@ -75,8 +89,10 @@ export const PIN_RELEASE_USAGE = `Usage: immediately.run pin-release [options]
 
 Resolve UI release authoring files into pinned lock artifacts + a registry index
 (UI_RELEASES_SPEC §5). Authoring files are <name>.json in the registry dir; the
-outputs are <name>.lock.json (fully commit-pinned), zips/<ns>/<repo>/<sha>.zip
-(the §3.4 registry-hosted bytes), and index.json.
+outputs are <name>.lock.json (commit-pinned), zips/<ns>/<repo>/<sha>.zip
+(the §3.4 registry-hosted bytes), and index.json. A channel template with
+"unpinned": true instead publishes a ref-following lock (no commits, no zips)
+that only the testing channel may target (§3.2).
 
 Options:
   --dir <path>            Registry directory (default: ./releases)
@@ -130,6 +146,15 @@ const readAuthoring = (dir: string): ReleaseAuthoring[] => {
     if (!a.apps || typeof a.apps !== 'object') {
       throw new Error(`${f}: missing "apps" map`);
     }
+    if (a.unpinned !== undefined && typeof a.unpinned !== 'boolean') {
+      // R3-658: this flag decides whether a lock is written with moving refs at
+      // all, so it is read as strictly as the kernel reads the lock's own flag.
+      throw new Error(`${f}: "unpinned" must be true or false`);
+    }
+    if (a.unpinned === true && !a.channel) {
+      // R3-658: only a channel template publishes unpinned (§5 step 4).
+      throw new Error(`${f}: "unpinned": true is only allowed on a channel template ("channel": true)`);
+    }
     return a;
   });
 };
@@ -159,11 +184,37 @@ const assertLockValid = (lock: ReleaseLock, name: string): void => {
   if (!lock.apps || typeof lock.apps !== 'object') throw new Error(`${name}: missing apps`);
   for (const [region, e] of Object.entries(lock.apps)) {
     if (!e || typeof e.repo !== 'string') throw new Error(`${name}: region ${region} missing repo`);
-    if (typeof e.commit !== 'string' || !COMMIT_RE.test(e.commit)) {
+    if (e.commit === undefined && lock.unpinned === true) {
+      // R3-658: a lock marked unpinned follows refs — every such entry names one.
+      if (typeof e.ref !== 'string' || e.ref === '') throw new Error(`${name}: region ${region} names no ref`);
+    } else if (typeof e.commit !== 'string' || !COMMIT_RE.test(e.commit)) {
       throw new Error(`${name}: region ${region} is not SHA-pinned`);
     }
     parseBindingId(e.repo);
   }
+};
+
+/** R3-658 — the name the dated flow gives an unpinned channel template's lock:
+ *  `<channel>-YYYY-MM-DD-<sha8>` (`datedLockName`), its `id` the channel's. */
+const isUnpinnedChannelTarget = (name: string, lockId: string): boolean =>
+  UNPINNED_CHANNELS.includes(lockId) && new RegExp(`^${lockId}-\\d{4}-\\d{2}-\\d{2}-[0-9a-f]{8}$`).test(name);
+
+/** R3-658 (§3.2) — only a channel in UNPINNED_CHANNELS (`testing`) may target an
+ *  unpinned lock; every other channel, `base`/`stable` included, stays pinned.
+ *  Shared by write mode and `--check`. */
+const unpinnedChannelProblems = (
+  channels: Record<string, string>,
+  locks: readonly { id: string; lockText: string }[],
+): string[] => {
+  const unpinned = new Set(
+    locks.filter((l) => (JSON.parse(l.lockText) as ReleaseLock).unpinned === true).map((l) => l.id),
+  );
+  return Object.entries(channels)
+    .filter(([c, target]) => unpinned.has(target) && !UNPINNED_CHANNELS.includes(c))
+    .map(
+      ([c, target]) =>
+        `channel "${c}" targets "${target}", an unpinned lock — only ${UNPINNED_CHANNELS.join(', ')} may (§3.2)`,
+    );
 };
 
 /** Parse `--channel a=b,c=d` (comma-separated pairs; the args parser keeps the
@@ -210,7 +261,7 @@ const readCommittedChannels = (dir: string): Record<string, string> => {
   }
 };
 
-type Bake = (dir: string, entry: ReleaseLockEntry) => Promise<BakeResult>;
+type Bake = (dir: string, entry: PinnedEntry) => Promise<BakeResult>;
 
 /** §5 5a — ensure the registry zip of every pin the given locks carry
  *  (deduplicated; a resident zip is reused, never rebuilt). The first failure
@@ -261,6 +312,15 @@ const collectOrphanLocks = (
       throw new Error(`${f}: not valid JSON (${err instanceof Error ? err.message : String(err)})`);
     }
     assertLockValid(parsed, f);
+    // R3-658 (§3.2/§5 step 4): an authoring-less unpinned lock is legitimate
+    // only as a dated target of an unpinned channel template — the name the
+    // dated flow writes. Anything else is a hand-written moving ref.
+    if (parsed.unpinned === true && !isUnpinnedChannelTarget(id, parsed.id)) {
+      throw new Error(
+        `${f}: an unpinned lock may only be a dated target of ${UNPINNED_CHANNELS.join(', ')} ` +
+          `(<channel>-YYYY-MM-DD-<sha8>)`,
+      );
+    }
     out.push({ id, lockText, label: parsed.label });
   }
   return out;
@@ -486,6 +546,11 @@ export const runPinRelease = async (args: ParsedArgs): Promise<number> => {
     console.error(`pin-release: ${err instanceof Error ? err.message : String(err)}`);
     return 1;
   }
+  const unpinnedProblems = unpinnedChannelProblems(channels, [...written, ...orphans]);
+  if (unpinnedProblems.length) {
+    for (const p of unpinnedProblems) console.error(`pin-release: ${p}`);
+    return 1;
+  }
 
   // §5 5a — bake the registry zips for EVERY pin the index will carry
   // (deduplicated; existing paths reused, never rebuilt).
@@ -545,7 +610,16 @@ const runCheck = (dir: string, authoring: ReleaseAuthoring[]): number => {
       continue;
     }
     try {
-      assertLockValid(JSON.parse(lockText) as ReleaseLock, `${a.id}.lock.json`);
+      const lock = JSON.parse(lockText) as ReleaseLock;
+      assertLockValid(lock, `${a.id}.lock.json`);
+      // R3-658 (§5 step 4): only an unpinned CHANNEL template publishes an
+      // unpinned lock, and it does so under dated names — so a plain release's
+      // lock that says `unpinned` is a hand-written moving ref. Write mode can't
+      // produce it; the review gate (this) refuses it.
+      if (lock.unpinned === true) {
+        problems.push(`${a.id}.lock.json is unpinned, but "${a.id}" is not an unpinned channel template`);
+        continue;
+      }
     } catch (err) {
       problems.push(err instanceof Error ? err.message : String(err));
       continue;
@@ -575,6 +649,7 @@ const runCheck = (dir: string, authoring: ReleaseAuthoring[]): number => {
   } catch (err) {
     problems.push(err instanceof Error ? err.message : String(err));
   }
+  problems.push(...unpinnedChannelProblems(committedChannels, locks));
   const expectedIndex = serializeIndex(buildIndex(locks, committedChannels));
   if (committedIndexText && committedIndexText !== expectedIndex) {
     problems.push('index.json is out of date or has wrong digests (run pin-release to regenerate)');
@@ -595,6 +670,7 @@ const runCheck = (dir: string, authoring: ReleaseAuthoring[]): number => {
     let absent = 0;
     for (const l of locks) {
       for (const entry of Object.values((JSON.parse(l.lockText) as ReleaseLock).apps)) {
+        if (!entry.commit) continue; // R3-658: an unpinned entry has no zip (§3.2)
         const bakeable = parseBakeableRepoId(entry.repo);
         if (!bakeable) {
           console.warn(
