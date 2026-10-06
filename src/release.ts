@@ -278,7 +278,7 @@ export const resolveLock = (
   const apps: Record<string, ReleaseLockEntry> = {};
   for (const region of Object.keys(flatApps).sort()) {
     const binding = parseBindingId(flatApps[region]!);
-    if (authoring.unpinned) {
+    if (authoring.unpinned === true) {
       // §5 step 4's one exception: no ref resolution — the entry follows its ref.
       if (!binding.ref || binding.commit) {
         throw new Error(
@@ -299,7 +299,7 @@ export const resolveLock = (
     schemaVersion: RELEASE_SCHEMA_VERSION,
     id: authoring.id,
     ...(authoring.label ? { label: authoring.label } : {}),
-    ...(authoring.unpinned ? { unpinned: true as const } : {}),
+    ...(authoring.unpinned === true ? { unpinned: true as const } : {}),
     apps,
   };
 };

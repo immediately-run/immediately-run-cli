@@ -703,3 +703,43 @@ test('--check still refuses a commit-less entry in a lock NOT marked unpinned', 
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('"unpinned" must be a boolean — "false" is refused, not read as on', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pin-release-'));
+  try {
+    writePinnedFixture(dir);
+    writeFileSync(join(dir, 'testing.json'), JSON.stringify({ ...unpinnedTesting, unpinned: 'false' }, null, 2));
+    await assert.rejects(
+      runPinRelease({ positionals: [], flags: { dir, 'no-bake': true, only: 'testing', dated: 'testing' } }),
+      /testing\.json: "unpinned" must be true or false/,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('--check refuses an unpinned lock entry that names no ref (the kernel would drop it)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pin-release-'));
+  try {
+    writePinnedFixture(dir);
+    writeFileSync(join(dir, 'testing.json'), JSON.stringify(unpinnedTesting, null, 2));
+    assert.equal(
+      await runPinRelease({
+        positionals: [],
+        flags: { dir, 'no-bake': true, only: 'testing', dated: 'testing', channel: 'testing=@dated' },
+      }),
+      0,
+    );
+    const index = JSON.parse(readFileSync(join(dir, 'index.json'), 'utf8'));
+    const target = index.channels.testing;
+    const lock = JSON.parse(readFileSync(join(dir, `${target}.lock.json`), 'utf8'));
+    delete lock.apps['panel.spaces'].ref;
+    const lockText = serializeLock(lock);
+    writeFileSync(join(dir, `${target}.lock.json`), lockText);
+    index.releases[target].sha256 = sha256Hex(lockText);
+    writeFileSync(join(dir, 'index.json'), serializeIndex(index));
+    await assert.rejects(runPinRelease({ positionals: [], flags: { dir, check: true } }), /names no ref/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

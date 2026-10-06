@@ -146,7 +146,12 @@ const readAuthoring = (dir: string): ReleaseAuthoring[] => {
     if (!a.apps || typeof a.apps !== 'object') {
       throw new Error(`${f}: missing "apps" map`);
     }
-    if (a.unpinned && !a.channel) {
+    if (a.unpinned !== undefined && typeof a.unpinned !== 'boolean') {
+      // R3-658: this flag decides whether a lock is written with moving refs at
+      // all, so it is read as strictly as the kernel reads the lock's own flag.
+      throw new Error(`${f}: "unpinned" must be true or false`);
+    }
+    if (a.unpinned === true && !a.channel) {
       // R3-658: only a channel template publishes unpinned (§5 step 4).
       throw new Error(`${f}: "unpinned": true is only allowed on a channel template ("channel": true)`);
     }
