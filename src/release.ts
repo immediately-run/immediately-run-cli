@@ -394,3 +394,11 @@ export const datedLockName = (id: string, lockText: string, date: Date = new Dat
   const d = String(date.getUTCDate()).padStart(2, '0');
   return `${id}-${y}-${m}-${d}-${sha256Hex(lockText).slice(0, 8)}`;
 };
+
+/** The one spelling of datedLockName's output shape, parsed: every consumer
+ *  that recognises a dated lock name (the unpinned-channel rule, the R3-999
+ *  digest rule) reads it through here so the shape cannot drift between sites. */
+export const parseDatedLockName = (name: string): { id: string; date: string; sha8: string } | undefined => {
+  const m = /^(.+)-(\d{4}-\d{2}-\d{2})-([0-9a-f]{8})$/.exec(name);
+  return m ? { id: m[1]!, date: m[2]!, sha8: m[3]! } : undefined;
+};

@@ -49,10 +49,12 @@ import {
   firstPartyStripWarnings,
   flattenAuthoring,
   parseBindingId,
+  parseDatedLockName,
   UNPINNED_CHANNELS,
   resolveLock,
   serializeIndex,
   serializeLock,
+  sha256Hex,
   substituteDatedTargets,
   validateChannels,
   type BuildDefaultRef,
@@ -195,9 +197,24 @@ const assertLockValid = (lock: ReleaseLock, name: string): void => {
 };
 
 /** R3-658 — the name the dated flow gives an unpinned channel template's lock:
- *  `<channel>-YYYY-MM-DD-<sha8>` (`datedLockName`), its `id` the channel's. */
+ *  `<channel>-YYYY-MM-DD-<sha8>` (`datedLockName`), its `id` the channel's. The
+ *  shape is parsed by release.ts's `parseDatedLockName` — one home, beside the
+ *  producer, so the two cannot drift. */
 const isUnpinnedChannelTarget = (name: string, lockId: string): boolean =>
-  UNPINNED_CHANNELS.includes(lockId) && new RegExp(`^${lockId}-\\d{4}-\\d{2}-\\d{2}-[0-9a-f]{8}$`).test(name);
+  UNPINNED_CHANNELS.includes(lockId) && parseDatedLockName(name)?.id === lockId;
+
+/** R3-999 — a dated lock's name is `datedLockName`'s output, so its `<sha8>`
+ *  suffix is the digest of the file's OWN bytes, not an arbitrary label: a
+ *  forged suffix (or a prefix that is not the lock's id) is a hand-written
+ *  history entry the index would otherwise happily carry (cli#53 review R1). */
+const datedNameProblem = (name: string, lockId: string, lockText: string): string | undefined => {
+  const dated = parseDatedLockName(name);
+  if (!dated) return undefined;
+  const expected = `${lockId}-${dated.date}-${sha256Hex(lockText).slice(0, 8)}`;
+  return name === expected
+    ? undefined
+    : `a dated lock's name must be ${expected}.lock.json — <id>-YYYY-MM-DD-<sha256(lock)[:8]> of the file's own bytes (datedLockName)`;
+};
 
 /** R3-658 (§3.2) — only a channel in UNPINNED_CHANNELS (`testing`) may target an
  *  unpinned lock; every other channel, `base`/`stable` included, stays pinned.
@@ -312,6 +329,11 @@ const collectOrphanLocks = (
       throw new Error(`${f}: not valid JSON (${err instanceof Error ? err.message : String(err)})`);
     }
     assertLockValid(parsed, f);
+    // R3-999: the digest rule applies to EVERY authoring-less dated lock,
+    // pinned or unpinned — for an unpinned one it is in addition to the
+    // isUnpinnedChannelTarget rule below, not a replacement for it.
+    const nameProblem = datedNameProblem(id, parsed.id, lockText);
+    if (nameProblem) throw new Error(`${f}: ${nameProblem}`);
     // R3-658 (§3.2/§5 step 4): an authoring-less unpinned lock is legitimate
     // only as a dated target of an unpinned channel template — the name the
     // dated flow writes. Anything else is a hand-written moving ref.
