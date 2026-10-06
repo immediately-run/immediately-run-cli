@@ -634,9 +634,26 @@ test('"unpinned" outside a channel template is refused', async () => {
   }
 });
 
-test('only testing may target an unpinned lock — base, stable and any other channel are refused in both modes', async () => {
+// Captures console.error while `fn` runs, so a refusal is asserted by its REASON —
+// an exit code of 1 alone cannot tell this guard from the dual-name rule.
+const errorsOf = async (fn) => {
+  const seen = [];
+  const original = console.error;
+  console.error = (...args) => seen.push(args.join(' '));
+  try {
+    return { code: await fn(), errors: seen.join('\n') };
+  } finally {
+    console.error = original;
+  }
+};
+
+// `base` is not swept: the fixture publishes `base` as a RELEASE, so a
+// `base=<target>` channel is refused first by the dual-name rule
+// (validateChannels), never reaching this guard. `stable` and an arbitrary name
+// are the class this guard owns.
+test('only testing may target an unpinned lock — any other channel is refused in both modes, naming the reason', async () => {
   assert.deepEqual(UNPINNED_CHANNELS, ['testing']);
-  for (const channel of ['base', 'stable', 'canary']) {
+  for (const channel of ['stable', 'canary']) {
     const dir = mkdtempSync(join(tmpdir(), 'pin-release-'));
     try {
       writePinnedFixture(dir);
@@ -649,19 +666,44 @@ test('only testing may target an unpinned lock — base, stable and any other ch
       assert.equal(await publish('testing=@dated'), 0);
       const target = JSON.parse(readFileSync(join(dir, 'index.json'), 'utf8')).channels.testing;
       // write mode
-      assert.equal(await publish(`${channel}=${target}`), 1, `write mode lets ${channel} target an unpinned lock`);
+      const write = await errorsOf(() => publish(`${channel}=${target}`));
+      assert.equal(write.code, 1, `write mode lets ${channel} target an unpinned lock`);
+      assert.match(write.errors, /an unpinned lock — only testing may/);
       // --check over a hand-edited index carrying the same shape
       const index = JSON.parse(readFileSync(join(dir, 'index.json'), 'utf8'));
       index.channels[channel] = target;
       writeFileSync(join(dir, 'index.json'), serializeIndex(index));
-      assert.equal(
-        await runPinRelease({ positionals: [], flags: { dir, check: true } }),
-        1,
-        `--check lets ${channel} target an unpinned lock`,
-      );
+      const check = await errorsOf(() => runPinRelease({ positionals: [], flags: { dir, check: true } }));
+      assert.equal(check.code, 1, `--check lets ${channel} target an unpinned lock`);
+      assert.match(check.errors, /an unpinned lock — only testing may/);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  }
+});
+
+test('--check refuses an authoring-less unpinned lock unless it is a dated testing target', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pin-release-'));
+  try {
+    writeFixture(dir);
+    const lockText = serializeLock({
+      schemaVersion: 1,
+      id: 'monaco',
+      unpinned: true,
+      apps: { 'panel.spaces': { repo: 'github:evil/x', ref: 'main' } },
+    });
+    writeFileSync(join(dir, 'monaco.lock.json'), lockText); // no monaco.json
+    const baseText = readFileSync(join(dir, 'base.lock.json'), 'utf8');
+    writeFileSync(
+      join(dir, 'index.json'),
+      serializeIndex(buildIndex([{ id: 'base', lockText: baseText, label: 'Default' }, { id: 'monaco', lockText }])),
+    );
+    await assert.rejects(
+      runPinRelease({ positionals: [], flags: { dir, check: true } }),
+      /monaco\.lock\.json: an unpinned lock may only be a dated target of testing/,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 

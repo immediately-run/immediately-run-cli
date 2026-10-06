@@ -194,6 +194,11 @@ const assertLockValid = (lock: ReleaseLock, name: string): void => {
   }
 };
 
+/** R3-658 — the name the dated flow gives an unpinned channel template's lock:
+ *  `<channel>-YYYY-MM-DD-<sha8>` (`datedLockName`), its `id` the channel's. */
+const isUnpinnedChannelTarget = (name: string, lockId: string): boolean =>
+  UNPINNED_CHANNELS.includes(lockId) && new RegExp(`^${lockId}-\\d{4}-\\d{2}-\\d{2}-[0-9a-f]{8}$`).test(name);
+
 /** R3-658 (§3.2) — only a channel in UNPINNED_CHANNELS (`testing`) may target an
  *  unpinned lock; every other channel, `base`/`stable` included, stays pinned.
  *  Shared by write mode and `--check`. */
@@ -307,6 +312,15 @@ const collectOrphanLocks = (
       throw new Error(`${f}: not valid JSON (${err instanceof Error ? err.message : String(err)})`);
     }
     assertLockValid(parsed, f);
+    // R3-658 (§3.2/§5 step 4): an authoring-less unpinned lock is legitimate
+    // only as a dated target of an unpinned channel template — the name the
+    // dated flow writes. Anything else is a hand-written moving ref.
+    if (parsed.unpinned === true && !isUnpinnedChannelTarget(id, parsed.id)) {
+      throw new Error(
+        `${f}: an unpinned lock may only be a dated target of ${UNPINNED_CHANNELS.join(', ')} ` +
+          `(<channel>-YYYY-MM-DD-<sha8>)`,
+      );
+    }
     out.push({ id, lockText, label: parsed.label });
   }
   return out;
@@ -532,9 +546,9 @@ export const runPinRelease = async (args: ParsedArgs): Promise<number> => {
     console.error(`pin-release: ${err instanceof Error ? err.message : String(err)}`);
     return 1;
   }
-  const pinnedOnly = unpinnedChannelProblems(channels, [...written, ...orphans]);
-  if (pinnedOnly.length) {
-    for (const p of pinnedOnly) console.error(`pin-release: ${p}`);
+  const unpinnedProblems = unpinnedChannelProblems(channels, [...written, ...orphans]);
+  if (unpinnedProblems.length) {
+    for (const p of unpinnedProblems) console.error(`pin-release: ${p}`);
     return 1;
   }
 
