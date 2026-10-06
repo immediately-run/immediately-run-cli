@@ -30,6 +30,11 @@
  *   - `--channel <name>=<release>[,<name2>=<release2>...]` repoints the index's
  *     channel map — the ONLY mutable write this flow performs. The map is read
  *     from the committed `index.json`, updated, validated, and rebuilt in.
+ *   - R3-658: a channel template marked `"unpinned": true` is written as an
+ *     UNPINNED lock (`unpinned: true`, `{ repo, ref }` entries): no ref is
+ *     resolved and no zip baked — the regions follow their branch heads. Both
+ *     modes refuse `"unpinned"` outside a channel template, and a `base` or
+ *     `stable` channel targeting an unpinned lock.
  */
 
 import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -42,6 +47,7 @@ import {
   firstPartyStripWarnings,
   flattenAuthoring,
   parseBindingId,
+  PINNED_ONLY_CHANNELS,
   resolveLock,
   serializeIndex,
   serializeLock,
@@ -51,9 +57,15 @@ import {
   type ReleaseAuthoring,
   type ReleaseIndex,
   type ReleaseLock,
-  type ReleaseLockEntry,
 } from '../release.js';
-import { bakeSet, ensureZip, parseBakeableRepoId, validateResidentZip, type BakeResult } from './releaseBake.js';
+import {
+  bakeSet,
+  ensureZip,
+  parseBakeableRepoId,
+  validateResidentZip,
+  type BakeResult,
+  type PinnedEntry,
+} from './releaseBake.js';
 
 /** The host's build-default manifest for the §6.1b strip lint (region → repo scope
  *  + first-party-only ceiling). Empty today: the registry's first-party-only set is
@@ -130,6 +142,10 @@ const readAuthoring = (dir: string): ReleaseAuthoring[] => {
     if (!a.apps || typeof a.apps !== 'object') {
       throw new Error(`${f}: missing "apps" map`);
     }
+    if (a.unpinned && !a.channel) {
+      // R3-658: only a channel template publishes unpinned (§5 step 4).
+      throw new Error(`${f}: "unpinned": true is only allowed on a channel template ("channel": true)`);
+    }
     return a;
   });
 };
@@ -159,11 +175,28 @@ const assertLockValid = (lock: ReleaseLock, name: string): void => {
   if (!lock.apps || typeof lock.apps !== 'object') throw new Error(`${name}: missing apps`);
   for (const [region, e] of Object.entries(lock.apps)) {
     if (!e || typeof e.repo !== 'string') throw new Error(`${name}: region ${region} missing repo`);
-    if (typeof e.commit !== 'string' || !COMMIT_RE.test(e.commit)) {
+    if (e.commit === undefined && lock.unpinned === true) {
+      // R3-658: a lock marked unpinned follows refs — every such entry names one.
+      if (typeof e.ref !== 'string' || e.ref === '') throw new Error(`${name}: region ${region} names no ref`);
+    } else if (typeof e.commit !== 'string' || !COMMIT_RE.test(e.commit)) {
       throw new Error(`${name}: region ${region} is not SHA-pinned`);
     }
     parseBindingId(e.repo);
   }
+};
+
+/** R3-658 (§4.4) — `base` and `stable` serve production-facing compositions, so
+ *  neither may target an unpinned lock. Shared by write mode and `--check`. */
+const unpinnedChannelProblems = (
+  channels: Record<string, string>,
+  locks: readonly { id: string; lockText: string }[],
+): string[] => {
+  const unpinned = new Set(
+    locks.filter((l) => (JSON.parse(l.lockText) as ReleaseLock).unpinned === true).map((l) => l.id),
+  );
+  return PINNED_ONLY_CHANNELS.filter((c) => channels[c] !== undefined && unpinned.has(channels[c]!)).map(
+    (c) => `channel "${c}" targets "${channels[c]}", an unpinned lock — ${c} must stay pinned (§4.4)`,
+  );
 };
 
 /** Parse `--channel a=b,c=d` (comma-separated pairs; the args parser keeps the
@@ -210,7 +243,7 @@ const readCommittedChannels = (dir: string): Record<string, string> => {
   }
 };
 
-type Bake = (dir: string, entry: ReleaseLockEntry) => Promise<BakeResult>;
+type Bake = (dir: string, entry: PinnedEntry) => Promise<BakeResult>;
 
 /** §5 5a — ensure the registry zip of every pin the given locks carry
  *  (deduplicated; a resident zip is reused, never rebuilt). The first failure
@@ -486,6 +519,11 @@ export const runPinRelease = async (args: ParsedArgs): Promise<number> => {
     console.error(`pin-release: ${err instanceof Error ? err.message : String(err)}`);
     return 1;
   }
+  const pinnedOnly = unpinnedChannelProblems(channels, [...written, ...orphans]);
+  if (pinnedOnly.length) {
+    for (const p of pinnedOnly) console.error(`pin-release: ${p}`);
+    return 1;
+  }
 
   // §5 5a — bake the registry zips for EVERY pin the index will carry
   // (deduplicated; existing paths reused, never rebuilt).
@@ -575,6 +613,7 @@ const runCheck = (dir: string, authoring: ReleaseAuthoring[]): number => {
   } catch (err) {
     problems.push(err instanceof Error ? err.message : String(err));
   }
+  problems.push(...unpinnedChannelProblems(committedChannels, locks));
   const expectedIndex = serializeIndex(buildIndex(locks, committedChannels));
   if (committedIndexText && committedIndexText !== expectedIndex) {
     problems.push('index.json is out of date or has wrong digests (run pin-release to regenerate)');
@@ -595,6 +634,7 @@ const runCheck = (dir: string, authoring: ReleaseAuthoring[]): number => {
     let absent = 0;
     for (const l of locks) {
       for (const entry of Object.values((JSON.parse(l.lockText) as ReleaseLock).apps)) {
+        if (!entry.commit) continue; // R3-658: an unpinned entry has no zip (§3.2)
         const bakeable = parseBakeableRepoId(entry.repo);
         if (!bakeable) {
           console.warn(

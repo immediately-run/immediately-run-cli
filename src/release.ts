@@ -75,6 +75,11 @@ export interface ReleaseAuthoring {
    *  belongs to the CHANNEL, so a plain `<id>.lock.json` must never exist (the
    *  dual-name rule). `--check` therefore requires no plain lock for it. */
   channel?: boolean;
+  /** R3-658 (UI_RELEASES_SPEC §3.2/§5 step 4): publish an UNPINNED lock — each
+   *  entry keeps its ref and no commit, so the region follows the branch head.
+   *  Only a channel template may carry it (`--check` and write mode refuse it
+   *  otherwise), and a `base`/`stable` channel may never target the result. */
+  unpinned?: boolean;
   /** region id → canonical id string `provider:ns/repo[@ref]`. */
   apps: Record<string, string>;
 }
@@ -82,15 +87,22 @@ export interface ReleaseAuthoring {
 export interface ReleaseLockEntry {
   repo: string;
   ref?: string;
-  commit: string;
+  /** Absent only in a lock marked `unpinned` (R3-658). */
+  commit?: string;
 }
 
 export interface ReleaseLock {
   schemaVersion: typeof RELEASE_SCHEMA_VERSION;
   id: string;
   label?: string;
+  /** R3-658 — entries follow refs, not commits; no zips are baked for it. */
+  unpinned?: true;
   apps: Record<string, ReleaseLockEntry>;
 }
+
+/** R3-658 — the channels that serve production-facing compositions: neither may
+ *  ever target an unpinned lock (UI_RELEASES_SPEC §4.4). */
+export const PINNED_ONLY_CHANNELS: readonly string[] = ['base', 'stable'];
 
 export interface ReleaseIndexEntry {
   label?: string;
@@ -261,6 +273,16 @@ export const resolveLock = (
   const apps: Record<string, ReleaseLockEntry> = {};
   for (const region of Object.keys(flatApps).sort()) {
     const binding = parseBindingId(flatApps[region]!);
+    if (authoring.unpinned) {
+      // §5 step 4's one exception: no ref resolution — the entry follows its ref.
+      if (!binding.ref || binding.commit) {
+        throw new Error(
+          `release "${authoring.id}" region "${region}": an unpinned release names a ref and no commit (${flatApps[region]})`,
+        );
+      }
+      apps[region] = { repo: appKey(binding), ref: binding.ref };
+      continue;
+    }
     const commit = resolver(binding);
     apps[region] = {
       repo: appKey(binding),
@@ -272,6 +294,7 @@ export const resolveLock = (
     schemaVersion: RELEASE_SCHEMA_VERSION,
     id: authoring.id,
     ...(authoring.label ? { label: authoring.label } : {}),
+    ...(authoring.unpinned ? { unpinned: true as const } : {}),
     apps,
   };
 };
@@ -284,12 +307,13 @@ export const serializeLock = (lock: ReleaseLock): string => {
     schemaVersion: lock.schemaVersion,
     id: lock.id,
     ...(lock.label ? { label: lock.label } : {}),
+    ...(lock.unpinned ? { unpinned: true as const } : {}),
     apps: Object.fromEntries(
       Object.keys(lock.apps)
         .sort()
         .map((region) => {
           const e = lock.apps[region]!;
-          return [region, { repo: e.repo, ...(e.ref ? { ref: e.ref } : {}), commit: e.commit }];
+          return [region, { repo: e.repo, ...(e.ref ? { ref: e.ref } : {}), ...(e.commit ? { commit: e.commit } : {}) }];
         }),
     ),
   };

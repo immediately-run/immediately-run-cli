@@ -22,6 +22,7 @@ import {
   validateChannels,
 } from '../dist/release.js';
 import { runPinRelease } from '../dist/commands/pinRelease.js';
+import { bakeSet } from '../dist/commands/releaseBake.js';
 import { parseArgs } from '../dist/args.js';
 
 const SHA = 'a'.repeat(40);
@@ -556,6 +557,120 @@ test('pin-release --check fails loudly on a STALE channels.base pointer (the tar
       errs.some((line) => line.includes("channels.base's target")),
       `expected the coverage branch's own refusal (channels.base's target); got: ${errs.join(' | ').slice(0, 300)}`,
     );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// --- R3-658: the unpinned lock (UI_RELEASES_SPEC §3.2, §4.4, §5 step 4) -------
+
+const unpinnedTesting = {
+  id: 'testing',
+  label: 'Head of main',
+  extends: 'base',
+  channel: true,
+  unpinned: true,
+  apps: { 'panel.spaces': 'github:ir/sm@main' },
+};
+
+test('resolveLock: an unpinned authoring keeps each ref, resolves nothing, marks the lock', () => {
+  const lock = resolveLock(
+    { id: 'testing', unpinned: true, apps: {} },
+    { 'panel.spaces': 'github:ir/sm@main', 'task.edit-file': 'github:ir/ef@next' },
+    () => assert.fail('an unpinned lock resolves no ref'),
+  );
+  assert.equal(lock.unpinned, true);
+  assert.deepEqual(lock.apps, {
+    'panel.spaces': { repo: 'github:ir/sm', ref: 'main' },
+    'task.edit-file': { repo: 'github:ir/ef', ref: 'next' },
+  });
+  const text = serializeLock(lock);
+  assert.ok(text.includes('"unpinned": true'));
+  assert.ok(!text.includes('"commit"'));
+});
+
+test('resolveLock: an unpinned entry needs a ref and no commit', () => {
+  for (const id of ['github:ir/sm', `github:ir/sm@main#${SHA}`]) {
+    assert.throws(() => resolveLock({ id: 'testing', unpinned: true, apps: {} }, { 'panel.spaces': id }, stub), /names a ref and no commit/);
+  }
+});
+
+test('bakeSet skips unpinned entries (nothing to bake)', () => {
+  const pinned = { apps: { a: { repo: 'github:ir/x', ref: 'main', commit: SHA } } };
+  const unpinned = { unpinned: true, apps: { a: { repo: 'github:ir/x', ref: 'main' } } };
+  assert.deepEqual(bakeSet([pinned, unpinned]), [pinned.apps.a]);
+});
+
+test('write mode: an unpinned channel template publishes an unpinned dated lock, and --check accepts it', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pin-release-'));
+  try {
+    writePinnedFixture(dir);
+    writeFileSync(join(dir, 'testing.json'), JSON.stringify(unpinnedTesting, null, 2));
+    const code = await runPinRelease({
+      positionals: [],
+      flags: { dir, 'no-bake': true, only: 'testing', dated: 'testing', channel: 'testing=@dated' },
+    });
+    assert.equal(code, 0); // no network: nothing is resolved
+    const index = JSON.parse(readFileSync(join(dir, 'index.json'), 'utf8'));
+    const lock = JSON.parse(readFileSync(join(dir, `${index.channels.testing}.lock.json`), 'utf8'));
+    assert.equal(lock.unpinned, true);
+    assert.deepEqual(lock.apps['panel.spaces'], { repo: 'github:ir/sm', ref: 'main' });
+    assert.equal(await runPinRelease({ positionals: [], flags: { dir, check: true } }), 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('"unpinned" outside a channel template is refused', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pin-release-'));
+  try {
+    writePinnedFixture(dir);
+    writeFileSync(join(dir, 'loose.json'), JSON.stringify({ id: 'loose', extends: 'base', unpinned: true, apps: {} }));
+    // Like every authoring error, it aborts the run naming the file.
+    await assert.rejects(runPinRelease({ positionals: [], flags: { dir, check: true } }), /loose\.json: "unpinned": true/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('base and stable may never target an unpinned lock — write mode and --check both refuse', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pin-release-'));
+  try {
+    writePinnedFixture(dir);
+    writeFileSync(join(dir, 'testing.json'), JSON.stringify(unpinnedTesting, null, 2));
+    assert.equal(
+      await runPinRelease({
+        positionals: [],
+        flags: { dir, 'no-bake': true, only: 'testing', dated: 'testing', channel: 'testing=@dated' },
+      }),
+      0,
+    );
+    const target = JSON.parse(readFileSync(join(dir, 'index.json'), 'utf8')).channels.testing;
+    // write mode
+    assert.equal(
+      await runPinRelease({ positionals: [], flags: { dir, 'no-bake': true, only: 'testing', dated: 'testing', channel: `stable=${target}` } }),
+      1,
+    );
+    // --check over a hand-edited index carrying the same shape
+    const index = JSON.parse(readFileSync(join(dir, 'index.json'), 'utf8'));
+    index.channels.stable = target;
+    writeFileSync(join(dir, 'index.json'), serializeIndex(index));
+    assert.equal(await runPinRelease({ positionals: [], flags: { dir, check: true } }), 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('--check still refuses a commit-less entry in a lock NOT marked unpinned', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pin-release-'));
+  try {
+    writeFixture(dir);
+    const lock = JSON.parse(readFileSync(join(dir, 'base.lock.json'), 'utf8'));
+    delete lock.apps['panel.spaces'].commit;
+    const lockText = serializeLock(lock);
+    writeFileSync(join(dir, 'base.lock.json'), lockText);
+    writeFileSync(join(dir, 'index.json'), serializeIndex(buildIndex([{ id: 'base', lockText, label: 'Default' }])));
+    assert.equal(await runPinRelease({ positionals: [], flags: { dir, check: true } }), 1);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
