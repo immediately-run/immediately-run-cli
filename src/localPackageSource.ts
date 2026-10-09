@@ -213,12 +213,12 @@ export const RUNTIME_EXTENSIONS = ['.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx',
  *
  * ⚠ THIS RETURNS ALL CANDIDATES, NOT THE FIRST, AND THAT IS THE POINT. An earlier cut
  * returned one, picked with node's importer-aware extension order (`.cjs` first from a CJS
- * file). That order is node's; the runtime's is a single fixed list, `.js` before `.cjs`,
- * the same for every importer (`bundler.ts` `extensions`, consumed by
- * `resolveFromCdnLayout`). Picking either one is a bet on which resolver runs — the fast
- * path, the general resolver, or an `exports` map choosing a different entry build — and a
- * lost bet leaves a file the runtime DOES load sitting in the zip as a bare size, which is a
- * blocking unpkg fetch at boot.
+ * file). The runtime's order is the default list with ONE importer-aware exception: a
+ * `.cjs` importer tries `.cjs` first (R3-577, `bundler.ts` `extensions` reordered by
+ * `importerAwareExtensions`, consumed by `resolveFromCdnLayout`). Picking either one is a
+ * bet on which resolver runs — the fast path, the general resolver, or an `exports` map
+ * choosing a different entry build — and a lost bet leaves a file the runtime DOES load
+ * sitting in the zip as a bare size, which is a blocking unpkg fetch at boot.
  *
  * There is nothing to gain by choosing. A dual-published package ships `x.js` and `x.cjs`
  * for the same specifier; carrying both costs bytes (measured: omnibox 3.85x the CDN's
