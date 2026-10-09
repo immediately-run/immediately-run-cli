@@ -201,10 +201,11 @@ const JS_RE = /\.(c|m)?js$/;
 /**
  * The extension list the RUNTIME resolves relative specifiers with, in its order.
  *
- * Single-sourced from `sandbox/src/bundler/bundler.ts` (the `extensions` default that
- * `resolveFromCdnLayout` receives) and checked against it by
- * `scripts/check-scanner-drift.mjs`, because a private copy of someone else's resolution
- * order is exactly the kind of thing that silently stops matching.
+ * Single-sourced from `sandbox/src/resolver/utils/extensions.ts` (DEFAULT_EXTENSIONS, the
+ * one canonical spelling since R3-577; `bundler.ts` imports it and reorders a copy per
+ * importer) and checked against it by `scripts/check-scanner-drift.mjs`, because a private
+ * copy of someone else's resolution order is exactly the kind of thing that silently stops
+ * matching.
  */
 export const RUNTIME_EXTENSIONS = ['.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx', '.mdx'];
 
