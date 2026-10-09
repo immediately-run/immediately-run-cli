@@ -27,10 +27,15 @@ const PAIRS = [
 
 // The SECOND thing copied out of the sandbox, and the one that cost a live acceptance: the
 // order the runtime resolves relative specifiers in. `RUNTIME_EXTENSIONS` must equal
-// `bundler.ts`'s `extensions` default verbatim, ORDER INCLUDED — `.js` before `.cjs` is the
-// whole content of the rule, and a copy that merely holds the same SET resolves
+// `bundler.ts`'s `extensions` default verbatim, ORDER INCLUDED — the default list is the
+// rule for every importer except a `.cjs` file, which tries `.cjs` FIRST (R3-577's
+// `importerAwareExtensions`), and a copy that merely holds the same SET resolves
 // `./Omnibox` to the other build and mispairs the interop. Not a missing file; a wrong one.
-const EXT_SOURCE = ['src/bundler/bundler.ts', /extensions: string\[\] = (\[[^\]]*\])/];
+// R3-577 moved the list out of bundler.ts into the resolver's own module and
+// renamed it DEFAULT_EXTENSIONS; the importer-aware reorder reads it from there
+// (bundler.ts reorders a COPY per importer). Read the canonical spelling at its
+// one home.
+const EXT_SOURCE = ['src/resolver/utils/extensions.ts', /DEFAULT_EXTENSIONS: string\[\] = (\[[^\]]*\])/];
 const MINE_EXT = ['src/localPackageSource.ts', /RUNTIME_EXTENSIONS = (\[[^\]]*\])/];
 
 const extract = (text, re, what) => {
