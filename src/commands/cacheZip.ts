@@ -343,7 +343,7 @@ const resolveBundledPackages = async (
   // always lose to the augmented build deps npm never installs.
   const localBuilt: BundledPackage[] = [];
   const platformBuilt = new Set<string>();
-  const peerOfLocal = new Set<string>();
+  const peerOfLocal = new Map<string, Set<string>>();
   const needCdn: typeof lockset.resolved = [];
   const localRefusals: string[] = [];
   for (const entry of lockset.resolved) {
@@ -387,14 +387,15 @@ const resolveBundledPackages = async (
         // its consumer's environment (the app's own react for the injected
         // react-error-boundary), never from this lockset — npm semantics. The
         // source package.json is in hand here, so the peer names are read from
-        // the producer, not guessed from content.
+        // the producer, not guessed from content — and keyed PER PACKAGE, so
+        // one package's peer can never mask a miss inside another.
         try {
           const peers = (
             JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')) as {
               peerDependencies?: Record<string, string>;
             }
           ).peerDependencies;
-          for (const peer of Object.keys(peers ?? {})) peerOfLocal.add(peer);
+          if (peers) peerOfLocal.set(name, new Set(Object.keys(peers)));
         } catch {
           // an unreadable package.json already failed the local build above
         }
@@ -446,7 +447,7 @@ const resolveBundledPackages = async (
   // `github:`-pinned deps resolve from mounts at boot, never from the
   // lockset, so their absence from `resolved` is by design, not a skew.
   const { deps: headDeps, registryResolved } = headDependencies(repo);
-  const exempt = new Set<string>([...registryResolved, ...peerOfLocal]);
+  const exempt = new Set<string>(registryResolved);
   for (const [depName, range] of Object.entries(headDeps)) {
     if (typeof range === 'string' && range.startsWith('github:')) exempt.add(depName);
   }
@@ -454,6 +455,7 @@ const resolveBundledPackages = async (
     outcome.packages,
     new Set(lockset.resolved.map((entry) => entry.n)),
     exempt,
+    peerOfLocal,
   );
   const importMisses = findings.filter((finding) => finding.source === 'import');
   if (importMisses.length) {

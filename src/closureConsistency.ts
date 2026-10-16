@@ -16,37 +16,44 @@ import type { BundledPackage } from './lockset.js';
  * nothing compared the halves. This module is the comparison.
  *
  * Content evidence is read from the SAME wire format the runtime decodes —
- * the `ICDNModule` msgpack (`f` files, `m` externals) — for local-built and
- * CDN-fetched packages alike (`encodeLocalPackage` produces the CDN's shape
- * verbatim), so there is one reader and no source special-casing. A file
- * entry's `.d` is the producer-computed require list: a bare specifier there
- * is a require the runtime WILL execute, and it is a hard failure when the
- * resolved set holds neither it nor an exemption. A name only in `.m` is
- * declared-but-unimported — peers and lazily-required optionals live there —
- * so it warns, never fails.
+ * the `ICDNModule` msgpack (`f` files, `m` the package-level import list)
+ * — for local-built and CDN-fetched packages alike (`encodeLocalPackage`
+ * produces the CDN's shape verbatim), so there is one reader and no source
+ * special-casing. A file entry's `.d` is the producer-computed require list:
+ * a bare specifier there is a require the runtime WILL execute, and it is a
+ * hard failure when the resolved set holds neither it nor an exemption. A
+ * name in `.m` but no file's `.d` is warn-only: the sandbox's boot-time
+ * rescue (R3-1203's fix) reconciles exactly the `m` list, so an `m`-named
+ * miss degrades at boot while a `.d`-only miss the rescue never sees is the
+ * one the build must refuse (the rescue partition, not a declared/imported
+ * distinction, is what separates the two tiers).
  */
 
-/** One dependency the resolved set (and the exempt set) does not cover. */
+/** One dependency the resolved set (and the exemptions) does not cover. */
 export interface ClosureFinding {
   /** The bundled package whose shipped content names the dependency. */
   name: string;
   version: string;
-  /** The bare dependency name the content requires (or declares). */
+  /** The bare dependency name the content requires (or the undecodable
+   *  marker, see below). */
   dependency: string;
   /** `import` — a `.d` require the runtime will execute (fails the build);
-   *  `declared` — an `.m`-only name (warns). */
+   *  `declared` — an `m`-only name (warns). */
   source: 'import' | 'declared';
 }
 
 /**
  * The bare package name a specifier resolves to, or null when it is not a
- * bare specifier: relative (`./x`, `../x`), absolute (`/x`), and URL-scheme
- * (`https://…`, `node:…`) forms never name a registry package. A subpath
- * (`react/jsx-runtime`) resolves to the package root the runtime preloads;
- * a scope takes two segments (`@scope/pkg/sub` → `@scope/pkg`).
+ * bare specifier: relative (`./x`, `../x`), absolute (`/x`), URL-scheme
+ * (`https://…`, `node:…`) and Node-internal (`#internal`) forms never name a
+ * registry package. A subpath (`react/jsx-runtime`) resolves to the package
+ * root the runtime preloads; a scope takes two segments
+ * (`@scope/pkg/sub` → `@scope/pkg`).
  */
 export function bareDependencyName(specifier: string): string | null {
-  if (specifier === '' || specifier.startsWith('.') || specifier.startsWith('/')) return null;
+  if (specifier === '' || specifier.startsWith('.') || specifier.startsWith('/') || specifier.startsWith('#')) {
+    return null;
+  }
   if (/^[a-zA-Z][a-zA-Z\d+.-]*:/.test(specifier)) return null; // node:fs, https://…, data:…
   if (specifier.startsWith('@')) {
     const [scope, pkg] = specifier.split('/');
@@ -69,54 +76,66 @@ const asStringArray = (value: unknown): string[] =>
 
 /**
  * Report every bare dependency named by shipped content that neither the
- * resolved set nor the exempt set holds.
+ * resolved set nor an exemption holds.
  *
  * `resolvedNames` is the lockset's resolved package names. `exemptNames` is
- * the other-rail set the venue provides by another route: the app's
- * `registryResolved` self-hosted names and `github:`-pinned deps (both
- * resolve from mounts at boot, never from the lockset). Node builtins are
- * exempt here — the `node:` prefix and `builtinModules` alike, because the
- * runtime stubs them (R3-411).
+ * the app-level other-rail set: the app's `registryResolved` self-hosted
+ * names and `github:`-pinned deps (both resolve from mounts at boot, never
+ * from the lockset). `peerImports` carries each locally-built package's OWN
+ * peer dependencies, keyed by package name: a peer resolves against its
+ * consumer's environment (the app's own react for the injected
+ * react-error-boundary), so a package's import of its own peer is exempt FOR
+ * THAT PACKAGE ONLY — a name-keyed global set would let one package's peer
+ * mask a genuine miss inside another.
+ *
+ * Node builtins are exempt here — bare and `node:`-prefixed alike, because
+ * the runtime stubs them (R3-411).
  */
 export function closureFindings(
   packages: readonly BundledPackage[],
   resolvedNames: ReadonlySet<string>,
   exemptNames: ReadonlySet<string> = new Set(),
+  peerImports: ReadonlyMap<string, ReadonlySet<string>> = new Map(),
 ): ClosureFinding[] {
   const findings: ClosureFinding[] = [];
   for (const pkg of packages) {
-    let decoded: DecodedModule;
+    let decoded: unknown;
     try {
-      decoded = decodeMsgPack(pkg.bytes) as DecodedModule;
+      decoded = decodeMsgPack(pkg.bytes);
     } catch (err) {
-      // Undecodable bytes are a finding about the package, not a skip: the
-      // runtime would fail the same decode at preload.
-      findings.push({
-        name: pkg.name,
-        version: pkg.version,
-        dependency: `<undecodable content: ${err instanceof Error ? err.message.split('\n')[0] : String(err)}>`,
-        source: 'import',
-      });
+      findings.push(undecodableFinding(pkg, err));
       continue;
     }
+    if (decoded === null || typeof decoded !== 'object' || Array.isArray(decoded)) {
+      findings.push(undecodableFinding(pkg, new Error(`decoded to ${Array.isArray(decoded) ? 'an array' : String(decoded)}`)));
+      continue;
+    }
+    const module = decoded as DecodedModule;
+    const ownPeers = peerImports.get(pkg.name);
     // Pass 1 — the requires the runtime WILL execute (file entries' `.d`).
     const imported = new Set<string>();
-    for (const entry of Object.values(decoded.f ?? {})) {
+    for (const entry of Object.values(module.f ?? {})) {
       if (entry === null || typeof entry === 'number') continue; // size-only entry
       for (const specifier of asStringArray(entry.d)) {
+        if (specifier.startsWith('node:')) continue;
         const bare = bareDependencyName(specifier);
-        if (bare === null || isExempt(bare, exemptNames)) continue;
+        if (bare === null || resolvedNames.has(bare) || isExempt(bare, exemptNames)) continue;
+        if (ownPeers?.has(bare)) continue; // this package's own peer — npm semantics
         imported.add(bare);
-        if (!resolvedNames.has(bare)) {
-          findings.push({ name: pkg.name, version: pkg.version, dependency: bare, source: 'import' });
-        }
       }
     }
-    // Pass 2 — declared-but-unimported externals (`.m`): warn-only, and a
-    // name pass 1 already covered as an import stays an import finding.
-    for (const name of asStringArray(decoded.m)) {
-      const bare = bareDependencyName(name) ?? name;
+    for (const bare of imported) {
+      findings.push({ name: pkg.name, version: pkg.version, dependency: bare, source: 'import' });
+    }
+    // Pass 2 — the package-level import list (`m`) outside every file's `.d`:
+    // warn-only, per the boot-rescue partition above. Non-bare entries
+    // (`node:fs`, relative forms) are skipped by the same extraction pass 1
+    // uses — they name nothing the lockset could hold.
+    for (const name of asStringArray(module.m)) {
+      const bare = bareDependencyName(name);
+      if (bare === null) continue;
       if (imported.has(bare) || resolvedNames.has(bare) || isExempt(bare, exemptNames)) continue;
+      if (ownPeers?.has(bare)) continue;
       findings.push({ name: pkg.name, version: pkg.version, dependency: bare, source: 'declared' });
     }
   }
@@ -133,13 +152,23 @@ export function closureFindings(
   return [...seen.values()];
 }
 
+const undecodableFinding = (pkg: BundledPackage, err: unknown): ClosureFinding => ({
+  name: pkg.name,
+  version: pkg.version,
+  dependency: `<undecodable: ${err instanceof Error ? err.message.split('\n')[0] : String(err)}>`,
+  source: 'import',
+});
+
 /** Node builtins arrive bare (`fs`) and prefixed (`node:fs`); both are
  *  stubbed by the runtime, so both are exempt regardless of the caller's
  *  set. */
 const isExempt = (bare: string, exemptNames: ReadonlySet<string>): boolean =>
   exemptNames.has(bare) || exemptNames.has(`node:${bare}`) || builtinModules.includes(bare);
 
-/** The one-line failure message for an `import`-source finding, exactly as
- *  the item prescribes: package, version, missing dependency, remediation. */
+/** The one-line failure message for an `import`-source finding: package,
+ *  version, missing dependency, remediation — or, for undecodable content,
+ *  the fact the runtime would fail the same decode at preload. */
 export const closureFailureMessage = (finding: ClosureFinding): string =>
-  `closure inconsistency: ${finding.name}@${finding.version} content imports ${finding.dependency}, but the resolved dependency set does not include it — pin ${finding.dependency} in the app's package.json or refresh the CDN mirror`;
+  finding.dependency.startsWith('<undecodable')
+    ? `closure inconsistency: ${finding.name}@${finding.version} bundled content is not decodable ICDNModule msgpack (${finding.dependency.slice('<undecodable: '.length, -1)}) — the runtime would fail the same decode at preload; pin ${finding.name} to a version whose content serves, or refresh the CDN mirror`
+    : `closure inconsistency: ${finding.name}@${finding.version} content imports ${finding.dependency}, but the resolved dependency set does not include it — pin ${finding.dependency} in the app's package.json or refresh the CDN mirror`;

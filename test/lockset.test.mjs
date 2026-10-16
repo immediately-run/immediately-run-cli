@@ -112,6 +112,14 @@ before(async () => {
       res.end();
       return;
     }
+    // /package/<key> responses are ICDNModule OBJECTS, not the /dep_tree
+    // array — the closure-consistency check decodes bundled content (R3-1204)
+    // and an array body there is an undecodable finding, not a module.
+    if (req.url.startsWith('/package/')) {
+      res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
+      res.end(Buffer.from(encodeMsgPack({ f: {}, m: [] })));
+      return;
+    }
     res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
     const body = dropFromDepTree
       ? RESOLVED.filter((r) => r.n !== dropFromDepTree)

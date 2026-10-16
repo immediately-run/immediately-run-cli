@@ -141,6 +141,53 @@ test('a name both imported and declared reports once, as the import', () => {
   assert.equal(findings[0].source, 'import');
 });
 
+test('bareDependencyName refuses Node-internal #imports', () => {
+  assert.equal(bareDependencyName('#internal'), null);
+});
+
+test('a peer exemption is per-importer: one package\'s peer never masks another\'s miss', () => {
+  const a = bundled('pkg-with-peers', '1.0.0', {
+    f: { 'index.js': { c: '// a', d: ['react'], t: false } },
+    m: [],
+  });
+  const b = bundled('pkg-without-peers', '1.0.0', {
+    f: { 'index.js': { c: '// b', d: ['react'], t: false } },
+    m: [],
+  });
+  const findings = closureFindings(
+    [a, b],
+    new Set(),
+    new Set(),
+    new Map([['pkg-with-peers', new Set(['react'])]]),
+  );
+  // pkg-with-peers imports its own peer react (npm semantics: the consumer
+  // supplies it); pkg-without-peers imports react with no peer relationship —
+  // a genuine miss.
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].name, 'pkg-without-peers');
+  assert.equal(findings[0].dependency, 'react');
+});
+
+test('a non-bare m entry (node:fs, relative) is skipped, not warned', () => {
+  const pkg = bundled('app-pkg', '1.0.0', { f: {}, m: ['node:fs', './x', 'https://esm.sh/y'] });
+  assert.deepEqual(closureFindings([pkg], new Set()), []);
+});
+
+test('undecodable or non-module bytes are an import-source finding naming the package', () => {
+  const nullBytes = new Uint8Array(Buffer.from(encodeMsgPack(null)));
+  const findings = closureFindings(
+    [{ key: 'k', name: 'broken-pkg', version: '2.0.0', bytes: nullBytes }],
+    new Set(['everything']),
+  );
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].source, 'import');
+  assert.equal(findings[0].name, 'broken-pkg');
+  assert.match(
+    closureFailureMessage(findings[0]),
+    /closure inconsistency: broken-pkg@2\.0\.0 bundled content is not decodable ICDNModule msgpack/,
+  );
+});
+
 // --- integration: cache-zip over a fake CDN --------------------------------
 
 // Complete over the react-preset augmentation (computeInputDepMap adds core-js
@@ -219,6 +266,30 @@ test('end-to-end fail: content importing a package the resolution omits rejects 
       buildCacheZip(zipOpts(root, { bundlePackages: true })),
       /closure inconsistency: react@18\.3\.1 content imports prop-types, but the resolved dependency set does not include it/,
     );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('end-to-end: a registry-resolved name imported by bundled content does not fail the build', async () => {
+  const root = makeRepo();
+  try {
+    writeFileSync(
+      join(root, 'package.json'),
+      JSON.stringify({
+        dependencies: { react: '^18.2.0' },
+        'immediately.run': { resolveFromRegistry: ['self-hosted-lib'] },
+      }),
+    );
+    const g = (args) => execFileSync('git', ['-C', root, ...args], { stdio: 'pipe' });
+    g(['add', 'package.json']);
+    g(['commit', '-q', '-m', 'registry-resolved dep']);
+    moduleFor = (key) =>
+      Buffer.from(key, 'base64').toString('utf8').includes('react@')
+        ? { f: { 'index.js': { c: '// react', d: ['self-hosted-lib'], t: false } }, m: [] }
+        : { f: { 'index.js': { c: `// ${key}`, d: [], t: false } }, m: [] };
+    const result = await buildCacheZip(zipOpts(root, { bundlePackages: true }));
+    assert.match(result.bundledPackagesSummary, new RegExp(`^${RESOLVED.length} packages, `));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
