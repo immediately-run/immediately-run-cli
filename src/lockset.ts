@@ -15,6 +15,7 @@ import {
   assertDependenciesResolved,
   concreteVersion,
   computeInputDepMap,
+  filterBuildDeps,
   findUnrequestedPrereleases,
   type DepMap,
 } from '@immediately-run/transpiler';
@@ -25,7 +26,7 @@ import {
 // DepMap derivation, the resolution-completeness guard and the prerelease
 // guard live in exactly one place, shared with the sandbox bundler.
 // Re-exported here for convenience.
-export { assertDependenciesResolved, computeInputDepMap, type DepMap };
+export { assertDependenciesResolved, computeInputDepMap, filterBuildDeps, type DepMap };
 
 // Mirrors sandbox/src/bundler/module-registry/module-cdn.ts (CDN_ROOT,
 // CDN_VERSION). Drift is safe — the runtime checks `cdnVersion` and falls back
