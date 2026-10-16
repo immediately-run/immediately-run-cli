@@ -29,6 +29,7 @@ import {
   MANIFEST_SIDECAR_ENTRY,
   type RepoManifest,
 } from '../manifest.js';
+import { closureFailureMessage, closureFindings } from '../closureConsistency.js';
 import {
   DEFAULT_CDN_ROOT,
   fetchBundledPackages,
@@ -342,6 +343,7 @@ const resolveBundledPackages = async (
   // always lose to the augmented build deps npm never installs.
   const localBuilt: BundledPackage[] = [];
   const platformBuilt = new Set<string>();
+  const peerOfLocal = new Set<string>();
   const needCdn: typeof lockset.resolved = [];
   const localRefusals: string[] = [];
   for (const entry of lockset.resolved) {
@@ -381,6 +383,21 @@ const resolveBundledPackages = async (
           version,
           bytes: encodeLocalPackage(await buildLocalPackage(dir, scanCjsModule, transformFile)),
         });
+        // R3-1204: a locally-built package's PEER dependencies resolve against
+        // its consumer's environment (the app's own react for the injected
+        // react-error-boundary), never from this lockset — npm semantics. The
+        // source package.json is in hand here, so the peer names are read from
+        // the producer, not guessed from content.
+        try {
+          const peers = (
+            JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')) as {
+              peerDependencies?: Record<string, string>;
+            }
+          ).peerDependencies;
+          for (const peer of Object.keys(peers ?? {})) peerOfLocal.add(peer);
+        } catch {
+          // an unreadable package.json already failed the local build above
+        }
         continue;
       } catch (err) {
         // A package that cannot be built LOCALLY falls back to the CDN whole — never
@@ -393,6 +410,7 @@ const resolveBundledPackages = async (
     needCdn.push(entry);
   }
 
+  let outcome: { packages: BundledPackage[]; summary: string };
   try {
     const fetched = needCdn.length ? await fetchBundledPackages(needCdn, opts.cdnRoot) : [];
     const packages = [...localBuilt, ...fetched];
@@ -410,12 +428,46 @@ const resolveBundledPackages = async (
       ]
         .filter(Boolean)
         .join(', ') || 'nothing';
-    return { packages, summary: `${packages.length} packages, ${formatBytes(bytes)} (${source})` };
+    outcome = { packages, summary: `${packages.length} packages, ${formatBytes(bytes)} (${source})` };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.warn(`Warning: bundled packages omitted (${message})`);
     return { summary: `omitted (${message})` };
   }
+
+  // R3-1204 — closure consistency, deliberately OUTSIDE the omit catch above.
+  // A zip whose bundled content requires a dependency the resolution omits
+  // boots broken (the R3-1203 @codemirror/language escape): omitting the
+  // section here would silently fall back to live fetches of the SAME broken
+  // pair, so an `import`-source finding throws and `runCacheZip` exits
+  // non-zero — the red Pages workflow that keeps the venue on the last good
+  // zip. The exempt set is the other-rail names `headDependencies` already
+  // returns: the app's `registryResolved` self-hosted modules and
+  // `github:`-pinned deps resolve from mounts at boot, never from the
+  // lockset, so their absence from `resolved` is by design, not a skew.
+  const { deps: headDeps, registryResolved } = headDependencies(repo);
+  const exempt = new Set<string>([...registryResolved, ...peerOfLocal]);
+  for (const [depName, range] of Object.entries(headDeps)) {
+    if (typeof range === 'string' && range.startsWith('github:')) exempt.add(depName);
+  }
+  const findings = closureFindings(
+    outcome.packages,
+    new Set(lockset.resolved.map((entry) => entry.n)),
+    exempt,
+  );
+  const importMisses = findings.filter((finding) => finding.source === 'import');
+  if (importMisses.length) {
+    throw new Error(importMisses.map(closureFailureMessage).join('\n'));
+  }
+  const declaredOnly = findings.filter((finding) => finding.source === 'declared');
+  if (declaredOnly.length) {
+    console.warn(
+      `  · declared but unresolved in bundled content: ${declaredOnly
+        .map((finding) => `${finding.name}@${finding.version}: ${finding.dependency}`)
+        .join(', ')}`,
+    );
+  }
+  return outcome;
 };
 
 export const buildCacheZip = async (opts: CacheZipOptions): Promise<CacheZipResult> => {
