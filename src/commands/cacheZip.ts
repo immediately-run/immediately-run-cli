@@ -442,14 +442,23 @@ const resolveBundledPackages = async (
   // section here would silently fall back to live fetches of the SAME broken
   // pair, so an `import`-source finding throws and `runCacheZip` exits
   // non-zero — the red Pages workflow that keeps the venue on the last good
-  // zip. The exempt set is the other-rail names `headDependencies` already
-  // returns: the app's `registryResolved` self-hosted modules and
-  // `github:`-pinned deps resolve from mounts at boot, never from the
-  // lockset, so their absence from `resolved` is by design, not a skew.
+  // zip.
+  //
+  // The exempt set is the SELF-HOSTED rail, in two halves. The DECLARED
+  // half is derived from data in hand rather than re-typed:
+  // `computeInputDepMap` (the transpiler's single home for this) strips the
+  // unconditional self-hosted modules — `@immediately-run/sdk` — from the
+  // DepMap it embeds, so a head dependency the embedded DepMap no longer
+  // names is exactly a name the venue provides by another rail (the SDK from
+  // the host), and content importing it is not a skew — deriving from the
+  // two maps keeps one home for the strip set, where hardcoding the SDK
+  // would drift the day the transpiler's list changes. The OPT-IN half is
+  // the app's `resolveFromRegistry` names, which resolve from mounts at
+  // boot and need not be declared dependencies at all.
   const { deps: headDeps, registryResolved } = headDependencies(repo);
   const exempt = new Set<string>(registryResolved);
-  for (const [depName, range] of Object.entries(headDeps)) {
-    if (typeof range === 'string' && range.startsWith('github:')) exempt.add(depName);
+  for (const depName of Object.keys(headDeps)) {
+    if (!(depName in (lockset.dependencies ?? {}))) exempt.add(depName);
   }
   const findings = closureFindings(
     outcome.packages,

@@ -271,6 +271,31 @@ test('end-to-end fail: content importing a package the resolution omits rejects 
   }
 });
 
+test('end-to-end: the self-hosted SDK a declared app imports does not fail the build (the strip-set derivation)', async () => {
+  const root = makeRepo();
+  try {
+    writeFileSync(
+      join(root, 'package.json'),
+      JSON.stringify({ dependencies: { react: '^18.2.0', '@immediately-run/sdk': '^0.30.0' } }),
+    );
+    const g = (args) => execFileSync('git', ['-C', root, ...args], { stdio: 'pipe' });
+    g(['add', 'package.json']);
+    g(['commit', '-q', '-m', 'declare the sdk']);
+    // The transpiler strips the SDK from the embedded DepMap by construction,
+    // so it never appears in resolved — while real bundled content (the
+    // omnibox fixture shape) imports its subpaths. The exemption is DERIVED
+    // from the two maps (head deps minus embedded DepMap), never hardcoded.
+    moduleFor = (key) =>
+      Buffer.from(key, 'base64').toString('utf8').includes('react@')
+        ? { f: { 'index.js': { c: '// react', d: ['@immediately-run/sdk/platformLink'], t: false } }, m: [] }
+        : { f: { 'index.js': { c: `// ${key}`, d: [], t: false } }, m: [] };
+    const result = await buildCacheZip(zipOpts(root, { bundlePackages: true }));
+    assert.match(result.bundledPackagesSummary, new RegExp(`^${RESOLVED.length} packages, `));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('end-to-end: a registry-resolved name imported by bundled content does not fail the build', async () => {
   const root = makeRepo();
   try {

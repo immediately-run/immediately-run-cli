@@ -16,8 +16,10 @@ import type { BundledPackage } from './lockset.js';
  * nothing compared the halves. This module is the comparison.
  *
  * Content evidence is read from the SAME wire format the runtime decodes —
- * the `ICDNModule` msgpack (`f` files, `m` the package-level import list)
- * — for local-built and CDN-fetched packages alike (`encodeLocalPackage`
+ * the `ICDNModule` msgpack (`f` files, `m` the package-level dependency
+ * list; only the SHAPE is shared across rails — a CDN package's `m` is the
+ * producer's dist scan, a local build's is its declared deps + peers) —
+ * for local-built and CDN-fetched packages alike (`encodeLocalPackage`
  * produces the CDN's shape verbatim), so there is one reader and no source
  * special-casing. A file entry's `.d` is the producer-computed require list:
  * a bare specifier there is a require the runtime WILL execute, and it is a
@@ -170,5 +172,5 @@ const isExempt = (bare: string, exemptNames: ReadonlySet<string>): boolean =>
  *  the fact the runtime would fail the same decode at preload. */
 export const closureFailureMessage = (finding: ClosureFinding): string =>
   finding.dependency.startsWith('<undecodable')
-    ? `closure inconsistency: ${finding.name}@${finding.version} bundled content is not decodable ICDNModule msgpack (${finding.dependency.slice('<undecodable: '.length, -1)}) — the runtime would fail the same decode at preload; pin ${finding.name} to a version whose content serves, or refresh the CDN mirror`
+    ? `closure inconsistency: ${finding.name}@${finding.version} bundled content is not decodable ICDNModule msgpack (${finding.dependency.slice('<undecodable: '.length, -1)}) — at preload the runtime would silently replace it with a live CDN fetch, defeating the zip; pin ${finding.name} to a version whose content serves, or refresh the CDN mirror`
     : `closure inconsistency: ${finding.name}@${finding.version} content imports ${finding.dependency}, but the resolved dependency set does not include it — pin ${finding.dependency} in the app's package.json or refresh the CDN mirror`;
