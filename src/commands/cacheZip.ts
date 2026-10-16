@@ -36,6 +36,7 @@ import {
   LOCKSET_CDN_VERSION,
   encodePackageKey,
   computeInputDepMap,
+  filterBuildDeps,
   assertDependenciesResolved,
   fetchDepTreeGuarded,
   type ResolvedDependency,
@@ -451,14 +452,21 @@ const resolveBundledPackages = async (
   // DepMap it embeds, so a head dependency the embedded DepMap no longer
   // names is exactly a name the venue provides by another rail (the SDK from
   // the host), and content importing it is not a skew — deriving from the
-  // two maps keeps one home for the strip set, where hardcoding the SDK
-  // would drift the day the transpiler's list changes. The OPT-IN half is
+  // maps and the transpiler's own exported predicate keeps one home for
+  // both the strip set and the build filter, where hardcoding either would
+  // drift the day the transpiler's lists change. The OPT-IN half is
   // the app's `resolveFromRegistry` names, which resolve from mounts at
   // boot and need not be declared dependencies at all.
   const { deps: headDeps, registryResolved } = headDependencies(repo);
   const exempt = new Set<string>(registryResolved);
-  for (const depName of Object.keys(headDeps)) {
-    if (!(depName in (lockset.dependencies ?? {}))) exempt.add(depName);
+  // The transpiler's own build filter, applied to the SAME left side the
+  // strip set sees, so a declared BUILD dep (vite, babel) — which
+  // filterBuildDeps removes from the embedded DepMap too — is not mistaken
+  // for a self-hosted name: only names the build filter KEEPS yet the
+  // embedded DepMap lacks are the strip set's output.
+  const runtimeDeclared = filterBuildDeps(headDeps);
+  for (const depName of Object.keys(runtimeDeclared)) {
+    if (!(depName in lockset.dependencies)) exempt.add(depName);
   }
   const findings = closureFindings(
     outcome.packages,

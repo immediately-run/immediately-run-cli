@@ -169,7 +169,8 @@ const isExempt = (bare: string, exemptNames: ReadonlySet<string>): boolean =>
 
 /** The one-line failure message for an `import`-source finding: package,
  *  version, missing dependency, remediation — or, for undecodable content,
- *  the fact the runtime would fail the same decode at preload. */
+ *  the fact that at preload the runtime would silently replace the package
+ *  with a live CDN fetch, defeating the zip. */
 export const closureFailureMessage = (finding: ClosureFinding): string =>
   finding.dependency.startsWith('<undecodable')
     ? `closure inconsistency: ${finding.name}@${finding.version} bundled content is not decodable ICDNModule msgpack (${finding.dependency.slice('<undecodable: '.length, -1)}) — at preload the runtime would silently replace it with a live CDN fetch, defeating the zip; pin ${finding.name} to a version whose content serves, or refresh the CDN mirror`

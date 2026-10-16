@@ -271,6 +271,32 @@ test('end-to-end fail: content importing a package the resolution omits rejects 
   }
 });
 
+test('a declared BUILD dependency is not exempt — only the self-hosted rail is (the build-filter subtraction)', async () => {
+  const root = makeRepo();
+  try {
+    writeFileSync(
+      join(root, 'package.json'),
+      JSON.stringify({ dependencies: { react: '^18.2.0', vite: '^5.0.0' } }),
+    );
+    const g = (args) => execFileSync('git', ['-C', root, ...args], { stdio: 'pipe' });
+    g(['add', 'package.json']);
+    g(['commit', '-q', '-m', 'declare a build tool']);
+    // vite in dependencies is filtered from the embedded DepMap as a build
+    // dep — but it is NOT on the self-hosted rail, so runtime content
+    // importing it is a genuine miss and the build must go red.
+    moduleFor = (key) =>
+      Buffer.from(key, 'base64').toString('utf8').includes('react@')
+        ? { f: { 'index.js': { c: '// react', d: ['vite'], t: false } }, m: [] }
+        : { f: { 'index.js': { c: `// ${key}`, d: [], t: false } }, m: [] };
+    await assert.rejects(
+      buildCacheZip(zipOpts(root, { bundlePackages: true })),
+      /closure inconsistency: react@18\.3\.1 content imports vite, but the resolved dependency set does not include it/,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('end-to-end: the self-hosted SDK a declared app imports does not fail the build (the strip-set derivation)', async () => {
   const root = makeRepo();
   try {
