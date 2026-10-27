@@ -114,3 +114,38 @@ test('cache-zip prints the toolchain stamp it embedded (R3-843 — the build-sid
   assert.ok(stamp, 'the stamp line is printed');
   assert.match(stamp, /@immediately-run\/transpiler \d+\.\d+\.\d+ \(hash [0-9a-f]{12}…\), preset react/);
 });
+
+test('cache-zip emits no artifact for a test file or a top-level scripts/ file (R3-1300)', async () => {
+  const root = makeRepo();
+  const g = (args) => execFileSync('git', ['-C', root, ...args], { stdio: 'pipe' });
+  writeFileSync(join(root, 'src', 'App.test.tsx'), "import { App } from './App';\nexport const t = App;\n");
+  mkdirSync(join(root, 'scripts'));
+  writeFileSync(join(root, 'scripts', 'build.mjs'), 'export const build = 1;\n');
+  g(['add', '.']);
+  g(['commit', '-q', '-m', 'test + script']);
+  const out = join(root, 'out.zip');
+  try {
+    await buildCacheZip({
+      repoPath: root,
+      owner: 'o',
+      repository: 'r',
+      ref: 'main',
+      defaultBranch: 'main',
+      out,
+      lockset: false,
+    });
+    const names = entryNames(out);
+    // The tracked files themselves stay (verifyZipBlobs needs every blob).
+    assert.ok(names.includes('src/App.test.tsx'));
+    assert.ok(names.includes('scripts/build.mjs'));
+    assert.ok(names.includes('.immediately.run/artifacts/transpiled/src/App.tsx.js'));
+    assert.ok(!names.includes('.immediately.run/artifacts/transpiled/src/App.test.tsx.js'));
+    assert.ok(!names.includes('.immediately.run/artifacts/transpiled/scripts/build.mjs.js'));
+    const index = JSON.parse(
+      execFileSync('unzip', ['-p', out, '.immediately.run/artifacts/index.json'], { encoding: 'utf8' }),
+    );
+    assert.deepEqual(Object.keys(index.files).sort(), ['/index.tsx', '/src/App.tsx']);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

@@ -7,7 +7,12 @@ import { tmpdir } from 'node:os';
 
 import { transformFile, parseFrontmatter } from '@immediately-run/transpiler';
 import { treeEntries } from '../dist/git.js';
-import { assertEmittedSidecar, emitArtifacts, emitMdxMetadata } from '../dist/artifacts.js';
+import {
+  assertEmittedSidecar,
+  emitArtifacts,
+  emitMdxMetadata,
+  isArtifactExcluded,
+} from '../dist/artifacts.js';
 import { validateMdxMetadataSidecar } from '@immediately-run/platform-constants';
 import { buildCacheZip } from '../dist/commands/cacheZip.js';
 
@@ -348,19 +353,19 @@ test('emitMdxMetadata output is accepted by the shared validator, entry for entr
 test('a file whose deps contain a non-string specifier is omitted, not indexed (R3-843)', async () => {
   const root = makeRepo({
     'src/App.tsx': APP_TSX,
-    'scripts/drill.mjs':
+    'docs/drills/drill.mjs':
       "const P = '/tmp/x.js';\nconst { default: p } = await import(P);\nexport const y = 1;\n",
   });
   try {
     const emission = await emitArtifacts(root, treeEntries(root));
     assert.ok(
-      emission.skipped.some((sk) => sk.path === 'scripts/drill.mjs' && sk.reason === 'unresolvable-deps'),
+      emission.skipped.some((sk) => sk.path === 'docs/drills/drill.mjs' && sk.reason === 'unresolvable-deps'),
       `drill.mjs skipped with the named reason (got: ${JSON.stringify(emission.skipped)})`,
     );
-    assert.equal(emission.index.files['/scripts/drill.mjs'], undefined);
+    assert.equal(emission.index.files['/docs/drills/drill.mjs'], undefined);
     // …and the artifact FILE is withheld too — an entry in one map without the
     // other is the inconsistency class this guard exists against.
-    assert.ok(!emission.files.has('transpiled/scripts/drill.mjs.js'), 'the artifact file is withheld');
+    assert.ok(!emission.files.has('transpiled/docs/drills/drill.mjs.js'), 'the artifact file is withheld');
     // The healthy file still emits — one bad file must not cost the repo its artifacts.
     assert.ok(emission.index.files['/src/App.tsx'], 'App.tsx still emitted');
     for (const [k, v] of Object.entries(emission.index.files)) {
@@ -368,5 +373,32 @@ test('a file whose deps contain a non-string specifier is omitted, not indexed (
     }
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// R3-1300: no artifact for files no runtime path imports.
+test('isArtifactExcluded drops tests, test dirs and top-level scripts/, and nothing else', () => {
+  for (const p of [
+    'src/a.test.tsx',
+    'src/a.spec.ts',
+    'src/a.test.mjs',
+    'x/__tests__/b.ts',
+    'x/__fixtures__/c.tsx',
+    'scripts/build.mjs',
+    'node_modules/dep/index.js',
+    '.immediately.run/x.js',
+  ]) {
+    assert.equal(isArtifactExcluded(p), true, `${p} is excluded`);
+  }
+  for (const p of [
+    'src/testing.ts',
+    'src/contest.tsx',
+    'src/latest.ts',
+    'docs/scripts.md',
+    'src/scripts/x.ts',
+    'scripts/README.md',
+    'docs/a.test.mdx',
+  ]) {
+    assert.equal(isArtifactExcluded(p), false, `${p} is included`);
   }
 });
