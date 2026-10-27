@@ -85,11 +85,11 @@ const isExcluded = (relPath: string): boolean =>
   relPath.split('/').includes('node_modules');
 
 // Files no runtime path imports, so their artifacts are bytes every viewer download
-// pays for and nothing reads (R3-1300): test files, test-only directories, and the
-// repo's top-level build scripts. They stay in the zip as tracked files
-// (verifyZipBlobs needs every blob); only the transpiled copy is dropped, and a repo
-// that does import one at runtime still works — §5.5 live-transpiles a missing
-// artifact. `.md`/`.mdx` are never excluded: a viewer repo is also opened as content.
+// pays for and nothing reads: test files, test-only directories, and the repo's
+// top-level build scripts. They stay in the zip as tracked files (verifyZipBlobs
+// needs every blob); only the transpiled copy is dropped, and a repo that does import
+// one at runtime still works — the runtime live-transpiles a missing artifact
+// (PRETRANSPILED_ARTIFACTS_SPEC §5.5). `.md`/`.mdx` are never excluded: a viewer repo is also opened as content.
 export const ARTIFACT_EXCLUDED_PATTERN =
   /(^|\/)(__tests__|__fixtures__)\/|\.(test|spec)\.[cm]?[jt]sx?$|^scripts\//;
 
