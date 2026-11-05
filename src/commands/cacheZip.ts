@@ -44,7 +44,13 @@ import {
   type DepMap,
   type BundledPackage,
 } from '../lockset.js';
-import { ownPackageDir, platformProvidedNames, resolvePlatformProvided } from '../platformProvided.js';
+import {
+  CDN_INJECTED_HELPERS,
+  ownPackageDir,
+  ownPeerNames,
+  platformProvidedNames,
+  resolvePlatformProvided,
+} from '../platformProvided.js';
 import {
   buildLocalPackage,
   mergeResolved,
@@ -344,7 +350,7 @@ const resolveBundledPackages = async (
   // always lose to the augmented build deps npm never installs.
   const localBuilt: BundledPackage[] = [];
   const platformBuilt = new Set<string>();
-  const peerOfLocal = new Map<string, Set<string>>();
+  const peersOf = new Map<string, Set<string>>();
   const needCdn: typeof lockset.resolved = [];
   const localRefusals: string[] = [];
   for (const entry of lockset.resolved) {
@@ -396,7 +402,7 @@ const resolveBundledPackages = async (
               peerDependencies?: Record<string, string>;
             }
           ).peerDependencies;
-          if (peers) peerOfLocal.set(name, new Set(Object.keys(peers)));
+          if (peers) peersOf.set(name, new Set(Object.keys(peers)));
         } catch {
           // an unreadable package.json already failed the local build above
         }
@@ -410,6 +416,21 @@ const resolveBundledPackages = async (
       }
     }
     needCdn.push(entry);
+  }
+
+  // R3-1337: a PLATFORM-injected package's peers are recorded whichever source won its
+  // version. The loop above records peers only for a locally-built package, so when the CDN's
+  // mirror and npm disagree on the platform package's latest (react-error-boundary 6.1.5 on the
+  // CDN, 6.1.6 beside the CLI) the CDN's bytes carried no peer record, and a repo that declares
+  // no `react` failed on react-error-boundary's import of it. The peer list is the name's, read
+  // from our own copy; an APP-declared package fetched from the CDN still records none, since an
+  // app package importing a name the app lacks is a genuine miss.
+  for (const name of platformNames) {
+    const own = ownPeerNames(name);
+    if (!own.size) continue;
+    const merged = peersOf.get(name) ?? new Set<string>();
+    for (const peer of own) merged.add(peer);
+    peersOf.set(name, merged);
   }
 
   let outcome: { packages: BundledPackage[]; summary: string };
@@ -468,12 +489,65 @@ const resolveBundledPackages = async (
   for (const depName of Object.keys(runtimeDeclared)) {
     if (!(depName in lockset.dependencies)) exempt.add(depName);
   }
-  const findings = closureFindings(
+  let findings = closureFindings(
     outcome.packages,
     new Set(lockset.resolved.map((entry) => entry.n)),
     exempt,
-    peerOfLocal,
+    peersOf,
   );
+  // R3-1337 — close over the helpers the CDN's transpiler injects, rather than exempt them:
+  // an exemption would ship a zip whose first `require("@swc/helpers")` is a live fetch,
+  // which is what this check exists to stop. Each needed helper is built from OUR tree (the
+  // CLI depends on it at the sandbox's exact version), appended to the bundle and to the
+  // lockset's `resolved` (the manifest carries this same object), and the check runs again
+  // so the helper's own content is held to the same rule.
+  const helperNeeds = [
+    ...new Set(
+      findings
+        .filter((finding) => finding.source === 'import' && CDN_INJECTED_HELPERS.includes(finding.dependency))
+        .map((finding) => finding.dependency),
+    ),
+  ].sort();
+  if (helperNeeds.length) {
+    // The helper's OWN dependencies come with it (@swc/helpers requires tslib), from the same
+    // tree, breadth-first, skipping any name the lockset already resolves.
+    const queue = helperNeeds.map((name) => ({ name, depth: 1 }));
+    const added = new Set<string>(lockset.resolved.map((entry) => entry.n));
+    const closed: string[] = [];
+    while (queue.length) {
+      const { name, depth } = queue.shift()!;
+      if (added.has(name)) continue;
+      added.add(name);
+      const dir = ownPackageDir(name);
+      const manifest = dir
+        ? (JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')) as {
+            version?: string;
+            dependencies?: Record<string, string>;
+          })
+        : null;
+      if (!dir || !manifest?.version) {
+        throw new Error(
+          `closure inconsistency: bundled content requires ${name}, which the CDN's transpiler injects, but this CLI carries no copy of it to bundle`,
+        );
+      }
+      outcome.packages.push({
+        key: encodePackageKey(name, manifest.version),
+        name,
+        version: manifest.version,
+        bytes: encodeLocalPackage(await buildLocalPackage(dir, scanCjsModule, transformFile)),
+      });
+      lockset.resolved.push({ n: name, v: manifest.version, d: depth });
+      closed.push(`${name}@${manifest.version}`);
+      for (const dep of Object.keys(manifest.dependencies ?? {}).sort()) queue.push({ name: dep, depth: depth + 1 });
+    }
+    outcome.summary += `; +${closed.length} closed over by this CLI (CDN-injected helpers): ${closed.join(', ')}`;
+    findings = closureFindings(
+      outcome.packages,
+      new Set(lockset.resolved.map((entry) => entry.n)),
+      exempt,
+      peersOf,
+    );
+  }
   const importMisses = findings.filter((finding) => finding.source === 'import');
   if (importMisses.length) {
     throw new Error(importMisses.map(closureFailureMessage).join('\n'));

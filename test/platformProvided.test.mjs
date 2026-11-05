@@ -18,7 +18,13 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
-import { ownPackageDir, platformProvidedNames, resolvePlatformProvided } from '../dist/platformProvided.js';
+import {
+  CDN_INJECTED_HELPERS,
+  ownPackageDir,
+  ownPeerNames,
+  platformProvidedNames,
+  resolvePlatformProvided,
+} from '../dist/platformProvided.js';
 
 /** A resolver over an explicit path→manifest map, standing in for node's own. */
 const resolverOver = (files) => (specifier) => {
@@ -180,4 +186,26 @@ test('the real tree answers for every name the real transpiler injects', async (
     `every injected name must resolve from this package's own tree — missing: ${names.filter((n) => !resolved.some((r) => r.n === n)).join(', ')}`,
   );
   for (const name of names) assert.ok(ownPackageDir(name), `${name} must have a readable directory for --bundle-packages`);
+});
+
+test('R3-1337: ownPeerNames reads a platform package\'s peers from our own copy; an unresolvable name has none', () => {
+  const root = mkdtempSync(join(tmpdir(), 'ir-peers-'));
+  try {
+    const path = writePkg(root, 'node_modules/react-error-boundary', {
+      name: 'react-error-boundary',
+      version: '6.1.6',
+      peerDependencies: { react: '^18.0.0 || ^19.0.0', '@types/react': '^18.0.0 || ^19.0.0' },
+    });
+    const resolve = resolverOver({ 'react-error-boundary/package.json': path });
+    assert.deepEqual([...ownPeerNames('react-error-boundary', resolve)].sort(), ['@types/react', 'react']);
+    assert.equal(ownPeerNames('nope', resolve).size, 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('R3-1337: the real tree carries every CDN-injected helper, and the real react-error-boundary peers react', () => {
+  assert.ok(CDN_INJECTED_HELPERS.length > 0, 'an empty list would make the closure vacuous');
+  for (const name of CDN_INJECTED_HELPERS) assert.ok(ownPackageDir(name), `${name} must have a readable directory to bundle`);
+  assert.ok(ownPeerNames('react-error-boundary').has('react'));
 });

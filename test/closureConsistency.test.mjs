@@ -202,6 +202,7 @@ const RESOLVED = [
 let server;
 let cdnRoot;
 let moduleFor; // per-test content resolver over the CDN package key
+let depTree = RESOLVED; // per-test /dep_tree answer (R3-1337's cases swap it)
 
 // The /package/ key is base64(LOCKSET_CDN_VERSION(name@version)), so content
 // selectors must match on the DECODED key — a selector over the raw key never
@@ -212,7 +213,7 @@ before(async () => {
   server = createServer((req, res) => {
     if (req.url.startsWith('/dep_tree/')) {
       res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
-      res.end(Buffer.from(encodeMsgPack(RESOLVED)));
+      res.end(Buffer.from(encodeMsgPack(depTree)));
       return;
     }
     if (req.url.startsWith('/package/')) {
@@ -364,6 +365,81 @@ test('end-to-end warn: an m-only miss resolves the build and warns, naming the p
     );
   } finally {
     console.warn = originalWarn;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// --- R3-1337: a repo without React, and the CDN's injected @swc/helpers ------------------
+//
+// The producer is baton's REAL package.json at origin/main (immediately-run/baton 47824e3,
+// 2026-11-05): a Cloudflare Worker whose only runtime dependency is jose. The /dep_tree answer
+// is the shape the live CDN gave for it, with react-error-boundary at a version this CLI's own
+// copy does not carry, so its bytes come from the CDN (the race that failed baton: the CDN's
+// mirror at 6.1.5, npm's latest 6.1.6 beside the CLI). The content records are the live ones'
+// shapes: react-error-boundary imports react; jose's CJS build requires @swc/helpers
+// (`dist/webapi/jwt/encrypt.js`, 8 of 80 files on the live CDN).
+const BATON_PACKAGE_JSON = { dependencies: { jose: '^6.2.12' } };
+const BATON_TREE = [
+  { n: 'core-js', v: '3.22.7', d: 0 },
+  { n: 'jose', v: '6.2.14', d: 0 },
+  { n: 'react-error-boundary', v: '6.1.0', d: 0 },
+  { n: 'react-refresh', v: '0.11.0', d: 0 },
+];
+const batonContent = (key) => {
+  const id = Buffer.from(key, 'base64').toString('utf8');
+  if (id.includes('react-error-boundary@')) {
+    return { f: { 'dist/index.cjs': { c: '// reb', d: ['react'], t: false } }, m: ['react'] };
+  }
+  if (id.includes('jose@')) {
+    return { f: { 'dist/webapi/jwt/encrypt.js': { c: 'var swcHelpers=require("@swc/helpers");', d: ['@swc/helpers'], t: false } }, m: [] };
+  }
+  return { f: { 'index.js': { c: `// ${id}`, d: [], t: false } }, m: [] };
+};
+const makeBatonRepo = () => {
+  const root = makeRepo();
+  writeFileSync(join(root, 'package.json'), JSON.stringify(BATON_PACKAGE_JSON));
+  const g = (args) => execFileSync('git', ['-C', root, ...args], { stdio: 'pipe' });
+  g(['add', 'package.json']);
+  g(['commit', '-q', '-m', 'baton manifest']);
+  return root;
+};
+const zipLockset = (outputPath) =>
+  JSON.parse(execFileSync('unzip', ['-p', outputPath, '.immediately.run/contribute-manifest.json'], { encoding: 'utf8' })).lockset;
+const zipPackages = (outputPath) =>
+  execFileSync('unzip', ['-Z1', outputPath], { encoding: 'utf8' }).split('\n').filter((l) => l.startsWith('.immediately.run/packages/'));
+
+test('R3-1337: a repo without react builds — a CDN-sourced platform package\'s peer is exempt, and @swc/helpers is closed over', async () => {
+  const root = makeBatonRepo();
+  depTree = BATON_TREE;
+  try {
+    moduleFor = servesContent(batonContent);
+    const result = await buildCacheZip(zipOpts(root, { bundlePackages: true }));
+    assert.match(result.bundledPackagesSummary, /\+2 closed over by this CLI \(CDN-injected helpers\): @swc\/helpers@0\.5\.17, tslib@/);
+    const resolved = zipLockset(result.outputPath).resolved.map((e) => e.n);
+    assert.ok(resolved.includes('@swc/helpers') && resolved.includes('tslib'), `lockset.resolved: ${resolved.join(', ')}`);
+    assert.ok(!resolved.includes('react'), 'react must not be pulled into a repo that never declared it');
+    const files = zipPackages(result.outputPath);
+    assert.ok(files.some((f) => f.includes(encodeURIComponent('@swc/helpers@0.5.17'))), `bundled: ${files.join(', ')}`);
+  } finally {
+    depTree = RESOLVED;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('R3-1337: an APP-declared package importing react in a repo without react still fails the build', async () => {
+  const root = makeBatonRepo();
+  depTree = BATON_TREE;
+  try {
+    moduleFor = servesContent((key) =>
+      Buffer.from(key, 'base64').toString('utf8').includes('jose@')
+        ? { f: { 'index.js': { c: '// jose', d: ['react'], t: false } }, m: [] }
+        : batonContent(key));
+    await assert.rejects(
+      buildCacheZip(zipOpts(root, { bundlePackages: true })),
+      /closure inconsistency: jose@6\.2\.14 content imports react, but the resolved dependency set does not include it/,
+    );
+  } finally {
+    depTree = RESOLVED;
     rmSync(root, { recursive: true, force: true });
   }
 });

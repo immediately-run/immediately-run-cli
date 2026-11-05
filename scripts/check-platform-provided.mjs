@@ -103,3 +103,31 @@ if (problems.length) {
   process.exit(1);
 }
 console.log(`OK: all ${entries.length} platform-injected dependenc(ies) are carried here: ${entries.map(([n, r]) => `${n}@${r}`).join(', ')}`);
+
+// R3-1337 — the helpers the CDN's transpiler injects. cache-zip bundles each from THIS tree,
+// so each must be a declared dependency here, at an EXACT version; and that version is the
+// sandbox's own pin when a sibling sandbox checkout is present (CI checks this repo out alone,
+// so the comparison then skips, loudly). One list, one home: src/platformProvided.ts.
+const { CDN_INJECTED_HELPERS } = await import(pathToFileURL(join(root, 'dist/platformProvided.js')).href);
+const helperProblems = [];
+let sandboxPkg = null;
+try {
+  sandboxPkg = JSON.parse(readFileSync(join(root, '..', 'sandbox', 'package.json'), 'utf8'));
+} catch {
+  console.log('  skip: no sibling ../sandbox checkout, so the helper pins are not compared with the sandbox\'s');
+}
+for (const name of CDN_INJECTED_HELPERS) {
+  const have = (pkg.dependencies ?? {})[name];
+  if (have === undefined) helperProblems.push(`${name} is a CDN-injected helper but not a dependency of this package`);
+  else if (!/^\d+\.\d+\.\d+$/.test(have)) helperProblems.push(`${name} must be pinned exactly, got ${have}`);
+  const theirs = sandboxPkg ? { ...sandboxPkg.devDependencies, ...sandboxPkg.dependencies }[name] : undefined;
+  if (sandboxPkg && theirs !== undefined && theirs !== have) {
+    helperProblems.push(`${name}@${have} here, but the sandbox pins ${theirs}`);
+  }
+}
+if (helperProblems.length) {
+  console.error('CDN-injected helpers are not carried correctly:\n');
+  for (const p of helperProblems) console.error(`  - ${p}`);
+  process.exit(1);
+}
+console.log(`OK: the CDN-injected helper(s) are carried at exact versions: ${CDN_INJECTED_HELPERS.map((n) => `${n}@${pkg.dependencies[n]}`).join(', ')}`);

@@ -117,3 +117,37 @@ export function ownPackageDir(name: string, resolve: OwnResolver = defaultResolv
     return null;
   }
 }
+
+/**
+ * The PEER dependency names of one platform-provided package, read from this package's own
+ * installed copy (R3-1337).
+ *
+ * A peer is a property of the package the platform injects, not of the source that won its
+ * version: when the CDN's mirror resolves `react-error-boundary@6.1.5` while npm installed
+ * 6.1.6 beside this CLI, the bundled bytes come from the CDN, but `react` is still that
+ * package's peer, supplied by the consumer — and in a repo that declares no `react` at all
+ * (baton, a Cloudflare Worker), absent by design. Empty for a name this tree cannot answer for.
+ */
+export function ownPeerNames(name: string, resolve: OwnResolver = defaultResolve): Set<string> {
+  const dir = ownPackageDir(name, resolve);
+  if (!dir) return new Set();
+  try {
+    const manifest = JSON.parse(readFileSync(`${dir}/package.json`, 'utf8')) as {
+      peerDependencies?: Record<string, string>;
+    };
+    return new Set(Object.keys(manifest.peerDependencies ?? {}));
+  } catch {
+    return new Set();
+  }
+}
+
+/**
+ * Helpers the dependency CDN's transpiler INJECTS into the content it serves (R3-1337). The
+ * CDN's CJS build of a package compiled with helpers carries `require("@swc/helpers")`, but
+ * its `/dep_tree` never lists the helper, so the lockset cannot hold it and the sandbox
+ * resolves the bare specifier from nowhere (its `swcHelpers` eval global is shadowed by the
+ * module's own `var swcHelpers = require(...)`). `cache-zip` closes over these: when bundled
+ * content requires one, it is built from THIS package's tree and added to the lockset.
+ * The one home of the list; this package depends on each at the sandbox's exact version.
+ */
+export const CDN_INJECTED_HELPERS: readonly string[] = Object.freeze(['@swc/helpers']);
