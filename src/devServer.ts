@@ -735,6 +735,15 @@ export const startDevServer = (opts: DevServerOptions): Promise<DevServerHandle>
           res.on('close', () => {
             if (!res.writableFinished) body.destroy();
           });
+          // `pipe` forwards no errors. When the caller-gone abort above rejects a read already
+          // in flight, the AbortError reaches `body` as an 'error' event before the `destroy`
+          // can swallow it, and with no listener it is an UNCAUGHT exception: it took down
+          // the R3-224 test on CI (cli#58's run 42010524763) and would take down
+          // `immediately.run dev`. An aborted upstream is the expected outcome here; any other
+          // upstream error ends the caller's response.
+          body.on('error', () => {
+            if (!res.writableFinished) res.destroy();
+          });
           body.pipe(res);
         } else {
           res.end();
