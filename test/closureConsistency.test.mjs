@@ -443,3 +443,18 @@ test('R3-1337: an APP-declared package importing react in a repo without react s
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+// R3-1337's three closureFindings groups, asserted directly (review 1-B-1): the per-package
+// keying of the peer map is what keeps (a) from masking (b).
+test('R3-1337 (a)/(b): a CDN-sourced platform package\'s own peer is exempt; the same import from another package is not', () => {
+  const reb = bundled('react-error-boundary', '6.1.5', { f: { 'dist/index.cjs': { c: '// reb', d: ['react'], t: false } }, m: [] });
+  const jose = bundled('jose', '6.2.14', { f: { 'index.js': { c: '// jose', d: ['react'], t: false } }, m: [] });
+  const findings = closureFindings([reb, jose], new Set(['react-error-boundary', 'jose']), new Set(), new Map([['react-error-boundary', new Set(['react', '@types/react'])]]));
+  assert.deepEqual(findings.map((f) => `${f.name}:${f.dependency}`), ['jose:react']);
+});
+
+test('R3-1337 (c): content requiring @swc/helpers is not a finding once the helper is resolved', () => {
+  const jose = bundled('jose', '6.2.14', { f: { 'dist/webapi/jwt/encrypt.js': { c: 'var swcHelpers=require("@swc/helpers");', d: ['@swc/helpers'], t: false } }, m: [] });
+  assert.equal(closureFindings([jose], new Set(['jose'])).length, 1);
+  assert.equal(closureFindings([jose], new Set(['jose', '@swc/helpers'])).length, 0);
+});

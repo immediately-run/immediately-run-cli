@@ -151,3 +151,72 @@ export function ownPeerNames(name: string, resolve: OwnResolver = defaultResolve
  * The one home of the list; this package depends on each at the sandbox's exact version.
  */
 export const CDN_INJECTED_HELPERS: readonly string[] = Object.freeze(['@swc/helpers']);
+
+/** One package the helper closure will bundle: where it is, what version, at what depth. */
+export interface ClosedOverPackage {
+  name: string;
+  version: string;
+  dir: string;
+  depth: number;
+}
+
+/** Resolve `specifier` as node would from inside the package at `dir`. */
+export type ResolveFrom = (dir: string, specifier: string) => string;
+const defaultResolveFrom: ResolveFrom = (dir, specifier) =>
+  createRequire(`${dir}/package.json`).resolve(specifier);
+
+/**
+ * The packages to bundle for the CDN-injected helpers that bundled content requires
+ * (R3-1337): each helper from THIS package's tree, then each helper's own dependencies,
+ * breadth-first, resolved FROM THE DEPENDENT'S DIRECTORY (node's own rule, so a nested copy
+ * wins over a hoisted one) and held to the dependent's declared range. A version outside
+ * that range is a different package; bundling it under the dependent would be a silent
+ * substitution (`@swc/helpers`' `_ts_dispose_resources` needs `tslib` 2's
+ * `__disposeResources`), so it throws, as does a name nothing resolves. Names in `have`
+ * (already in the lockset) are skipped: the lockset holds one version per name.
+ */
+export function closeOverHelpers(
+  needs: readonly string[],
+  have: ReadonlySet<string>,
+  resolveOwn: OwnResolver = defaultResolve,
+  resolveFrom: ResolveFrom = defaultResolveFrom,
+): ClosedOverPackage[] {
+  const out: ClosedOverPackage[] = [];
+  const seen = new Set(have);
+  const queue: { name: string; depth: number; parent: { dir: string; name: string; range: string } | null }[] = [
+    ...needs.map((name) => ({ name, depth: 1, parent: null })),
+  ];
+  while (queue.length) {
+    const { name, depth, parent } = queue.shift()!;
+    if (seen.has(name)) continue;
+    seen.add(name);
+    let dir: string | null;
+    try {
+      dir = parent ? dirname(resolveFrom(parent.dir, `${name}/package.json`)) : ownPackageDir(name, resolveOwn);
+    } catch {
+      dir = null;
+    }
+    if (!dir) {
+      throw new Error(
+        parent
+          ? `closure inconsistency: ${parent.name} (a CDN-injected helper this CLI bundles) depends on ${name}, which does not resolve from ${parent.dir}`
+          : `closure inconsistency: bundled content requires ${name}, which the CDN's transpiler injects, but this CLI carries no copy of it to bundle`,
+      );
+    }
+    const manifest = JSON.parse(readFileSync(`${dir}/package.json`, 'utf8')) as {
+      version?: string;
+      dependencies?: Record<string, string>;
+    };
+    const version = manifest.version;
+    if (!version || (parent && !satisfies(version, parent.range))) {
+      throw new Error(
+        `closure inconsistency: ${parent?.name ?? name} needs ${name}@${parent?.range ?? '(any)'}, but the copy at ${dir} is ${version ?? 'unversioned'}`,
+      );
+    }
+    out.push({ name, version, dir, depth });
+    for (const [dep, range] of Object.entries(manifest.dependencies ?? {}).sort(([a], [b]) => (a < b ? -1 : 1))) {
+      queue.push({ name: dep, depth: depth + 1, parent: { dir, name, range } });
+    }
+  }
+  return out;
+}

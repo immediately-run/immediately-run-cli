@@ -20,6 +20,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 
 import {
   CDN_INJECTED_HELPERS,
+  closeOverHelpers,
   ownPackageDir,
   ownPeerNames,
   platformProvidedNames,
@@ -208,4 +209,54 @@ test('R3-1337: the real tree carries every CDN-injected helper, and the real rea
   assert.ok(CDN_INJECTED_HELPERS.length > 0, 'an empty list would make the closure vacuous');
   for (const name of CDN_INJECTED_HELPERS) assert.ok(ownPackageDir(name), `${name} must have a readable directory to bundle`);
   assert.ok(ownPeerNames('react-error-boundary').has('react'));
+});
+
+// closeOverHelpers (review 1-A-1): a helper's dependency resolves FROM THE HELPER'S
+// directory, so a nested copy wins over a hoisted one of another major, and a copy outside
+// the helper's range is refused rather than bundled.
+const helperTree = (root, { nestedTslib, hoistedTslib }) => {
+  const helpers = writePkg(root, 'node_modules/@swc/helpers', { name: '@swc/helpers', version: '0.5.17', dependencies: { tslib: '^2.8.0' } });
+  const files = { '@swc/helpers/package.json': helpers };
+  const nested = nestedTslib ? writePkg(root, 'node_modules/@swc/helpers/node_modules/tslib', { name: 'tslib', version: nestedTslib }) : null;
+  const hoisted = hoistedTslib ? writePkg(root, 'node_modules/tslib', { name: 'tslib', version: hoistedTslib }) : null;
+  const resolveFrom = (dir, spec) => {
+    if (spec !== 'tslib/package.json') throw new Error(`unexpected ${spec}`);
+    if (nested && dir === dirname(helpers)) return nested;
+    if (hoisted) return hoisted;
+    throw Object.assign(new Error(`Cannot find module '${spec}'`), { code: 'MODULE_NOT_FOUND' });
+  };
+  return { resolveOwn: resolverOver(files), resolveFrom };
+};
+
+test('closeOverHelpers: the helper\'s nested tslib 2 wins over a hoisted tslib 1', () => {
+  const root = mkdtempSync(join(tmpdir(), 'ir-helpers-'));
+  try {
+    const { resolveOwn, resolveFrom } = helperTree(root, { nestedTslib: '2.9.1', hoistedTslib: '1.14.1' });
+    const out = closeOverHelpers(['@swc/helpers'], new Set(), resolveOwn, resolveFrom);
+    assert.deepEqual(out.map((p) => `${p.name}@${p.version}:${p.depth}`), ['@swc/helpers@0.5.17:1', 'tslib@2.9.1:2']);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('closeOverHelpers: a tslib outside the helper\'s range is refused, never bundled', () => {
+  const root = mkdtempSync(join(tmpdir(), 'ir-helpers-'));
+  try {
+    const { resolveOwn, resolveFrom } = helperTree(root, { hoistedTslib: '1.14.1' });
+    assert.throws(() => closeOverHelpers(['@swc/helpers'], new Set(), resolveOwn, resolveFrom), /@swc\/helpers needs tslib@\^2\.8\.0, but the copy at .* is 1\.14\.1/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('closeOverHelpers: a missing dependency, and a helper this CLI lacks, are loud', () => {
+  const root = mkdtempSync(join(tmpdir(), 'ir-helpers-'));
+  try {
+    const { resolveOwn, resolveFrom } = helperTree(root, {});
+    assert.throws(() => closeOverHelpers(['@swc/helpers'], new Set(), resolveOwn, resolveFrom), /depends on tslib, which does not resolve from/);
+    assert.throws(() => closeOverHelpers(['@nope/helpers'], new Set(), resolveOwn, resolveFrom), /this CLI carries no copy of it to bundle/);
+    assert.deepEqual(closeOverHelpers(['@swc/helpers'], new Set(['@swc/helpers']), resolveOwn, resolveFrom), []);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

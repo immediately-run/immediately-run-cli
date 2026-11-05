@@ -740,8 +740,11 @@ export const startDevServer = (opts: DevServerOptions): Promise<DevServerHandle>
           // can swallow it, and with no listener it is an UNCAUGHT exception: it took down
           // the R3-224 test on CI (cli#58's run 42010524763) and would take down
           // `immediately.run dev`. An aborted upstream is the expected outcome here; any other
-          // upstream error ends the caller's response.
-          body.on('error', () => {
+          // upstream error ends the caller's response too, but is reported, not swallowed.
+          body.on('error', (err: Error) => {
+            if (err.name !== 'AbortError') {
+              console.warn(`  · llm proxy: the upstream stream failed mid-response (${err.message})`);
+            }
             if (!res.writableFinished) res.destroy();
           });
           body.pipe(res);

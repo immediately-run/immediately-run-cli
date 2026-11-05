@@ -46,6 +46,7 @@ import {
 } from '../lockset.js';
 import {
   CDN_INJECTED_HELPERS,
+  closeOverHelpers,
   ownPackageDir,
   ownPeerNames,
   platformProvidedNames,
@@ -337,7 +338,7 @@ const resolveBundledPackages = async (
   lockset: RepoManifest['lockset'] | undefined,
   repo: string,
   platformNames: ReadonlySet<string> = new Set(),
-): Promise<{ packages?: BundledPackage[]; summary: string }> => {
+): Promise<{ packages?: BundledPackage[]; summary: string; closedOver?: number }> => {
   if (!opts.bundlePackages) {
     return { summary: 'omitted (not requested)' };
   }
@@ -433,7 +434,7 @@ const resolveBundledPackages = async (
     peersOf.set(name, merged);
   }
 
-  let outcome: { packages: BundledPackage[]; summary: string };
+  let outcome: { packages: BundledPackage[]; summary: string; closedOver?: number };
   try {
     const fetched = needCdn.length ? await fetchBundledPackages(needCdn, opts.cdnRoot) : [];
     const packages = [...localBuilt, ...fetched];
@@ -509,37 +510,20 @@ const resolveBundledPackages = async (
     ),
   ].sort();
   if (helperNeeds.length) {
-    // The helper's OWN dependencies come with it (@swc/helpers requires tslib), from the same
-    // tree, breadth-first, skipping any name the lockset already resolves.
-    const queue = helperNeeds.map((name) => ({ name, depth: 1 }));
-    const added = new Set<string>(lockset.resolved.map((entry) => entry.n));
+    // The helper's OWN dependencies come with it (@swc/helpers requires tslib), resolved
+    // from the helper's directory and held to its declared range (`closeOverHelpers`).
     const closed: string[] = [];
-    while (queue.length) {
-      const { name, depth } = queue.shift()!;
-      if (added.has(name)) continue;
-      added.add(name);
-      const dir = ownPackageDir(name);
-      const manifest = dir
-        ? (JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')) as {
-            version?: string;
-            dependencies?: Record<string, string>;
-          })
-        : null;
-      if (!dir || !manifest?.version) {
-        throw new Error(
-          `closure inconsistency: bundled content requires ${name}, which the CDN's transpiler injects, but this CLI carries no copy of it to bundle`,
-        );
-      }
+    for (const pkg of closeOverHelpers(helperNeeds, new Set(lockset.resolved.map((entry) => entry.n)))) {
       outcome.packages.push({
-        key: encodePackageKey(name, manifest.version),
-        name,
-        version: manifest.version,
-        bytes: encodeLocalPackage(await buildLocalPackage(dir, scanCjsModule, transformFile)),
+        key: encodePackageKey(pkg.name, pkg.version),
+        name: pkg.name,
+        version: pkg.version,
+        bytes: encodeLocalPackage(await buildLocalPackage(pkg.dir, scanCjsModule, transformFile)),
       });
-      lockset.resolved.push({ n: name, v: manifest.version, d: depth });
-      closed.push(`${name}@${manifest.version}`);
-      for (const dep of Object.keys(manifest.dependencies ?? {}).sort()) queue.push({ name: dep, depth: depth + 1 });
+      lockset.resolved.push({ n: pkg.name, v: pkg.version, d: pkg.depth });
+      closed.push(`${pkg.name}@${pkg.version}`);
     }
+    outcome.closedOver = closed.length;
     outcome.summary += `; +${closed.length} closed over by this CLI (CDN-injected helpers): ${closed.join(', ')}`;
     findings = closureFindings(
       outcome.packages,
@@ -593,11 +577,15 @@ export const buildCacheZip = async (opts: CacheZipOptions): Promise<CacheZipResu
   const treeSha = headTreeSha(repo);
   const defaultBranch = opts.defaultBranch || defaultBranchOf(repo, ref);
   const entries = treeEntries(repo);
-  const { lockset, summary: locksetSummary } = await resolveLockset(repo, opts);
+  const { lockset, summary: locksetSummaryAtResolve } = await resolveLockset(repo, opts);
   const platformNames = new Set(
     lockset ? platformProvidedNames(headDependencies(repo).deps, lockset.dependencies) : [],
   );
-  const { packages, summary: bundledPackagesSummary } = await resolveBundledPackages(opts, lockset, repo, platformNames);
+  const {
+    packages,
+    summary: bundledPackagesSummary,
+    closedOver = 0,
+  } = await resolveBundledPackages(opts, lockset, repo, platformNames);
 
   const manifest: RepoManifest = {
     schemaVersion: MANIFEST_SCHEMA_VERSION,
@@ -725,7 +713,12 @@ export const buildCacheZip = async (opts: CacheZipOptions): Promise<CacheZipResu
     entryCount: entries.length,
     artifactsSummary,
     mdxMetadataSummary,
-    locksetSummary,
+    // The helper closure (R3-1337) appends to `lockset.resolved` after the summary was
+    // written, so the printed count says so rather than understating the zip's lockset.
+    locksetSummary:
+      closedOver > 0
+        ? `${locksetSummaryAtResolve} + ${closedOver} closed over (CDN-injected helpers)`
+        : locksetSummaryAtResolve,
     bundledPackagesSummary,
     declaredDependencyCount: Object.keys(headDependencies(repo).deps).length,
     bundledPackageCount: packages ? packages.length : null,
