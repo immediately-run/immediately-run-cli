@@ -172,22 +172,33 @@ const defaultResolveFrom: ResolveFrom = (dir, specifier) =>
  * wins over a hoisted one) and held to the dependent's declared range. A version outside
  * that range is a different package; bundling it under the dependent would be a silent
  * substitution (`@swc/helpers`' `_ts_dispose_resources` needs `tslib` 2's
- * `__disposeResources`), so it throws, as does a name nothing resolves. Names in `have`
- * (already in the lockset) are skipped: the lockset holds one version per name.
+ * `__disposeResources`), so it throws, as does a name nothing resolves. A name `have` already
+ * resolves (the lockset, name → version) is not bundled again — the lockset holds one version
+ * per name — but its version is still held to the dependent's range: an app lockset carrying
+ * `tslib@1` would otherwise pair silently with a bundled helper that needs `tslib@2`.
  */
 export function closeOverHelpers(
   needs: readonly string[],
-  have: ReadonlySet<string>,
+  have: ReadonlyMap<string, string>,
   resolveOwn: OwnResolver = defaultResolve,
   resolveFrom: ResolveFrom = defaultResolveFrom,
 ): ClosedOverPackage[] {
   const out: ClosedOverPackage[] = [];
-  const seen = new Set(have);
+  const seen = new Set<string>();
   const queue: { name: string; depth: number; parent: { dir: string; name: string; range: string } | null }[] = [
     ...needs.map((name) => ({ name, depth: 1, parent: null })),
   ];
   while (queue.length) {
     const { name, depth, parent } = queue.shift()!;
+    const pinned = have.get(name);
+    if (pinned !== undefined) {
+      if (parent && !satisfies(pinned, parent.range)) {
+        throw new Error(
+          `closure inconsistency: ${parent.name} needs ${name}@${parent.range}, but the lockset already resolves ${name}@${pinned}`,
+        );
+      }
+      continue;
+    }
     if (seen.has(name)) continue;
     seen.add(name);
     let dir: string | null;

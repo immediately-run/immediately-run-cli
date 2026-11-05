@@ -232,7 +232,7 @@ test('closeOverHelpers: the helper\'s nested tslib 2 wins over a hoisted tslib 1
   const root = mkdtempSync(join(tmpdir(), 'ir-helpers-'));
   try {
     const { resolveOwn, resolveFrom } = helperTree(root, { nestedTslib: '2.9.1', hoistedTslib: '1.14.1' });
-    const out = closeOverHelpers(['@swc/helpers'], new Set(), resolveOwn, resolveFrom);
+    const out = closeOverHelpers(['@swc/helpers'], new Map(), resolveOwn, resolveFrom);
     assert.deepEqual(out.map((p) => `${p.name}@${p.version}:${p.depth}`), ['@swc/helpers@0.5.17:1', 'tslib@2.9.1:2']);
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -243,7 +243,7 @@ test('closeOverHelpers: a tslib outside the helper\'s range is refused, never bu
   const root = mkdtempSync(join(tmpdir(), 'ir-helpers-'));
   try {
     const { resolveOwn, resolveFrom } = helperTree(root, { hoistedTslib: '1.14.1' });
-    assert.throws(() => closeOverHelpers(['@swc/helpers'], new Set(), resolveOwn, resolveFrom), /@swc\/helpers needs tslib@\^2\.8\.0, but the copy at .* is 1\.14\.1/);
+    assert.throws(() => closeOverHelpers(['@swc/helpers'], new Map(), resolveOwn, resolveFrom), /@swc\/helpers needs tslib@\^2\.8\.0, but the copy at .* is 1\.14\.1/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -253,9 +253,25 @@ test('closeOverHelpers: a missing dependency, and a helper this CLI lacks, are l
   const root = mkdtempSync(join(tmpdir(), 'ir-helpers-'));
   try {
     const { resolveOwn, resolveFrom } = helperTree(root, {});
-    assert.throws(() => closeOverHelpers(['@swc/helpers'], new Set(), resolveOwn, resolveFrom), /depends on tslib, which does not resolve from/);
-    assert.throws(() => closeOverHelpers(['@nope/helpers'], new Set(), resolveOwn, resolveFrom), /this CLI carries no copy of it to bundle/);
-    assert.deepEqual(closeOverHelpers(['@swc/helpers'], new Set(['@swc/helpers']), resolveOwn, resolveFrom), []);
+    assert.throws(() => closeOverHelpers(['@swc/helpers'], new Map(), resolveOwn, resolveFrom), /depends on tslib, which does not resolve from/);
+    assert.throws(() => closeOverHelpers(['@nope/helpers'], new Map(), resolveOwn, resolveFrom), /this CLI carries no copy of it to bundle/);
+    assert.deepEqual(closeOverHelpers(['@swc/helpers'], new Map([['@swc/helpers', '0.5.17']]), resolveOwn, resolveFrom), []);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('closeOverHelpers: a lockset already resolving tslib 1 is refused for a helper needing tslib 2 (review 2-r2-0)', () => {
+  const root = mkdtempSync(join(tmpdir(), 'ir-helpers-'));
+  try {
+    const { resolveOwn, resolveFrom } = helperTree(root, { nestedTslib: '2.9.1' });
+    assert.throws(
+      () => closeOverHelpers(['@swc/helpers'], new Map([['tslib', '1.14.1']]), resolveOwn, resolveFrom),
+      /@swc\/helpers needs tslib@\^2\.8\.0, but the lockset already resolves tslib@1\.14\.1/,
+    );
+    // A lockset tslib inside the range is reused, not bundled twice.
+    const out = closeOverHelpers(['@swc/helpers'], new Map([['tslib', '2.8.1']]), resolveOwn, resolveFrom);
+    assert.deepEqual(out.map((p) => p.name), ['@swc/helpers']);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

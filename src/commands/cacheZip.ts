@@ -513,7 +513,7 @@ const resolveBundledPackages = async (
     // The helper's OWN dependencies come with it (@swc/helpers requires tslib), resolved
     // from the helper's directory and held to its declared range (`closeOverHelpers`).
     const closed: string[] = [];
-    for (const pkg of closeOverHelpers(helperNeeds, new Set(lockset.resolved.map((entry) => entry.n)))) {
+    for (const pkg of closeOverHelpers(helperNeeds, new Map(lockset.resolved.map((entry) => [entry.n, entry.v])))) {
       outcome.packages.push({
         key: encodePackageKey(pkg.name, pkg.version),
         name: pkg.name,
