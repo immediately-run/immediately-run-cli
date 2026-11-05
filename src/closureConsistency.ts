@@ -83,8 +83,10 @@ const asStringArray = (value: unknown): string[] =>
  * `resolvedNames` is the lockset's resolved package names. `exemptNames` is
  * the app-level other-rail set: the app's `registryResolved` self-hosted
  * names and `github:`-pinned deps (both resolve from mounts at boot, never
- * from the lockset). `peerImports` carries each locally-built package's OWN
- * peer dependencies, keyed by package name: a peer resolves against its
+ * from the lockset). `peerImports` carries each package's OWN peer dependencies,
+ * keyed by package name: a locally-built package's, read from its source
+ * directory, and every PLATFORM-injected package's, read from the CLI's own copy
+ * whichever source supplied its bytes (R3-1337). A peer resolves against its
  * consumer's environment (the app's own react for the injected
  * react-error-boundary), so a package's import of its own peer is exempt FOR
  * THAT PACKAGE ONLY — a name-keyed global set would let one package's peer

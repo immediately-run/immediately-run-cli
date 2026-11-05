@@ -44,7 +44,14 @@ import {
   type DepMap,
   type BundledPackage,
 } from '../lockset.js';
-import { ownPackageDir, platformProvidedNames, resolvePlatformProvided } from '../platformProvided.js';
+import {
+  CDN_INJECTED_HELPERS,
+  closeOverHelpers,
+  ownPackageDir,
+  ownPeerNames,
+  platformProvidedNames,
+  resolvePlatformProvided,
+} from '../platformProvided.js';
 import {
   buildLocalPackage,
   mergeResolved,
@@ -331,7 +338,7 @@ const resolveBundledPackages = async (
   lockset: RepoManifest['lockset'] | undefined,
   repo: string,
   platformNames: ReadonlySet<string> = new Set(),
-): Promise<{ packages?: BundledPackage[]; summary: string }> => {
+): Promise<{ packages?: BundledPackage[]; summary: string; closedOver?: number }> => {
   if (!opts.bundlePackages) {
     return { summary: 'omitted (not requested)' };
   }
@@ -344,7 +351,7 @@ const resolveBundledPackages = async (
   // always lose to the augmented build deps npm never installs.
   const localBuilt: BundledPackage[] = [];
   const platformBuilt = new Set<string>();
-  const peerOfLocal = new Map<string, Set<string>>();
+  const peersOf = new Map<string, Set<string>>();
   const needCdn: typeof lockset.resolved = [];
   const localRefusals: string[] = [];
   for (const entry of lockset.resolved) {
@@ -396,7 +403,7 @@ const resolveBundledPackages = async (
               peerDependencies?: Record<string, string>;
             }
           ).peerDependencies;
-          if (peers) peerOfLocal.set(name, new Set(Object.keys(peers)));
+          if (peers) peersOf.set(name, new Set(Object.keys(peers)));
         } catch {
           // an unreadable package.json already failed the local build above
         }
@@ -412,7 +419,22 @@ const resolveBundledPackages = async (
     needCdn.push(entry);
   }
 
-  let outcome: { packages: BundledPackage[]; summary: string };
+  // R3-1337: a PLATFORM-injected package's peers are recorded whichever source won its
+  // version. The loop above records peers only for a locally-built package, so when the CDN's
+  // mirror and npm disagree on the platform package's latest (react-error-boundary 6.1.5 on the
+  // CDN, 6.1.6 beside the CLI) the CDN's bytes carried no peer record, and a repo that declares
+  // no `react` failed on react-error-boundary's import of it. The peer list is the name's, read
+  // from our own copy; an APP-declared package fetched from the CDN still records none, since an
+  // app package importing a name the app lacks is a genuine miss.
+  for (const name of platformNames) {
+    const own = ownPeerNames(name);
+    if (!own.size) continue;
+    const merged = peersOf.get(name) ?? new Set<string>();
+    for (const peer of own) merged.add(peer);
+    peersOf.set(name, merged);
+  }
+
+  let outcome: { packages: BundledPackage[]; summary: string; closedOver?: number };
   try {
     const fetched = needCdn.length ? await fetchBundledPackages(needCdn, opts.cdnRoot) : [];
     const packages = [...localBuilt, ...fetched];
@@ -468,12 +490,48 @@ const resolveBundledPackages = async (
   for (const depName of Object.keys(runtimeDeclared)) {
     if (!(depName in lockset.dependencies)) exempt.add(depName);
   }
-  const findings = closureFindings(
+  let findings = closureFindings(
     outcome.packages,
     new Set(lockset.resolved.map((entry) => entry.n)),
     exempt,
-    peerOfLocal,
+    peersOf,
   );
+  // R3-1337 — close over the helpers the CDN's transpiler injects, rather than exempt them:
+  // an exemption would ship a zip whose first `require("@swc/helpers")` is a live fetch,
+  // which is what this check exists to stop. Each needed helper is built from OUR tree (the
+  // CLI depends on it at the sandbox's exact version), appended to the bundle and to the
+  // lockset's `resolved` (the manifest carries this same object), and the check runs again
+  // so the helper's own content is held to the same rule.
+  const helperNeeds = [
+    ...new Set(
+      findings
+        .filter((finding) => finding.source === 'import' && CDN_INJECTED_HELPERS.includes(finding.dependency))
+        .map((finding) => finding.dependency),
+    ),
+  ].sort();
+  if (helperNeeds.length) {
+    // The helper's OWN dependencies come with it (@swc/helpers requires tslib), resolved
+    // from the helper's directory and held to its declared range (`closeOverHelpers`).
+    const closed: string[] = [];
+    for (const pkg of closeOverHelpers(helperNeeds, new Map(lockset.resolved.map((entry) => [entry.n, entry.v])))) {
+      outcome.packages.push({
+        key: encodePackageKey(pkg.name, pkg.version),
+        name: pkg.name,
+        version: pkg.version,
+        bytes: encodeLocalPackage(await buildLocalPackage(pkg.dir, scanCjsModule, transformFile)),
+      });
+      lockset.resolved.push({ n: pkg.name, v: pkg.version, d: pkg.depth });
+      closed.push(`${pkg.name}@${pkg.version}`);
+    }
+    outcome.closedOver = closed.length;
+    outcome.summary += `; +${closed.length} closed over by this CLI (CDN-injected helpers): ${closed.join(', ')}`;
+    findings = closureFindings(
+      outcome.packages,
+      new Set(lockset.resolved.map((entry) => entry.n)),
+      exempt,
+      peersOf,
+    );
+  }
   const importMisses = findings.filter((finding) => finding.source === 'import');
   if (importMisses.length) {
     throw new Error(importMisses.map(closureFailureMessage).join('\n'));
@@ -519,11 +577,15 @@ export const buildCacheZip = async (opts: CacheZipOptions): Promise<CacheZipResu
   const treeSha = headTreeSha(repo);
   const defaultBranch = opts.defaultBranch || defaultBranchOf(repo, ref);
   const entries = treeEntries(repo);
-  const { lockset, summary: locksetSummary } = await resolveLockset(repo, opts);
+  const { lockset, summary: locksetSummaryAtResolve } = await resolveLockset(repo, opts);
   const platformNames = new Set(
     lockset ? platformProvidedNames(headDependencies(repo).deps, lockset.dependencies) : [],
   );
-  const { packages, summary: bundledPackagesSummary } = await resolveBundledPackages(opts, lockset, repo, platformNames);
+  const {
+    packages,
+    summary: bundledPackagesSummary,
+    closedOver = 0,
+  } = await resolveBundledPackages(opts, lockset, repo, platformNames);
 
   const manifest: RepoManifest = {
     schemaVersion: MANIFEST_SCHEMA_VERSION,
@@ -651,7 +713,12 @@ export const buildCacheZip = async (opts: CacheZipOptions): Promise<CacheZipResu
     entryCount: entries.length,
     artifactsSummary,
     mdxMetadataSummary,
-    locksetSummary,
+    // The helper closure (R3-1337) appends to `lockset.resolved` after the summary was
+    // written, so the printed count says so rather than understating the zip's lockset.
+    locksetSummary:
+      closedOver > 0
+        ? `${locksetSummaryAtResolve} + ${closedOver} closed over (CDN-injected helpers)`
+        : locksetSummaryAtResolve,
     bundledPackagesSummary,
     declaredDependencyCount: Object.keys(headDependencies(repo).deps).length,
     bundledPackageCount: packages ? packages.length : null,
