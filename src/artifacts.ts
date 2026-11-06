@@ -85,6 +85,10 @@ export interface ArtifactEmission {
   transpiledCount: number;
   /** `files[].library` variants emitted (R3-1345) — 0 unless the repo opted in. */
   libraryVariantCount: number;
+  /** Variants skipped alone (transform error / unresolvable dep) while the base
+   *  artifact beside them still emitted — counted apart from `skipped`, which stays
+   *  whole-file: a variant skip never means the file lost its artifact. */
+  libraryVariantSkipped: number;
   skipped: { path: string; reason: string }[];
   sourceBytes: number;
   artifactBytes: number;
@@ -169,6 +173,7 @@ export const emitArtifacts = async (
   let sourceBytes = 0;
   let artifactBytes = 0;
   let libraryVariantCount = 0;
+  let libraryVariantSkipped = 0;
 
   for (const entry of entries) {
     if (entry.type !== 'blob') continue;
@@ -226,16 +231,18 @@ export const emitArtifacts = async (
         // dep specifier — skips the VARIANT alone, with a warning: never the
         // base artifact beside it, never the whole index. The module stays
         // cached for the `/app` shape and live-transpiles at library mounts.
+        // The skip counts as a variant skip, not a file skip: the base entry is
+        // already emitted and `skipped` stays whole-file.
         if ('error' in libResult) {
           console.warn(
             `Warning: library variant omitted for ${rel} (${libResult.error.message})`,
           );
-          skipped.push({ path: rel, reason: `library-variant: ${libResult.error.message}` });
+          libraryVariantSkipped++;
         } else if (!libResult.deps.every((d): d is string => typeof d === 'string')) {
           console.warn(
             `Warning: library variant omitted for ${rel} (the dep collector returned a non-string specifier — a dynamic import it could not resolve)`,
           );
-          skipped.push({ path: rel, reason: 'library-variant: unresolvable-deps' });
+          libraryVariantSkipped++;
         } else {
           const libOut = `transpiled-lib/${rel}.js`;
           files.set(libOut, libResult.code);
@@ -263,6 +270,7 @@ export const emitArtifacts = async (
     files,
     transpiledCount: Object.keys(indexFiles).length,
     libraryVariantCount,
+    libraryVariantSkipped,
     skipped,
     sourceBytes,
     artifactBytes,

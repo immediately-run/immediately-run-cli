@@ -483,10 +483,12 @@ test('without the flag no entry carries a library variant — the default, every
   }
 });
 
-test('a file the base rejects never gets a variant; its neighbours keep base AND variant (R3-843 at the variant level)', async () => {
+test('a file the base rejects never gets a variant (a variant rides a validated entry); its neighbours keep base AND variant', async () => {
   // The dynamic-import landmine: the base's non-string dep check drops the whole
-  // entry (no variant can ride a rejected entry); the healthy neighbour must
-  // keep both artifacts — one poisoned file never costs the index anything.
+  // entry, so no variant can exist for it (there is no entry to ride); the healthy
+  // neighbour keeps both artifacts. This case exercises the BASE rejection — the
+  // variant-ONLY failure branches (base fine, variant error/unresolvable) are a
+  // separate, real-input-unreachable path; see the Untested trailer.
   const root = makeRepo({
     'src/App.tsx': APP_TSX,
     'docs/drills/drill.mjs':
@@ -545,5 +547,40 @@ test('cache-zip reads the flag from HEAD package.json and embeds the variants (R
     assert.throws(() => readEntry(zip, '.immediately.run/artifacts/transpiled-lib/src/App.tsx.js'));
   } finally {
     rmSync(plain, { recursive: true, force: true });
+  }
+});
+
+test('the flag set without a usable package name warns and emits no variants (R3-1345)', async () => {
+  const readEntry = (zip, name) =>
+    execFileSync('unzip', ['-p', zip, name], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+
+  const root = makeRepo({
+    'src/App.tsx': APP_TSX,
+    // The flag is set, but the package has no `name` — nothing to mount the
+    // variant compile at. This must be LOUD (a config error), never a silent
+    // match of the non-opted output.
+    'package.json': '{"immediately.run":{"libraryArtifacts":true}}\n',
+  });
+  const warns = [];
+  const origWarn = console.warn;
+  console.warn = (...args) => warns.push(args.join(' '));
+  try {
+    const zip = join(root, 'nameless.zip');
+    await buildCacheZip({ repoPath: root, owner: 'a', repository: 'b', ref: 'main', out: zip, lockset: false });
+    const index = JSON.parse(readEntry(zip, '.immediately.run/artifacts/index.json'));
+    // The base emission is untouched; no variant anywhere.
+    assert.ok('/src/App.tsx' in index.files);
+    for (const [k, v] of Object.entries(index.files)) {
+      assert.equal(v.library, undefined, `${k} carries no variant`);
+    }
+    assert.throws(() => readEntry(zip, '.immediately.run/artifacts/transpiled-lib/src/App.tsx.js'));
+    // And the reason is said out loud.
+    assert.ok(
+      warns.some((w) => w.includes('libraryArtifacts is true') && w.includes('no usable "name"')),
+      `expected the nameless-flag warning (got: ${JSON.stringify(warns)})`,
+    );
+  } finally {
+    console.warn = origWarn;
+    rmSync(root, { recursive: true, force: true });
   }
 });

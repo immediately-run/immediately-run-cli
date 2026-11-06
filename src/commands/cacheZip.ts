@@ -143,8 +143,9 @@ export interface CacheZipResult {
   refKind: RepoManifest['refKind'];
   commitSha: string;
   entryCount: number;
-  // Human-readable artifact outcome for the summary line: "<n> files (<k> skipped),
-  // <bytes>" or "omitted (--no-artifacts)".
+  // Human-readable artifact outcome for the summary line: "<n> files (+ <v> library
+  // variant(s) [(<s> variant skip(s))]) (<k> skipped), <bytes>" or "omitted
+  // (--no-artifacts)".
   artifactsSummary: string;
   // Human-readable MDX-metadata outcome: "<n> entries", "no MDX frontmatter", or
   // "omitted (--no-mdx-metadata)".
@@ -181,13 +182,14 @@ const headRegistryResolved = (parsed: unknown): string[] => {
 // The publisher's own name is correct because the mounted-path compile is
 // path-independent across mount names (its source map names only the basename):
 // the sandbox consumes the variant under whatever name the app mounted it by
-// (R3-1343). The flag requires that `name`; a nameless package.json yields no
-// variants (nothing to mount the compile at).
-const headLibraryArtifacts = (parsed: unknown): { rootName: string } | null => {
+// (R3-1343). Returns `{ rootName: null }` when the flag is set but the package
+// `name` is missing/empty — the caller warns and emits no variants (nothing to
+// mount the compile at).
+const headLibraryArtifacts = (parsed: unknown): { rootName: string | null } | null => {
   const cfg = (parsed as Record<string, unknown> | null)?.['immediately.run'];
   if ((cfg as { libraryArtifacts?: unknown } | undefined)?.libraryArtifacts !== true) return null;
   const name = (parsed as { name?: unknown } | null)?.name;
-  return typeof name === 'string' && name.length > 0 ? { rootName: name } : null;
+  return { rootName: typeof name === 'string' && name.length > 0 ? name : null };
 };
 
 // Dependencies as committed at HEAD — the lockset must correspond to the tree
@@ -197,7 +199,7 @@ const headDependencies = (
 ): {
   deps: DepMap;
   registryResolved: string[];
-  libraryArtifacts: { rootName: string } | null;
+  libraryArtifacts: { rootName: string | null } | null;
   reason?: string;
 } => {
   let raw: string;
@@ -650,13 +652,25 @@ export const buildCacheZip = async (opts: CacheZipOptions): Promise<CacheZipResu
   let emission: ArtifactEmission | undefined;
   if (opts.artifacts !== false) {
     // R3-1345: the library-variant flag rides the SAME HEAD:package.json blob the
-    // lockset read uses — one config source, never a second.
+    // lockset read uses — one config source, never a second. A flag set without a
+    // usable package `name` is a config error: say so, and emit no variants
+    // (nothing to mount the compile at) rather than silently matching a
+    // non-opted repo's output.
+    const libraryArtifacts = headDependencies(repo).libraryArtifacts;
+    if (libraryArtifacts && !libraryArtifacts.rootName) {
+      console.warn(
+        'Warning: libraryArtifacts is true but HEAD package.json has no usable "name" — library variants omitted',
+      );
+    }
     emission = await emitArtifacts(repo, entries, {
-      libraryArtifacts: headDependencies(repo).libraryArtifacts,
+      libraryArtifacts: libraryArtifacts?.rootName ? { rootName: libraryArtifacts.rootName } : null,
     });
     const skip = emission.skipped.length ? ` (${emission.skipped.length} skipped)` : '';
+    const vskip = emission.libraryVariantSkipped
+      ? ` (${emission.libraryVariantSkipped} variant skip(s))`
+      : '';
     const variants = emission.libraryVariantCount
-      ? ` + ${emission.libraryVariantCount} library variant(s)`
+      ? ` + ${emission.libraryVariantCount} library variant(s)${vskip}`
       : '';
     artifactsSummary = `${emission.transpiledCount} files${variants}${skip}, ${formatBytes(
       emission.sourceBytes,
