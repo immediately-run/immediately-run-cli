@@ -143,9 +143,9 @@ export interface CacheZipResult {
   refKind: RepoManifest['refKind'];
   commitSha: string;
   entryCount: number;
-  // Human-readable artifact outcome for the summary line: "<n> files (+ <v> library
-  // variant(s) [(<s> variant skip(s))]) (<k> skipped), <bytes>" or "omitted
-  // (--no-artifacts)".
+  // Human-readable artifact outcome for the summary line — bracketed segments are
+  // optional, parentheses are literal: "<n> files[ + <v> library variant(s)[
+  // (<s> variant skip(s))]][ (<k> skipped)], <bytes>" or "omitted (--no-artifacts)".
   artifactsSummary: string;
   // Human-readable MDX-metadata outcome: "<n> entries", "no MDX frontmatter", or
   // "omitted (--no-mdx-metadata)".
@@ -666,12 +666,15 @@ export const buildCacheZip = async (opts: CacheZipOptions): Promise<CacheZipResu
       libraryArtifacts: libraryArtifacts?.rootName ? { rootName: libraryArtifacts.rootName } : null,
     });
     const skip = emission.skipped.length ? ` (${emission.skipped.length} skipped)` : '';
-    const vskip = emission.libraryVariantSkipped
-      ? ` (${emission.libraryVariantSkipped} variant skip(s))`
-      : '';
-    const variants = emission.libraryVariantCount
-      ? ` + ${emission.libraryVariantCount} library variant(s)${vskip}`
-      : '';
+    // The variant fragment prints whenever ANY variant outcome exists — including
+    // an opted-in repo whose every variant failed (count 0, skips >0): folding the
+    // skip count inside the count-only fragment would print a summary identical
+    // to a non-opted repo's, hiding the emission gap.
+    const vskip = emission.libraryVariantSkipped ? ` (${emission.libraryVariantSkipped} variant skip(s))` : '';
+    const variants =
+      emission.libraryVariantCount || emission.libraryVariantSkipped
+        ? ` + ${emission.libraryVariantCount} library variant(s)${vskip}`
+        : '';
     artifactsSummary = `${emission.transpiledCount} files${variants}${skip}, ${formatBytes(
       emission.sourceBytes,
     )} → ${formatBytes(emission.artifactBytes)}`;

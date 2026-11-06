@@ -584,3 +584,52 @@ test('the flag set without a usable package name warns and emits no variants (R3
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('a variant-ONLY transform failure keeps the base and skips just the variant (real `using` input)', async () => {
+  // Round 2 of the gate found the real-input route round 1 wrongly declared
+  // unreachable: the /app refresh chain carries
+  // @babel/plugin-proposal-explicit-resource-management and the plain
+  // /node_modules chain does NOT — so a `using` declaration compiles at /app
+  // (base artifact emits) and FAILS at the mounted shape (variant skipped alone).
+  const USING_TSX = `export function Res() {
+  using handle = { [Symbol.dispose]() {} };
+  return null;
+}
+`;
+  const root = makeRepo({ 'src/Res.tsx': USING_TSX, 'package.json': FLAG_PKG });
+  try {
+    const emission = await emitArtifacts(root, treeEntries(root), {
+      libraryArtifacts: { rootName: '@scope/lib' },
+    });
+    // The base is untouched in every way…
+    const entry = emission.index.files['/src/App.tsx'] ?? emission.index.files['/src/Res.tsx'];
+    assert.ok(entry, 'the base entry survives');
+    assert.ok(emission.files.has('transpiled/src/Res.tsx.js'), 'the base artifact file survives');
+    const baseExpected = await transformFile({ path: '/app/src/Res.tsx', code: USING_TSX });
+    assert.ok(!('error' in baseExpected), 'sanity: the /app compile succeeds (the fixture reaches the branch)');
+    assert.equal(emission.files.get('transpiled/src/Res.tsx.js'), baseExpected.code);
+    // …and the variant is skipped ALONE: no entry field, no file, no file-skip.
+    assert.equal(entry.library, undefined, 'no variant on the entry');
+    assert.ok(!emission.files.has('transpiled-lib/src/Res.tsx.js'), 'no variant file');
+    assert.equal(emission.libraryVariantSkipped, 1);
+    assert.equal(emission.libraryVariantCount, 0);
+    assert.deepEqual(emission.skipped, [], 'a variant skip is not a file skip');
+
+    // …and the summary says the variants were attempted and skipped — NOT the
+    // non-opted repo's shape (round 2: a count-0 fragment folded the skip count
+    // away, printing "1 files, …" like a repo without the flag).
+    const zip = join(root, 'using.zip');
+    const built = await buildCacheZip({
+      repoPath: root,
+      owner: 'a',
+      repository: 'b',
+      ref: 'main',
+      out: zip,
+      lockset: false,
+    });
+    assert.match(built.artifactsSummary, /\+ 0 library variant\(s\) \(1 variant skip\(s\)\)/);
+    assert.match(built.artifactsSummary, /^1 files /);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
