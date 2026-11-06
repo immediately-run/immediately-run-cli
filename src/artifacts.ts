@@ -33,6 +33,7 @@ import {
   isTransformable,
   parseFrontmatter,
   PRESET_NAME,
+  selectReactChain,
   transformFile,
   TRANSPILER_VERSION,
 } from '@immediately-run/transpiler';
@@ -55,6 +56,15 @@ export interface ArtifactIndexFileEntry {
   out: string;
   /** Raw dependency specifiers, as the chain reports them. */
   deps: string[];
+  /**
+   * The optional library-mount variant (R3-1345, D-PTA-6): the same source compiled
+   * for consumption at a `/node_modules/<name>` mount — the compile the module gets
+   * live at its mounted path (plain chain, compact). Emitted only when the repo opts
+   * in via `package.json` `immediately.run`.`libraryArtifacts: true`. A library root
+   * serves THIS variant, never the base `out` (R3-1343: two path axes — chain and
+   * compaction — make every `/app` compile byte-differ from a mounted-path compile).
+   */
+  library?: { out: string; deps: string[] };
 }
 
 export interface ArtifactIndex {
@@ -73,9 +83,22 @@ export interface ArtifactEmission {
   /** Output files keyed by path relative to `.immediately.run/artifacts/`. */
   files: Map<string, string>;
   transpiledCount: number;
+  /** `files[].library` variants emitted (R3-1345) — 0 unless the repo opted in. */
+  libraryVariantCount: number;
   skipped: { path: string; reason: string }[];
   sourceBytes: number;
   artifactBytes: number;
+}
+
+/** Options for {@link emitArtifacts} (R3-1345). */
+export interface ArtifactEmissionOptions {
+  /**
+   * Emit the opt-in `library` variant of every covered file (D-PTA-6): the compile at
+   * `/node_modules/<rootName>/<rel>`, byte-identical at any mount name the consuming
+   * app uses (the plain chain's output names only the basename in its source map).
+   * `rootName` is the publisher repo's own HEAD `package.json` `name`.
+   */
+  libraryArtifacts?: { rootName: string } | null;
 }
 
 // `node_modules/` is never covered (the runtime transpiles it live & compact),
@@ -138,12 +161,14 @@ const resolveToolchainHash = async (): Promise<string> => {
 export const emitArtifacts = async (
   repo: string,
   entries: ManifestEntry[],
+  opts: ArtifactEmissionOptions = {},
 ): Promise<ArtifactEmission> => {
   const files = new Map<string, string>();
   const indexFiles: Record<string, ArtifactIndexFileEntry> = {};
   const skipped: { path: string; reason: string }[] = [];
   let sourceBytes = 0;
   let artifactBytes = 0;
+  let libraryVariantCount = 0;
 
   for (const entry of entries) {
     if (entry.type !== 'blob') continue;
@@ -180,9 +205,46 @@ export const emitArtifacts = async (
 
     const out = `transpiled/${rel}.js`;
     files.set(out, result.code);
-    indexFiles[`/${rel}`] = { srcSha: entry.sha, out, deps: result.deps };
+    const indexEntry: ArtifactIndexFileEntry = { srcSha: entry.sha, out, deps: result.deps };
+    indexFiles[`/${rel}`] = indexEntry;
     sourceBytes += Buffer.byteLength(code, 'utf8');
     artifactBytes += Buffer.byteLength(result.code, 'utf8');
+
+    // R3-1345 (D-PTA-6): the library variant — the compile at the mounted-path
+    // shape `/node_modules/<rootName>/<rel>`, what a git-library root serves
+    // (R3-1343). The rule is the transpiler's own chain selection, NEVER a
+    // hand-copied extension list: `selectReactChain` at the mounted path owns
+    // which files get a variant. That is where `.mdx`/`.md` fall out — no chain
+    // owns them under `/node_modules` — and where `.ts`/`.tsx`/`.js`/`.jsx` get
+    // the plain (compact) compile. A variant rides a VALIDATED entry: it exists
+    // only beside a base artifact that passed every check above.
+    if (opts.libraryArtifacts) {
+      const libPath = `/node_modules/${opts.libraryArtifacts.rootName}/${rel}`;
+      if (selectReactChain(libPath) !== null) {
+        const libResult = await transformFile({ path: libPath, code });
+        // A variant failure — a transform error, or the same R3-843 non-string
+        // dep specifier — skips the VARIANT alone, with a warning: never the
+        // base artifact beside it, never the whole index. The module stays
+        // cached for the `/app` shape and live-transpiles at library mounts.
+        if ('error' in libResult) {
+          console.warn(
+            `Warning: library variant omitted for ${rel} (${libResult.error.message})`,
+          );
+          skipped.push({ path: rel, reason: `library-variant: ${libResult.error.message}` });
+        } else if (!libResult.deps.every((d): d is string => typeof d === 'string')) {
+          console.warn(
+            `Warning: library variant omitted for ${rel} (the dep collector returned a non-string specifier — a dynamic import it could not resolve)`,
+          );
+          skipped.push({ path: rel, reason: 'library-variant: unresolvable-deps' });
+        } else {
+          const libOut = `transpiled-lib/${rel}.js`;
+          files.set(libOut, libResult.code);
+          indexEntry.library = { out: libOut, deps: libResult.deps };
+          artifactBytes += Buffer.byteLength(libResult.code, 'utf8');
+          libraryVariantCount++;
+        }
+      }
+    }
   }
 
   const index: ArtifactIndex = {
@@ -199,7 +261,8 @@ export const emitArtifacts = async (
   return {
     index,
     files,
-    transpiledCount: files.size,
+    transpiledCount: Object.keys(indexFiles).length,
+    libraryVariantCount,
     skipped,
     sourceBytes,
     artifactBytes,

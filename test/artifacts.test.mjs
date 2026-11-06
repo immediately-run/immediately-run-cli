@@ -402,3 +402,148 @@ test('isArtifactExcluded drops tests, test dirs and top-level scripts/, and noth
     assert.equal(isArtifactExcluded(p), false, `${p} is included`);
   }
 });
+
+// R3-1345 — the opt-in library variant (D-PTA-6): with package.json
+// `immediately.run`.`libraryArtifacts: true`, every covered file ALSO gets its
+// mounted-path compile under `transpiled-lib/` and `files[].library = {out, deps}`.
+// Without the flag (every repo today) the index is unchanged. Byte-identity is
+// the whole point: the variant must equal the compile the sandbox's §5.7 spot-check
+// re-transpiles at the MOUNTED path — for ANY mount name (path independence,
+// R3-1343) — and never the base `/app` artifact, which differs on two path axes
+// (the react-refresh chain envelope, and compaction: /node_modules minifies).
+const FLAG_PKG = '{"name":"@scope/lib","immediately.run":{"libraryArtifacts":true}}\n';
+
+test('libraryArtifacts: the variant equals the mounted-path compile, at ANY mount name (R3-1345)', async () => {
+  const root = makeRepo({
+    'src/App.tsx': APP_TSX,
+    'src/util.ts': UTIL_TS,
+    'content/post.mdx': POST_MDX,
+  });
+  try {
+    const emission = await emitArtifacts(root, treeEntries(root), {
+      libraryArtifacts: { rootName: '@scope/lib' },
+    });
+
+    // The .tsx variant bytes: the compile at the publisher's own mount shape…
+    const atMount = await transformFile({ path: '/node_modules/@scope/lib/src/App.tsx', code: APP_TSX });
+    assert.ok(!('error' in atMount));
+    // …byte-equal to the same compile under a DIFFERENT mount name — one zip
+    // serves every consumer (the plain compile names only the basename).
+    const atOther = await transformFile({ path: '/node_modules/@other/x/src/App.tsx', code: APP_TSX });
+    assert.ok(!('error' in atOther));
+    assert.equal(atMount.code, atOther.code);
+
+    const tsx = emission.index.files['/src/App.tsx'];
+    assert.equal(tsx.library.out, 'transpiled-lib/src/App.tsx.js');
+    assert.equal(emission.files.get('transpiled-lib/src/App.tsx.js'), atMount.code);
+    assert.deepEqual(tsx.library.deps, atMount.deps);
+    // Ruling 1: library code carries no react-refresh envelope — the variant is
+    // the plain compile, and it is NOT the base artifact.
+    assert.doesNotMatch(emission.files.get('transpiled-lib/src/App.tsx.js'), /\$RefreshReg\$/);
+    assert.notEqual(
+      emission.files.get('transpiled-lib/src/App.tsx.js'),
+      emission.files.get('transpiled/src/App.tsx.js'),
+    );
+
+    // The same-chain `.ts` gets a variant too — the compact mounted compile,
+    // never its pretty `/app` base (the compaction axis alone differs).
+    const tsAtMount = await transformFile({ path: '/node_modules/@scope/lib/src/util.ts', code: UTIL_TS });
+    assert.ok(!('error' in tsAtMount));
+    assert.equal(emission.files.get('transpiled-lib/src/util.ts.js'), tsAtMount.code);
+    assert.notEqual(
+      emission.files.get('transpiled-lib/src/util.ts.js'),
+      emission.files.get('transpiled/src/util.ts.js'),
+    );
+
+    // `.mdx` gets NO variant: no chain owns it under /node_modules
+    // (`selectReactChain`'s call — never a hand-copied extension list); it keeps
+    // its base artifact and live-compiles at library mounts, as today.
+    assert.equal(emission.index.files['/content/post.mdx'].library, undefined);
+
+    assert.equal(emission.libraryVariantCount, 2);
+    // The base artifacts are unchanged by the flag: out, bytes, count.
+    assert.equal(emission.files.get('transpiled/src/App.tsx.js'), (await transformFile({ path: '/app/src/App.tsx', code: APP_TSX })).code);
+    assert.equal(emission.transpiledCount, 3);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('without the flag no entry carries a library variant — the default, every repo today (R3-1345)', async () => {
+  const root = makeRepo({ 'src/App.tsx': APP_TSX, 'src/util.ts': UTIL_TS });
+  try {
+    const emission = await emitArtifacts(root, treeEntries(root));
+    for (const [k, v] of Object.entries(emission.index.files)) {
+      assert.equal(v.library, undefined, `${k} carries no variant`);
+    }
+    assert.equal(emission.libraryVariantCount, 0);
+    assert.ok(!emission.files.has('transpiled-lib/src/App.tsx.js'));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a file the base rejects never gets a variant; its neighbours keep base AND variant (R3-843 at the variant level)', async () => {
+  // The dynamic-import landmine: the base's non-string dep check drops the whole
+  // entry (no variant can ride a rejected entry); the healthy neighbour must
+  // keep both artifacts — one poisoned file never costs the index anything.
+  const root = makeRepo({
+    'src/App.tsx': APP_TSX,
+    'docs/drills/drill.mjs':
+      "const P = '/tmp/x.js';\nconst { default: p } = await import(P);\nexport const y = 1;\n",
+  });
+  try {
+    const emission = await emitArtifacts(root, treeEntries(root), {
+      libraryArtifacts: { rootName: '@scope/lib' },
+    });
+    assert.equal(emission.index.files['/docs/drills/drill.mjs'], undefined);
+    assert.ok(!emission.files.has('transpiled-lib/docs/drills/drill.mjs.js'));
+    assert.ok(emission.index.files['/src/App.tsx'].library, 'App.tsx keeps base AND variant');
+    assert.equal(emission.libraryVariantCount, 1);
+    for (const [k, v] of Object.entries(emission.index.files)) {
+      if (v.library) {
+        assert.ok(v.library.deps.every((d) => typeof d === 'string'), `${k}: variant deps are strings`);
+      }
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('cache-zip reads the flag from HEAD package.json and embeds the variants (R3-1345)', async () => {
+  const readEntry = (zip, name) =>
+    execFileSync('unzip', ['-p', zip, name], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+
+  const flagged = makeRepo({ 'src/App.tsx': APP_TSX, 'src/util.ts': UTIL_TS, 'package.json': FLAG_PKG });
+  try {
+    const zip = join(flagged, 'flagged.zip');
+    await buildCacheZip({ repoPath: flagged, owner: 'a', repository: 'b', ref: 'main', out: zip, lockset: false });
+    const index = JSON.parse(readEntry(zip, '.immediately.run/artifacts/index.json'));
+    assert.equal(index.files['/src/App.tsx'].library.out, 'transpiled-lib/src/App.tsx.js');
+    assert.equal(index.files['/src/util.ts'].library.out, 'transpiled-lib/src/util.ts.js');
+    // The variant file rides in the zip beside the base tree.
+    const variant = readEntry(zip, '.immediately.run/artifacts/transpiled-lib/src/App.tsx.js');
+    assert.doesNotMatch(variant, /\$RefreshReg\$/, 'the variant carries no refresh envelope');
+    const expected = await transformFile({ path: '/node_modules/@scope/lib/src/App.tsx', code: APP_TSX });
+    assert.equal(variant, expected.code);
+  } finally {
+    rmSync(flagged, { recursive: true, force: true });
+  }
+
+  // The same repo shape WITHOUT the flag (the default) embeds no variant anywhere.
+  const plain = makeRepo({
+    'src/App.tsx': APP_TSX,
+    'package.json': '{"name":"@scope/lib","immediately.run":{}}\n',
+  });
+  try {
+    const zip = join(plain, 'plain.zip');
+    await buildCacheZip({ repoPath: plain, owner: 'a', repository: 'b', ref: 'main', out: zip, lockset: false });
+    const index = JSON.parse(readEntry(zip, '.immediately.run/artifacts/index.json'));
+    for (const [k, v] of Object.entries(index.files)) {
+      assert.equal(v.library, undefined, `${k} carries no variant`);
+    }
+    assert.throws(() => readEntry(zip, '.immediately.run/artifacts/transpiled-lib/src/App.tsx.js'));
+  } finally {
+    rmSync(plain, { recursive: true, force: true });
+  }
+});

@@ -173,24 +173,47 @@ const headRegistryResolved = (parsed: unknown): string[] => {
   return Array.isArray(list) ? list.filter((m): m is string => typeof m === 'string') : [];
 };
 
+// R3-1345: the opt-in library-variant flag (package.json
+// `immediately.run`.`libraryArtifacts === true`). When set, `emitArtifacts` also
+// transpiles every covered file at `/node_modules/<name>/<rel>` — `<name>` is
+// this repo's own HEAD package.json `name` — and records
+// `files['/<rel>'].library = { out, deps }` (PRETRANSPILED_ARTIFACTS_SPEC §7).
+// The publisher's own name is correct because the mounted-path compile is
+// path-independent across mount names (its source map names only the basename):
+// the sandbox consumes the variant under whatever name the app mounted it by
+// (R3-1343). The flag requires that `name`; a nameless package.json yields no
+// variants (nothing to mount the compile at).
+const headLibraryArtifacts = (parsed: unknown): { rootName: string } | null => {
+  const cfg = (parsed as Record<string, unknown> | null)?.['immediately.run'];
+  if ((cfg as { libraryArtifacts?: unknown } | undefined)?.libraryArtifacts !== true) return null;
+  const name = (parsed as { name?: unknown } | null)?.name;
+  return typeof name === 'string' && name.length > 0 ? { rootName: name } : null;
+};
+
 // Dependencies as committed at HEAD — the lockset must correspond to the tree
 // the zip carries (git archive HEAD), not the working directory.
 const headDependencies = (
   repo: string,
-): { deps: DepMap; registryResolved: string[]; reason?: string } => {
+): {
+  deps: DepMap;
+  registryResolved: string[];
+  libraryArtifacts: { rootName: string } | null;
+  reason?: string;
+} => {
   let raw: string;
   try {
     raw = git(repo, ['show', 'HEAD:package.json']);
   } catch {
-    return { deps: {}, registryResolved: [], reason: 'no package.json at HEAD' };
+    return { deps: {}, registryResolved: [], libraryArtifacts: null, reason: 'no package.json at HEAD' };
   }
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch {
-    return { deps: {}, registryResolved: [], reason: 'package.json at HEAD is not valid JSON' };
+    return { deps: {}, registryResolved: [], libraryArtifacts: null, reason: 'package.json at HEAD is not valid JSON' };
   }
   const registryResolved = headRegistryResolved(parsed);
+  const libraryArtifacts = headLibraryArtifacts(parsed);
   // R3-289: the lockset echo must be the SAME input DepMap the runtime computes
   // — including the root package's non-optional `peerDependencies` (the root of
   // a run has no consumer, so a peer is a runtime need there). The merge is the
@@ -198,14 +221,14 @@ const headDependencies = (
   // runtime's echo-match against this lockset holds.
   const deps = rootRuntimeDependencies(parsed as RootPackageShape);
   if (Object.keys(deps).length === 0) {
-    return { deps: {}, registryResolved, reason: 'package.json has no dependencies' };
+    return { deps: {}, registryResolved, libraryArtifacts, reason: 'package.json has no dependencies' };
   }
   for (const [name, range] of Object.entries(deps)) {
     if (typeof range !== 'string') {
-      return { deps: {}, registryResolved, reason: `dependency ${name} has a non-string version` };
+      return { deps: {}, registryResolved, libraryArtifacts, reason: `dependency ${name} has a non-string version` };
     }
   }
-  return { deps, registryResolved };
+  return { deps, registryResolved, libraryArtifacts };
 };
 
 /**
@@ -626,9 +649,16 @@ export const buildCacheZip = async (opts: CacheZipOptions): Promise<CacheZipResu
   let artifactsSummary = 'omitted (--no-artifacts)';
   let emission: ArtifactEmission | undefined;
   if (opts.artifacts !== false) {
-    emission = await emitArtifacts(repo, entries);
+    // R3-1345: the library-variant flag rides the SAME HEAD:package.json blob the
+    // lockset read uses — one config source, never a second.
+    emission = await emitArtifacts(repo, entries, {
+      libraryArtifacts: headDependencies(repo).libraryArtifacts,
+    });
     const skip = emission.skipped.length ? ` (${emission.skipped.length} skipped)` : '';
-    artifactsSummary = `${emission.transpiledCount} files${skip}, ${formatBytes(
+    const variants = emission.libraryVariantCount
+      ? ` + ${emission.libraryVariantCount} library variant(s)`
+      : '';
+    artifactsSummary = `${emission.transpiledCount} files${variants}${skip}, ${formatBytes(
       emission.sourceBytes,
     )} → ${formatBytes(emission.artifactBytes)}`;
     // R3-843: the stamp is the consume-side gate (§4.4) and it was observable NOWHERE
