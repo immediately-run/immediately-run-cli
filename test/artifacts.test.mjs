@@ -602,7 +602,7 @@ test('a variant-ONLY transform failure keeps the base and skips just the variant
       libraryArtifacts: { rootName: '@scope/lib' },
     });
     // The base is untouched in every way…
-    const entry = emission.index.files['/src/App.tsx'] ?? emission.index.files['/src/Res.tsx'];
+    const entry = emission.index.files['/src/Res.tsx'];
     assert.ok(entry, 'the base entry survives');
     assert.ok(emission.files.has('transpiled/src/Res.tsx.js'), 'the base artifact file survives');
     const baseExpected = await transformFile({ path: '/app/src/Res.tsx', code: USING_TSX });
