@@ -14,3 +14,17 @@ checked our own output against our own expectations would agree with itself.
 rather than a current version precisely because it is old enough that the CDN resolves it;
 the outage this work exists for is that a *fresh* version does not. Refreshing these means
 re-fetching both halves for the same version, never one of them.
+
+## `grove-hero/hero-33391ef.mdx` + `grove-hero/hero-e017647.mdx`
+
+grove's `content/_layouts/hero.mdx` copied verbatim at two commits of
+`immediately-run/grove` (R3-1349):
+
+- `33391ef`: the shipped starter whose unquoted `description:` holds `nav: top` and
+  `cover: lands` mid-line. That is a YAML error, so the host dropped its metadata row.
+- `e017647`: the same file with the `description:` quoted. It parses to
+  `layoutRole: root`, `nav: top`.
+
+The sidecar test feeds both to `emitMdxMetadata` and checks the two outcomes the sandbox's
+live scan gives for the same bytes (sandbox `src/bundler/frontmatterAdoption.test.ts`).
+Frozen: the point is those exact bytes, not grove's current file.
