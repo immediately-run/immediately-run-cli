@@ -229,6 +229,24 @@ test('emitMdxMetadata — grove hero.mdx: unquoted (33391ef) omitted with the YA
   }
 });
 
+// Review 1-A-0 — the canon also rejects a block that IS valid YAML but not a map. Under
+// 0.9.1 a list block with a `<More />` excerpt gave an `{ excerpt }`-only entry; under
+// 0.10.0 it is omitted with a warning, as the sandbox's live scan now drops it too.
+test('emitMdxMetadata — a list block (valid YAML, not a map) is omitted with its reason (R3-1349)', () => {
+  const root = makeRepo({ 'content/list.mdx': '---\n- a\n- b\n---\nintro\n<More />\nrest\n' });
+  const warn = console.warn;
+  console.warn = () => {};
+  try {
+    const { sidecar, skipped } = emitMdxMetadata(root, treeEntries(root));
+    assert.ok(!('/content/list.mdx' in sidecar.files));
+    assert.equal(skipped.length, 1);
+    assert.match(skipped[0].reason, /must be a map of keys, not a list/);
+  } finally {
+    console.warn = warn;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('cache-zip embeds mdx-metadata.json; --no-mdx-metadata omits it; no-frontmatter repo omits it', async () => {
   const readEntry = (zip, name) =>
     execFileSync('unzip', ['-p', zip, name], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
