@@ -345,10 +345,11 @@ export const emitMdxMetadata = (repo: string, entries: ManifestEntry[]): MdxMeta
     // than the live scan, silently. Omit-with-warning instead, the same treatment a
     // parse failure gets, so the sidecar is never a lie about what it carries.
     //
-    // Unreachable with today's parser: `@immediately-run/transpiler` uses `yaml`'s
-    // core schema, which yields a string for `date: 2020-01-02`. This guards the
-    // parser CHANGING (a YAML-1.1 timestamp schema, a custom tag), which is exactly
-    // the kind of upstream change that would otherwise land as a boot-time mystery.
+    // Unreachable with today's parser: since transpiler 0.10.0 (R3-1348/R3-1349)
+    // `parseFrontmatter` delegates to `@immediately-run/mdx-plugins/frontmatter`, which
+    // already rejects (kind `not-json`, thrown into the catch above) every value JSON
+    // cannot carry: a timestamp, a Set, a binary, a non-finite number. This guard is the
+    // second line, for the canon dropping or weakening that check of its own.
     if (!isJsonSerializable(frontmatter)) {
       const reason = 'frontmatter contains a value JSON cannot carry unchanged';
       console.warn(`Warning: mdx-metadata omitted for ${rel} (${reason})`);

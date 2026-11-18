@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -185,6 +185,64 @@ test('emitMdxMetadata — a malformed frontmatter file is omitted, non-fatally',
     assert.equal(skipped.length, 1);
     assert.equal(skipped[0].path, 'content/bad.mdx');
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// R3-1349 — transpiler 0.10.0 parses frontmatter through mdx-plugins' YAML canon. The
+// input is grove's real layout starter at two commits (test/fixtures/README.md): the
+// unquoted one is a YAML error the sidecar must omit with a warning naming the file and
+// the parser's message; the quoted one must carry the values the live scan stores.
+test('emitMdxMetadata — grove hero.mdx: unquoted (33391ef) omitted with the YAML error, quoted (e017647) kept (R3-1349)', () => {
+  const fixture = (name) => readFileSync(new URL(`./fixtures/grove-hero/${name}`, import.meta.url), 'utf8');
+  const root = makeRepo({
+    'content/_layouts/hero.mdx': fixture('hero-33391ef.mdx'),
+    'content/_layouts/hero-quoted.mdx': fixture('hero-e017647.mdx'),
+  });
+  const warnings = [];
+  const warn = console.warn;
+  console.warn = (...args) => warnings.push(args.join(' '));
+  try {
+    const { sidecar, skipped } = emitMdxMetadata(root, treeEntries(root));
+    // Unquoted: no row, and a warning that names the file and carries the YAML message.
+    assert.ok(!('/content/_layouts/hero.mdx' in sidecar.files));
+    assert.deepEqual(skipped.map((s) => s.path), ['content/_layouts/hero.mdx']);
+    let yamlMessage;
+    try {
+      parseFrontmatter(fixture('hero-33391ef.mdx'));
+    } catch (err) {
+      yamlMessage = err.message;
+    }
+    assert.ok(yamlMessage, 'the shared parser rejects the unquoted starter');
+    assert.match(yamlMessage, /^frontmatter \(line 4, column \d+\): /);
+    assert.equal(skipped[0].reason, yamlMessage);
+    const w = warnings.find((x) => x.includes('content/_layouts/hero.mdx'));
+    assert.ok(w && w.includes(yamlMessage), `warning names the file and the YAML error: ${w}`);
+    // Quoted: the row the live scan stores.
+    assert.deepEqual(
+      { layoutRole: sidecar.files['/content/_layouts/hero-quoted.mdx'].frontmatter.layoutRole, nav: sidecar.files['/content/_layouts/hero-quoted.mdx'].frontmatter.nav },
+      { layoutRole: 'root', nav: 'top' },
+    );
+  } finally {
+    console.warn = warn;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// Review 1-A-0 — the canon also rejects a block that IS valid YAML but not a map. Under
+// 0.9.1 a list block with a `<More />` excerpt gave an `{ excerpt }`-only entry; under
+// 0.10.0 it is omitted with a warning, as the sandbox's live scan now drops it too.
+test('emitMdxMetadata — a list block (valid YAML, not a map) is omitted with its reason (R3-1349)', () => {
+  const root = makeRepo({ 'content/list.mdx': '---\n- a\n- b\n---\nintro\n<More />\nrest\n' });
+  const warn = console.warn;
+  console.warn = () => {};
+  try {
+    const { sidecar, skipped } = emitMdxMetadata(root, treeEntries(root));
+    assert.ok(!('/content/list.mdx' in sidecar.files));
+    assert.equal(skipped.length, 1);
+    assert.match(skipped[0].reason, /must be a map of keys, not a list/);
+  } finally {
+    console.warn = warn;
     rmSync(root, { recursive: true, force: true });
   }
 });
