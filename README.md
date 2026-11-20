@@ -127,9 +127,14 @@ npx @immediately-run/cli git-serve ~/repos
 | `--cert` | `<host>.crt` beside the root, else minted by `tailscale cert` | TLS certificate for `--bind tailscale`; its `.key` sibling is the key |
 | `--allow-login` | none | With `--bind tailscale`, also serve devices of this tailnet user (repeatable) |
 | `--allow-push` | off | With `--bind tailscale`, let git clients push (fast-forward only, no branch deletes) |
+| `--allow-commit` | off | Let the browser commit through `POST /commit` (below) |
+| `--author` | this machine's git `user.name` and `user.email` | With `--allow-commit`, the author and committer of browser commits, as `"Name <email>"` |
 | `--origin` | `https://immediately.run` | Allowed browser origin and deep-link base; the site's local-development mediator origin is admitted with it |
 | `--origin-unsafe` | off | Allow an `--origin` outside the recognized set |
 | `--json` | off | One JSON line on stdout: `{ endpoint, namespace, port, protocol, allowPush, allowCommit, links: [{ repo, url }] }`, plus `token` on `localhost` only |
+
+With `--allow-commit` it also takes one write, `POST /commit` (see
+"Committing from the browser").
 
 What it serves, to a request that carries the session token:
 
@@ -190,6 +195,33 @@ endpoint and no credential.
   changing the port or the machine name makes a new one.
 - Peer identity is device identity: every process and every OS user on a device
   signed in as you can reach the server.
+
+### Committing from the browser
+
+```sh
+npx @immediately-run/cli git-serve ~/repos --allow-commit
+```
+
+With `--allow-commit` the page can commit the edits made in its editor. The
+server writes the commit; the browser sends only file contents and a message.
+
+- **One commit, on one branch, as a compare-and-swap.** The request names the
+  branch tip the browser saw. If the branch moved meanwhile, nothing is written
+  and the browser is told the current tip (409). A new branch names its parent
+  commit instead. A tag is never written, and a branch is never rewound.
+- **Paths are checked by git itself**, with its HFS and NTFS protections forced
+  on: nothing can be written under `.git` in any spelling. A change to
+  `.gitmodules`, and to or under a symlink or a submodule, is refused as well.
+- **File modes are never the request's.** A new file is `100644`; a changed file
+  keeps its mode.
+- **The author is this machine's** git identity, or `--author`. The request
+  carries none. Each commit ends with a `Git-Serve-Connection:` trailer naming
+  the connection that made it (`loopback` on localhost).
+- **Two gates on a tailnet.** The server must run with `--allow-commit`, and the
+  browser's connection must have been paired with `pair --scope write`. On
+  localhost the flag is the one gate.
+- **About 3 MiB of file content per commit**, across all files (4 MiB of request
+  body). A larger change is a job for `git push`.
 
 ### Plain git against the same server
 

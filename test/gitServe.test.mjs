@@ -495,7 +495,7 @@ test('§10.1: the Host header is pinned, with its port required', async () => {
 });
 
 test('§10.1: a path in no class is 404, a wrong method is 405, and nothing is writable', async () => {
-  for (const path of ['/', '/watch', '/commit', '/pair', '/notes.git/info/refs', '/notes.git/HEAD', '/meta/', '/META']) {
+  for (const path of ['/', '/watch', '/pair', '/notes.git/info/refs', '/notes.git/HEAD', '/meta/', '/META']) {
     assert.equal((await authed(path)).status, 404, path);
   }
   for (const method of ['POST', 'PUT', 'DELETE', 'HEAD']) {

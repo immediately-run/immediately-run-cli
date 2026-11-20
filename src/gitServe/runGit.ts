@@ -39,12 +39,17 @@ const gitArgs = (repoDir: string, args: readonly string[]): string[] => [
   ...args,
 ];
 
-export const runGit: RunGit = (repoDir, args) =>
+export const runGit: RunGit = (repoDir, args, options = {}) =>
   new Promise<GitResult>((resolve) => {
-    execFile(
+    const child = execFile(
       'git',
       gitArgs(repoDir, args),
-      { encoding: 'buffer', maxBuffer: MAX_GIT_OUTPUT_BYTES, env: gitEnv() },
+      {
+        encoding: 'buffer',
+        maxBuffer: MAX_GIT_OUTPUT_BYTES,
+        // The caller's variables are set after the inherited GIT_* were dropped.
+        env: { ...gitEnv(), ...(options.env ?? {}) },
+      },
       (error, stdout, stderr) => {
         const code =
           error === null
@@ -55,6 +60,10 @@ export const runGit: RunGit = (repoDir, args) =>
         resolve({ code, stdout, stderr: stderr.toString('utf8') });
       },
     );
+    // A git that exits before reading its input closes the pipe; the exit code
+    // above already reports that failure.
+    child.stdin?.on('error', () => {});
+    child.stdin?.end(options.input);
   });
 
 /** Starts git with its stdout left as a stream, for a body too large to buffer. */

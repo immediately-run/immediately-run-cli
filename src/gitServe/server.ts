@@ -15,6 +15,8 @@
  *             smart-HTTP routes (`smartHttp.ts`).
  *
  * It reads committed objects only; there is no working tree and no stream route.
+ * Its one write is `POST /commit` (`commit.ts`), behind `--allow-commit` and the
+ * `write` scope, both checked on every request (R-GS-23).
  */
 
 import * as http from 'node:http';
@@ -24,7 +26,14 @@ import { realpathSync } from 'node:fs';
 
 import { LOOPBACK_HOSTS, admittedOrigins } from '../devServer.js';
 import { connectionLookup, type ConnectionScope } from './connections.js';
-import { READ_ROUTES, TAILNET_ROUTES, admit, authorize, sameSecret } from './guards.js';
+import {
+  MAX_COMMIT_BODY_BYTES,
+  applyCommit,
+  parseCommitRequest,
+  type CommitIdentity,
+  type CommitRefusal,
+} from './commit.js';
+import { LOOPBACK_ROUTES, TAILNET_ROUTES, admit, authorize, sameSecret } from './guards.js';
 import { gitServeNamespace } from './namespace.js';
 import { exchangePairingCode } from './pairing.js';
 import { checkPeer, type PeerGateConfig } from './peerGate.js';
@@ -32,6 +41,7 @@ import { GIT_SERVE_PROTOCOL, GIT_SERVE_SERVER, type RunGit } from './protocol.js
 import { answerRead, type ReadAnswer } from './readRoutes.js';
 import { runGit as realRunGit, spawnGit } from './runGit.js';
 import { hasBrowserHeaders, planGitRequest, runBackend } from './smartHttp.js';
+import { resolveRepo } from './repoName.js';
 import { loadInstanceId } from './state.js';
 
 export interface TailnetBinding {
@@ -61,6 +71,12 @@ export interface GitServeOptions {
   /** `--allow-push`: git clients may push (fast-forward only, no deletes). It is
    *  the only thing that turns push on; a repository's own config cannot. */
   allowPush?: boolean;
+  /** `--allow-commit`: `POST /commit` is served to a connection that holds the
+   *  `write` scope. On loopback the session credential holds `write` exactly
+   *  when this is set. Requires `identity`. */
+  allowCommit?: boolean;
+  /** The author and committer of every browser commit (R-GS-22). */
+  identity?: CommitIdentity;
   /** Tests inject a `runGit` to move a ref between two of the server's own git calls. */
   runGit?: RunGit;
   /** Where refusals are logged (default: stderr). Never receives a credential. */
@@ -110,6 +126,36 @@ const sendRefusal = (
   cors: Record<string, string>,
 ): void =>
   sendJson(res, status, { server: GIT_SERVE_SERVER, protocol: GIT_SERVE_PROTOCOL, reason }, cors);
+
+/** Reads a request body, counting bytes as they arrive. Resolves null once the
+ *  count passes `limit`; the rest of the body is then discarded, not buffered. */
+const readBody = (req: http.IncomingMessage, limit: number): Promise<Buffer | null> =>
+  new Promise((resolve, reject) => {
+    const declared = Number(req.headers['content-length']);
+    if (Number.isFinite(declared) && declared > limit) {
+      req.resume();
+      resolve(null);
+      return;
+    }
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let over = false;
+    req.on('data', (chunk: Buffer) => {
+      if (over) return;
+      size += chunk.length;
+      if (size > limit) {
+        over = true;
+        chunks.length = 0;
+        resolve(null);
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      if (!over) resolve(Buffer.concat(chunks));
+    });
+    req.on('error', reject);
+  });
 
 const sendBlob = (
   res: http.ServerResponse,
@@ -164,6 +210,11 @@ export const startGitServe = (opts: GitServeOptions): Promise<GitServeHandle> =>
   if ((opts.token === undefined) === (opts.tailnet === undefined)) {
     throw new Error('startGitServe takes exactly one of `token` (loopback) and `tailnet`.');
   }
+  const allowCommit = opts.allowCommit === true;
+  const identity = opts.identity;
+  if (allowCommit && identity === undefined) {
+    throw new Error('allowCommit needs the identity that browser commits are written under.');
+  }
   const root = realpathSync(opts.root);
   const instanceId = loadInstanceId(root);
   const runGit = opts.runGit ?? realRunGit;
@@ -172,7 +223,7 @@ export const startGitServe = (opts: GitServeOptions): Promise<GitServeHandle> =>
   const origins = admittedOrigins(opts.origin);
   const tailnet = opts.tailnet;
   const allowedHosts = tailnet ? new Set([tailnet.host.toLowerCase()]) : LOOPBACK_HOSTS;
-  const routes = tailnet ? TAILNET_ROUTES : READ_ROUTES;
+  const routes = tailnet ? TAILNET_ROUTES : LOOPBACK_ROUTES;
   // Set once the port is known; the handler runs only after that.
   let namespace = '';
 
@@ -186,8 +237,10 @@ export const startGitServe = (opts: GitServeOptions): Promise<GitServeHandle> =>
       const record = connections.find(bearer);
       return record === null ? null : { connectionId: record.id, scope: record.scope };
     }
+    // On loopback there are no connections: the session credential carries
+    // `write` exactly when the server was started with --allow-commit (R-GS-23).
     return sessionSecret !== undefined && sameSecret(bearer, sessionSecret)
-      ? { connectionId: 'loopback', scope: 'read' }
+      ? { connectionId: 'loopback', scope: allowCommit ? 'write' : 'read' }
       : null;
   };
 
@@ -303,15 +356,84 @@ export const startGitServe = (opts: GitServeOptions): Promise<GitServeHandle> =>
     }
 
     // Every other browser route needs a live credential.
-    if (callerOf(bearer) === null) {
+    const caller = callerOf(bearer);
+    if (caller === null) {
       refuse(401, 'token', cors);
+      return;
+    }
+
+    if (url.pathname === '/commit') {
+      // R-GS-23: two gates, both checked on every request. Neither stands in
+      // for the other, and the mediator relaying the route is not a gate.
+      if (!allowCommit || identity === undefined) {
+        req.resume();
+        refuse(403, 'commit-disabled', cors);
+        return;
+      }
+      if (caller.scope !== 'write') {
+        req.resume();
+        refuse(403, 'scope', cors);
+        return;
+      }
+      const raw = await readBody(req, MAX_COMMIT_BODY_BYTES);
+      if (raw === null) {
+        refuse(413, 'too-large', cors);
+        return;
+      }
+      const sendCommitRefusal = (refusal: CommitRefusal): void => {
+        const { status, ...rest } = refusal;
+        log(`git-serve: refused (${refusal.reason}) POST /commit by connection ${caller.connectionId}`);
+        sendJson(res, status, { server: GIT_SERVE_SERVER, protocol: GIT_SERVE_PROTOCOL, ...rest }, cors);
+      };
+      let body: unknown;
+      try {
+        body = JSON.parse(raw.toString('utf8'));
+      } catch {
+        sendCommitRefusal({ status: 400, reason: 'malformed' });
+        return;
+      }
+      const parsed = parseCommitRequest(body);
+      if (!parsed.ok) {
+        sendCommitRefusal(parsed.refusal);
+        return;
+      }
+      // R-GS-6, the same rule as every other route that names a repository.
+      const repo = resolveRepo(root, parsed.request.repo);
+      if (!repo.ok) {
+        refuse(repo.reason === 'malformed' ? 400 : 404, repo.reason === 'malformed' ? 'malformed' : 'not-found', cors);
+        return;
+      }
+      const applied = await applyCommit(repo.dir, parsed.request, {
+        runGit,
+        identity,
+        connectionId: caller.connectionId,
+      });
+      if (!applied.ok) {
+        sendCommitRefusal(applied.refusal);
+        return;
+      }
+      log(
+        `git-serve: commit ${applied.commitSha} on ${repo.name} ${parsed.request.branch} ` +
+          `by connection ${caller.connectionId}`,
+      );
+      sendJson(
+        res,
+        200,
+        {
+          server: GIT_SERVE_SERVER,
+          protocol: GIT_SERVE_PROTOCOL,
+          commitSha: applied.commitSha,
+          treeSha: applied.treeSha,
+        },
+        cors,
+      );
       return;
     }
 
     const answer = await answerRead(url.pathname, url.searchParams, {
       root,
       instanceId,
-      allowCommit: false,
+      allowCommit,
       runGit,
     });
     if (answer.kind === 'json') sendJson(res, answer.status, answer.body, cors);

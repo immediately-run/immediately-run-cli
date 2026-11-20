@@ -20,6 +20,7 @@ import {
   revokeConnection,
   type ConnectionScope,
 } from '../gitServe/connections.js';
+import { parseAuthor, type CommitIdentity } from '../gitServe/commit.js';
 import { PAIRING_TTL_MS, createPairingCode } from '../gitServe/pairing.js';
 import { DEFAULT_GIT_SERVE_PORT, GIT_SERVE_PROTOCOL } from '../gitServe/protocol.js';
 import { resolveRef } from '../gitServe/refs.js';
@@ -76,6 +77,14 @@ Options:
   --allow-login <login>     With --bind tailscale, also serve devices of this
                             tailnet user (repeatable). Required when this node
                             is itself tagged.
+  --allow-commit            Let the browser commit: POST /commit writes one
+                            commit to one branch, as a fast-forward of the tip
+                            the browser saw. On localhost the flag is the one
+                            gate; on a tailnet the connection must also have
+                            been paired with --scope write.
+  --author "Name <email>"   With --allow-commit, the author and committer of
+                            browser commits (default: this machine's git
+                            user.name and user.email).
   --allow-push              With --bind tailscale, let git clients push. A push
                             must be a fast-forward and cannot delete a branch.
                             Without the flag every push is refused, whatever a
@@ -187,6 +196,42 @@ const defaultBranchOf = async (repoDir: string): Promise<string | null> => {
   return resolved.ok && resolved.refKind === 'branch' ? branch : null;
 };
 
+/**
+ * The author and committer of browser commits: `--author`, else this machine's
+ * git identity. A commit made without one would carry whatever git invents from
+ * the login name, so a missing identity is a start-up error.
+ */
+const commitIdentity = (authorFlag: string | undefined, root: string): CommitIdentity => {
+  if (authorFlag !== undefined) {
+    const parsed = parseAuthor(authorFlag);
+    if (parsed === null) {
+      throw new Error(`Invalid --author: ${JSON.stringify(authorFlag)} (expected "Name <email>")`);
+    }
+    return parsed;
+  }
+  const read = (key: string): string => {
+    try {
+      return execFileSync('git', ['config', '--get', key], {
+        cwd: root,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        env: gitEnv(),
+      }).trim();
+    } catch {
+      return '';
+    }
+  };
+  const name = read('user.name');
+  const email = read('user.email');
+  if (name === '' || email === '') {
+    throw new Error(
+      '--allow-commit needs an identity for the commits it writes, and this machine has no ' +
+        'git user.name and user.email. Pass --author "Name <email>", or set them with git config.',
+    );
+  }
+  return { name, email };
+};
+
 /** Each repository with the branch its link opens, and those with none yet. */
 const describeRepos = async (
   root: string,
@@ -227,6 +272,7 @@ const serveTailnet = async (
   port: number,
   allowLogins: readonly string[],
   allowPush: boolean,
+  commitOptions: { allowCommit?: boolean; identity?: CommitIdentity },
 ): Promise<number> => {
   const bin = resolveTailscaleBin();
   const identity = await readTailnetIdentity(bin);
@@ -250,7 +296,7 @@ const serveTailnet = async (
     key,
     peerGate: { self: identity.self, allowUserIds, whois: tailscaleWhois(bin) },
   };
-  const handle = await startGitServe({ root, origin, port, tailnet, allowPush });
+  const handle = await startGitServe({ root, origin, port, tailnet, allowPush, ...commitOptions });
   const repos = await describeRepos(handle.root);
   // A tailnet link carries no endpoint and no credential: the host finds both
   // in the connection the user made (R-GS-9).
@@ -268,7 +314,7 @@ const serveTailnet = async (
         port: handle.port,
         protocol: GIT_SERVE_PROTOCOL,
         allowPush,
-        allowCommit: false,
+        allowCommit: commitOptions.allowCommit === true,
         links,
       }) + '\n',
     );
@@ -280,6 +326,12 @@ const serveTailnet = async (
     console.log(`Allowed origin: ${origin}`);
     console.log(`Namespace: ${handle.namespace}`);
     console.log(`To connect a browser: immediately.run git-serve pair ${root}`);
+    if (commitOptions.identity) {
+      console.log(
+        `Browser commits are on for connections paired with --scope write, written as ` +
+          `${commitOptions.identity.name} <${commitOptions.identity.email}>.`,
+      );
+    }
     console.log(
       allowPush
         ? 'git clients may clone and push (fast-forward only, no branch deletes).'
@@ -348,13 +400,23 @@ export const runGitServe = async (args: ParsedArgs): Promise<number> => {
     );
   }
 
+  // R-GS-22: the identity of every browser commit is the server's, resolved
+  // once here. With --allow-commit a missing identity stops the start.
+  const allowCommit = args.flags['allow-commit'] === true;
+  const authorFlag = flagValue(args.flags, 'author');
+  if (authorFlag !== undefined && !allowCommit) {
+    throw new Error('--author applies with --allow-commit only.');
+  }
+  const identity = allowCommit ? commitIdentity(authorFlag, root) : undefined;
+  const commitOptions = allowCommit && identity ? { allowCommit, identity } : {};
+
   if (bindMode === 'tailscale') {
-    return await serveTailnet(args, root, origin, port, allowLogins, allowPush);
+    return await serveTailnet(args, root, origin, port, allowLogins, allowPush, commitOptions);
   }
 
   // 256 random bits, minted per start, compared in constant time (guards.ts).
   const token = randomBytes(32).toString('base64url');
-  const handle = await startGitServe({ root, origin, token, port });
+  const handle = await startGitServe({ root, origin, token, port, ...commitOptions });
   const repos = await describeRepos(handle.root);
   const links = repos.linked.map(({ repo, branch }) => ({
     repo,
@@ -370,7 +432,7 @@ export const runGitServe = async (args: ParsedArgs): Promise<number> => {
         port: handle.port,
         protocol: GIT_SERVE_PROTOCOL,
         allowPush: false,
-        allowCommit: false,
+        allowCommit,
         token,
         links,
       }) + '\n',
@@ -379,9 +441,10 @@ export const runGitServe = async (args: ParsedArgs): Promise<number> => {
       `Serving ${handle.root} (read-only) on ${handle.endpoint} for ${origin}. Ctrl-C to stop.`,
     );
   } else {
-    console.log(`Serving ${handle.root} (read-only, committed objects only) on ${handle.endpoint}`);
+    console.log(`Serving ${handle.root} (committed objects only) on ${handle.endpoint}`);
     console.log(`Allowed origin: ${origin}`);
     console.log(`Namespace: ${handle.namespace}`);
+    if (identity) console.log(`Browser commits are on, written as ${identity.name} <${identity.email}>.`);
     printRepoLines(root, links, repos.unlinked);
     console.log('Press Ctrl-C to stop. Keep this running while a page is open.');
   }

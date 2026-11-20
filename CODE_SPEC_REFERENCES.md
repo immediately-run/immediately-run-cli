@@ -56,3 +56,10 @@ core_concepts §9).
   the parsed parts; push is the `--allow-push` flag's alone (`forcedConfig`, through
   `GIT_CONFIG_COUNT`, which outranks the repository's config); browser headers are refused
   before the peer gate.
+- **`src/gitServe/commit.ts`** — `POST /commit`, R-GS-18 to R-GS-22. `planCommit` is the
+  pure check against the parent tree; `applyCommit` builds the tree in a private index
+  (`update-index --index-info`, `core.protectHFS`/`core.protectNTFS` forced on, never
+  `mktree`) and moves the branch with `update-ref <ref> <new> <old>`. git keeps a refused
+  path out of the index by SKIPPING it with exit 0, so `applyCommit` reads the index back
+  and refuses the request unless every planned path is there as planned. The two gates of
+  R-GS-23 (`--allow-commit`, the `write` scope) are checked in `server.ts` on every request.
