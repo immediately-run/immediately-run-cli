@@ -39,6 +39,12 @@ import { isBranchName } from './refs.js';
  *  mediator passes is never refused here for its size. */
 export const MAX_COMMIT_BODY_BYTES = 4 * 1024 * 1024;
 export const MAX_MESSAGE_BYTES = 64 * 1024;
+/** Bounds on one request's shape. Without them a small body could cost a great
+ *  deal: every path is checked against each of its directory prefixes, and
+ *  every change starts a git process. */
+export const MAX_CHANGES = 2000;
+export const MAX_PATH_BYTES = 4096;
+export const MAX_PATH_SEGMENTS = 64;
 export const CONNECTION_TRAILER = 'Git-Serve-Connection';
 
 const ZERO_SHA = '0'.repeat(40);
@@ -111,12 +117,17 @@ export const parseCommitRequest = (
   // The connection trailer is the server's statement about who committed.
   if (new RegExp(`^${CONNECTION_TRAILER}\\s*:`, 'im').test(b.message)) return bad('message');
   if (!Array.isArray(b.changes) || b.changes.length === 0) return bad('no-changes');
+  if (b.changes.length > MAX_CHANGES) return bad('too-many-changes');
 
   const changes: CommitChange[] = [];
   for (const raw of b.changes) {
     if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return bad('malformed');
     const c = raw as Record<string, unknown>;
     if (typeof c.path !== 'string') return bad('malformed');
+    // Refused here, before any per-path work, and without echoing a huge path.
+    if (Buffer.byteLength(c.path, 'utf8') > MAX_PATH_BYTES || c.path.split('/').length > MAX_PATH_SEGMENTS) {
+      return bad('path-too-long');
+    }
     const keys = Object.keys(c).sort().join(',');
     if (keys === 'delete,path' && c.delete === true) {
       changes.push({ path: c.path, delete: true });
@@ -137,6 +148,25 @@ export const parseCommitRequest = (
     ...(b.baseSha !== undefined ? { baseSha: b.baseSha as string } : {}),
   };
   return { ok: true, request };
+};
+
+/** Code points HFS+ ignores in a file name (git's own list, utf8.c). */
+const HFS_IGNORABLE = /[\u200c-\u200f\u202a-\u202e\u206a-\u206f\ufeff]/g;
+
+/**
+ * True when a path component is `.gitmodules` under any spelling a
+ * case-insensitive, HFS+ or NTFS checkout would resolve to that file: another
+ * case, ignorable code points, trailing dots and spaces, an alternate data
+ * stream suffix, or the 8.3 short names. git's own path check refuses these
+ * spellings only for symlinks, so `core.protectHFS`/`protectNTFS` do not cover
+ * a regular file.
+ */
+export const isGitmodulesName = (component: string): boolean => {
+  let name = component.replace(HFS_IGNORABLE, '').toLowerCase();
+  const stream = name.indexOf(':');
+  if (stream !== -1) name = name.slice(0, stream);
+  name = name.replace(/[. ]+$/, '');
+  return name === '.gitmodules' || /^gitmod~[1-4]$/.test(name) || /^gi7eba~?/.test(name) || /^gi7eb~/.test(name);
 };
 
 /** Every proper directory prefix of a path: `a/b/c` → `a`, `a/b`. */
@@ -172,8 +202,9 @@ export const planCommit = (
     if (path.includes('\\')) return bad('path-backslash', path);
     if (seen.has(path)) return bad('path-duplicate', path);
     seen.add(path);
-    // `.gitmodules` decides where a submodule is fetched from.
-    if (path.toLowerCase() === '.gitmodules') return bad('gitmodules', path);
+    // `.gitmodules` decides where a submodule is fetched from. Refused under
+    // every spelling, at any depth.
+    if (path.split('/').some(isGitmodulesName)) return bad('gitmodules', path);
     // At or under a symlink or a submodule of the parent tree.
     for (const at of [...prefixes(path), path]) {
       const mode = parentTree.get(at)?.mode;
@@ -248,6 +279,10 @@ export const applyCommit = async (
   const { runGit } = ctx;
   // Only refs/heads/ is writable, and only under a name git accepts as a branch.
   if (!(await isBranchName(repoDir, request.branch, runGit))) return bad('branch');
+  // A branch that is a symbolic ref would carry the write to whatever it names
+  // (a tag, for one). It is refused, and the swap below never dereferences.
+  const symbolic = await runGit(repoDir, ['symbolic-ref', '-q', `refs/heads/${request.branch}`]);
+  if (symbolic.code === 0) return bad('branch');
 
   // The parent is the tip the swap will replace. This read is a courtesy that
   // answers the common conflict early; the swap below is the authority.
@@ -328,6 +363,11 @@ export const applyCommit = async (
     const wrote = await runGit(repoDir, [...PROTECT, 'write-tree'], { env });
     const treeSha = text(wrote.stdout);
     if (wrote.code !== 0 || !COMMIT_SHA_RE.test(treeSha)) return failed();
+    // A request whose every change equals what the parent already holds would
+    // land as an empty commit; it is refused instead.
+    const parentTreeSha = await runGit(repoDir, ['rev-parse', '--verify', '-q', '--end-of-options', `${parent}^{tree}`]);
+    if (parentTreeSha.code !== 0) return failed();
+    if (text(parentTreeSha.stdout) === treeSha) return bad('no-change');
 
     // Authorship is the server's; the connection is recorded as a trailer.
     const message = `${request.message.trimEnd()}\n\n${CONNECTION_TRAILER}: ${ctx.connectionId}\n`;
@@ -352,13 +392,22 @@ export const applyCommit = async (
     // and the commit just written stays unreachable.
     const swapped = await runGit(repoDir, [
       'update-ref',
+      '--no-deref',
       `refs/heads/${request.branch}`,
       commitSha,
       request.expectedSha ?? ZERO_SHA,
     ]);
     if (swapped.code !== 0) {
+      // A conflict only if the branch is somewhere else than the request said.
+      // Otherwise the ref could not be written for another reason, and telling
+      // the browser "conflict" would have it refresh and retry forever.
       const currentSha = await branchTip(repoDir, request.branch, runGit);
-      return { ok: false, refusal: { status: 409, reason: 'conflict', currentSha } };
+      if (currentSha !== request.expectedSha) {
+        return { ok: false, refusal: { status: 409, reason: 'conflict', currentSha } };
+      }
+      // A new branch whose name collides with an existing one (`main/x` beside
+      // `main`) can never be created; anything else (a held lock) may pass.
+      return request.expectedSha === null ? bad('branch') : failed();
     }
     return { ok: true, commitSha, treeSha };
   } finally {

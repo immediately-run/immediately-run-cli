@@ -318,9 +318,9 @@ const serveTailnet = async (
         links,
       }) + '\n',
     );
-    console.error(`Serving ${handle.root} (read-only) on ${handle.endpoint} for ${origin}. Ctrl-C to stop.`);
+    console.error(`Serving ${handle.root} on ${handle.endpoint} for ${origin}. Ctrl-C to stop.`);
   } else {
-    console.log(`Serving ${handle.root} (read-only, committed objects only) on ${handle.endpoint}`);
+    console.log(`Serving ${handle.root} (committed objects only) on ${handle.endpoint}`);
     console.log(`Bound to the tailnet interface ${address}. Only your own devices are served.`);
     if (allowUserIds.size > 0) console.log(`Also served: devices of ${allowLogins.join(', ')}`);
     console.log(`Allowed origin: ${origin}`);
@@ -437,9 +437,7 @@ export const runGitServe = async (args: ParsedArgs): Promise<number> => {
         links,
       }) + '\n',
     );
-    console.error(
-      `Serving ${handle.root} (read-only) on ${handle.endpoint} for ${origin}. Ctrl-C to stop.`,
-    );
+    console.error(`Serving ${handle.root} on ${handle.endpoint} for ${origin}. Ctrl-C to stop.`);
   } else {
     console.log(`Serving ${handle.root} (committed objects only) on ${handle.endpoint}`);
     console.log(`Allowed origin: ${origin}`);

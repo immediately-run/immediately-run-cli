@@ -234,9 +234,10 @@ git clone https://<machine>.<tailnet>.ts.net:7701/notes.git
 
 - `git clone` and `git fetch` are always on for your own devices (the peer
   check above is the whole gate; there is no token on these routes).
-- `git push` needs the server started with `--allow-push`. A push must be a
-  fast-forward and cannot delete a branch. Rewriting a branch means doing it on
-  the serving machine's disk.
+- `git push` needs the server started with `--allow-push`. A push can only
+  touch branches: it must be a fast-forward and cannot delete one, and a tag
+  (or any other ref) cannot be pushed, moved or deleted. Rewriting a branch or
+  tagging means doing it on the serving machine's disk.
 - A repository's own config cannot turn push on, or force-pushes and deletes
   back on: the server sets `http.receivepack`, `receive.denyNonFastForwards`
   and `receive.denyDeletes` itself for every request.

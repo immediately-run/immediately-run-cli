@@ -98,8 +98,12 @@ const post = (port, path, { headers = {}, body } = {}) =>
         });
       },
     );
-    // A server that answers 413 early may close the socket under the upload.
-    req.on('error', (e) => (e.code === 'EPIPE' || e.code === 'ECONNRESET' ? resolvePromise({ status: 0, error: e.code }) : reject(e)));
+    // A server that answers 413 early may close the socket under the upload; the
+    // answer still arrives, so a write error waits for it before giving up.
+    req.on('error', (e) => {
+      if (e.code !== 'EPIPE' && e.code !== 'ECONNRESET') return reject(e);
+      setTimeout(() => resolvePromise({ status: 0, error: e.code }), 2000);
+    });
     if (payload) req.write(payload);
     req.end();
   });
@@ -382,6 +386,18 @@ test('G-GS-14: the hostile-path table — each is a 400 naming the path, and the
       ['a\\b', 'path-backslash'],
       ['.gitmodules', 'gitmodules'],
       ['.GITMODULES', 'gitmodules'],
+      // The spellings an NTFS or HFS+ checkout resolves to .gitmodules. git's own
+      // check refuses these for symlinks only, so the server must.
+      ['.gitmodules ', 'gitmodules'],
+      ['.gitmodules.', 'gitmodules'],
+      ['.gitmodules. .', 'gitmodules'],
+      ['GITMOD~1', 'gitmodules'],
+      ['gi7eba~1', 'gitmodules'],
+      ['.gitmodules::$DATA', 'gitmodules'],
+      ['.gitmodules:$DATA', 'gitmodules'],
+      ['.git\u200cmodules', 'gitmodules'],
+      ['.gitmodules\u200d', 'gitmodules'],
+      ['sub/dir/.GitModules', 'gitmodules'],
       ['link', 'under-symlink'], // the symlink entry itself
       ['link/inside', 'under-symlink'],
       ['vendor/sub', 'under-submodule'],
@@ -439,6 +455,79 @@ test('the temp index is removed after a success and after a refusal', async () =
     await s.commit({ repo: 'notes', branch: 'main', expectedSha: tip, message: 'stale', changes: [{ path: 'a.txt', contentBase64: b64('2') }] });
     await s.commit({ repo: 'notes', branch: 'main', expectedSha: tip, message: 'bad', changes: [{ path: '.git/x', contentBase64: b64('3') }] });
     assert.equal(scratchDirs().length, before);
+  } finally {
+    await s.handle.close();
+  }
+});
+
+test('a branch that is a symbolic ref is refused: a commit never follows it to a tag', async () => {
+  const { root, bare, tip } = makeRoot();
+  git(bare, ['tag', 'rel', tip]);
+  git(bare, ['symbolic-ref', 'refs/heads/alias', 'refs/tags/rel']);
+  const s = await loopback(root);
+  try {
+    const res = await s.commit({ repo: 'notes', branch: 'alias', expectedSha: tip, message: 'm', changes: [{ path: 'a.txt', contentBase64: b64('via alias\n') }] });
+    assert.equal(res.status, 400, res.text);
+    assert.equal(res.body.reason, 'branch');
+    assert.equal(git(bare, ['rev-parse', 'refs/tags/rel']), tip, 'the tag did not move');
+  } finally {
+    await s.handle.close();
+  }
+});
+
+test('a failed swap is a conflict only when the branch moved', async () => {
+  const { root, bare, tip } = makeRoot();
+  const s = await loopback(root);
+  const change = [{ path: 'a.txt', contentBase64: b64('swap\n') }];
+  try {
+    // A new branch whose name collides with an existing branch can never exist.
+    const clash = await s.commit({ repo: 'notes', branch: 'main/x', expectedSha: null, baseSha: tip, message: 'm', changes: change });
+    assert.equal(clash.status, 400, clash.text);
+    assert.equal(clash.body.reason, 'branch');
+    // A held lock on the ref: not a conflict (the tip is where the request said).
+    writeFileSync(join(bare, 'refs', 'heads', 'main.lock'), '');
+    const locked = await s.commit({ repo: 'notes', branch: 'main', expectedSha: tip, message: 'm', changes: change });
+    assert.equal(locked.status, 500, locked.text);
+    assert.equal(git(bare, ['rev-parse', 'refs/heads/main']), tip);
+    rmSync(join(bare, 'refs', 'heads', 'main.lock'));
+    assert.equal((await s.commit({ repo: 'notes', branch: 'main', expectedSha: tip, message: 'm', changes: change })).status, 200);
+  } finally {
+    await s.handle.close();
+  }
+});
+
+test('a request that changes nothing is refused, not landed as an empty commit', async () => {
+  const { root, bare, tip } = makeRoot();
+  const s = await loopback(root);
+  try {
+    const res = await s.commit({ repo: 'notes', branch: 'main', expectedSha: tip, message: 'same', changes: [{ path: 'a.txt', contentBase64: b64('hello\n') }] });
+    assert.equal(res.status, 400, res.text);
+    assert.equal(res.body.reason, 'no-change');
+    assert.equal(git(bare, ['rev-parse', 'refs/heads/main']), tip);
+  } finally {
+    await s.handle.close();
+  }
+});
+
+test('a small body cannot cost much: deep paths, long paths and huge change lists are refused at once', async () => {
+  const { root, bare, tip } = makeRoot();
+  const s = await loopback(root);
+  try {
+    const started = Date.now();
+    // 120,000 segments in 240 KB: this used to stall the server and exhaust its heap.
+    const deep = await s.commit({ repo: 'notes', branch: 'main', expectedSha: tip, message: 'm', changes: [{ path: 'a/'.repeat(120000) + 'f', contentBase64: '' }] });
+    assert.equal(deep.status, 400);
+    assert.equal(deep.body.reason, 'path-too-long');
+    assert.equal(deep.body.path, undefined, 'the path is not echoed back');
+    assert.equal((await s.commit({ repo: 'notes', branch: 'main', expectedSha: tip, message: 'm', changes: [{ path: 'a/'.repeat(64) + 'f', contentBase64: '' }] })).body.reason, 'path-too-long');
+    assert.equal((await s.commit({ repo: 'notes', branch: 'main', expectedSha: tip, message: 'm', changes: [{ path: 'x'.repeat(4097), contentBase64: '' }] })).body.reason, 'path-too-long');
+    const many = Array.from({ length: 2001 }, (_, i) => ({ path: `f${i}`, contentBase64: '' }));
+    assert.equal((await s.commit({ repo: 'notes', branch: 'main', expectedSha: tip, message: 'm', changes: many })).body.reason, 'too-many-changes');
+    assert.ok(Date.now() - started < 5000, `the four refusals took ${Date.now() - started} ms`);
+    // The server is alive, and a path at the limits still commits.
+    const ok = await s.commit({ repo: 'notes', branch: 'main', expectedSha: tip, message: 'm', changes: [{ path: 'd/'.repeat(63) + 'f', contentBase64: b64('deep\n') }] });
+    assert.equal(ok.status, 200, ok.text);
+    assert.equal(git(bare, ['rev-parse', 'refs/heads/main']), ok.body.commitSha);
   } finally {
     await s.handle.close();
   }
@@ -547,8 +636,8 @@ test('G-GS-15: a body one byte over the limit is a 413; one at the limit is read
       return Buffer.from(padded + ' '.repeat(size - padded.length));
     };
     const over = await post(s.handle.port, '/commit', { headers: { Authorization: `Bearer ${TOKEN}` }, body: bodyOfSize(MAX_COMMIT_BODY_BYTES + 1) });
-    assert.ok(over.status === 413 || over.status === 0, `over the limit: ${over.status}`);
-    if (over.status === 413) assert.equal(over.body.reason, 'too-large');
+    assert.equal(over.status, 413, `over the limit: ${over.status} ${over.error ?? ''}`);
+    assert.equal(over.body.reason, 'too-large');
     assert.equal(git(bare, ['rev-parse', 'refs/heads/main']), tip, 'nothing landed');
     // Without a Content-Length (chunked), the count is made as the bytes arrive.
     const chunked = await new Promise((resolvePromise) => {
