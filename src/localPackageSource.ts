@@ -287,12 +287,12 @@ function walkFiles(dir: string, sub = ''): string[] {
  * left 1,803 of its files size-only — a blocking unpkg fetch each, at boot. They are seeded
  * now because `transpileToCjs` makes them safe to inline.
  */
-const SKIP_CONDITIONS = new Set(['types', 'typings', 'react-server']);
+export const SKIP_CONDITIONS = new Set(['types', 'typings', 'react-server']);
 
 /** The main-ish fields the resolver tries, IN ITS ORDER. All are seeded: which one the
  *  runtime picks depends on which files exist, and guessing wrong leaves an entry point
  *  size-only, which is the boot-time unpkg fetch this module exists to prevent. */
-const MAIN_FIELDS = ['module', 'browser', 'main', 'jsnext:main'];
+export const MAIN_FIELDS = ['module', 'browser', 'main', 'jsnext:main'];
 
 /**
  * Every entry point a consumer can reach, repo-relative: each `MAIN_FIELDS` value plus
