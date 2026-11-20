@@ -375,6 +375,12 @@ test('G-GS-3: a repository is a name — a path, a nested name, a symlink and a 
   mkdirSync(join(root, 'borrower.git', 'objects', 'info'), { recursive: true });
   writeFileSync(join(root, 'borrower.git', 'objects', 'info', 'alternates'), join(outside, 'secret.git', 'objects') + '\n');
   git(join(root, 'borrower.git'), ['update-ref', 'refs/heads/main', git(work, ['rev-parse', 'main'])]);
+  // Two more ways to borrow objects: a `commondir` pointer, and a symlinked
+  // fan-out directory under objects/.
+  runGitServeInit(root, 'common');
+  writeFileSync(join(root, 'common.git', 'commondir'), join(outside, 'secret.git') + '\n');
+  runGitServeInit(root, 'fanout');
+  symlinkSync(join(outside, 'secret.git', 'objects', 'pack'), join(root, 'fanout.git', 'objects', 'zz'));
   // Sanity: git itself would happily serve the borrower and the symlink.
   assert.equal(git(join(root, 'borrower.git'), ['cat-file', '-t', 'refs/heads/main']), 'commit');
   assert.equal(git(join(root, 'linked.git'), ['cat-file', '-t', 'refs/heads/main']), 'commit');
@@ -391,7 +397,7 @@ test('G-GS-3: a repository is a name — a path, a nested name, a symlink and a 
         assert.equal(calls.length, 0, `git must not run for ${path}`);
       }
     }
-    const refused = ['linked', 'borrower', 'absent', '-h', '--upload-pack'];
+    const refused = ['linked', 'borrower', 'common', 'fanout', 'absent', '-h', '--upload-pack'];
     const bodies = new Set();
     for (const repo of refused) {
       for (const path of [`/meta?repo=${repo}`, `/tree?repo=${repo}&ref=main`, `/blob?repo=${repo}&sha=${blob}`]) {
@@ -410,6 +416,8 @@ test('G-GS-3: a repository is a name — a path, a nested name, a symlink and a 
     await recording.close();
     rmSync(join(root, 'linked.git'));
     rmSync(join(root, 'borrower.git'), { recursive: true, force: true });
+    rmSync(join(root, 'common.git'), { recursive: true, force: true });
+    rmSync(join(root, 'fanout.git'), { recursive: true, force: true });
     rmSync(join(root, 'a'), { recursive: true, force: true });
   }
 });
@@ -498,6 +506,9 @@ test('§10.1: a path in no class is 404, a wrong method is 405, and nothing is w
   for (const path of ['/', '/watch', '/commit', '/pair', '/notes.git/info/refs', '/notes.git/HEAD', '/meta/', '/META']) {
     assert.equal((await authed(path)).status, 404, path);
   }
+  // A request target the URL parser refuses is a 400, and the server lives on.
+  assert.equal((await authed('//')).status, 400);
+  assert.equal((await authed('/meta')).status, 200);
   for (const method of ['POST', 'PUT', 'DELETE', 'HEAD']) {
     assert.equal((await authed('/meta', { method })).status, 405, method);
   }
