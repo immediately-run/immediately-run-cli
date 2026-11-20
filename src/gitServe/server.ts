@@ -187,7 +187,15 @@ export const startGitServe = (opts: GitServeOptions): Promise<GitServeHandle> =>
   };
 
   const serve = async (req: http.IncomingMessage, res: http.ServerResponse): Promise<void> => {
-    const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+    // A request target the URL parser refuses (`//`, for one) is a 400, never a throw.
+    let url: URL;
+    try {
+      url = new URL(req.url ?? '/', 'http://127.0.0.1');
+    } catch {
+      log(`git-serve: refused (malformed) request target from ${req.socket.remoteAddress ?? 'unknown'}`);
+      sendRefusal(res, 400, 'malformed', {});
+      return;
+    }
     const refuse = (status: number, reason: string, cors: Record<string, string>): void => {
       log(
         `git-serve: refused (${reason}) ${req.method ?? '?'} ${url.pathname} ` +
