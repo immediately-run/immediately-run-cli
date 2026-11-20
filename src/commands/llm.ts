@@ -21,6 +21,7 @@ import { resolve } from 'node:path';
 
 import { startDevServer, runUntilShutdown } from '../devServer.js';
 import { flagValue, type ParsedArgs } from '../args.js';
+import { buildLocatorLink } from '../deepLink.js';
 import { collectHeaderFlags, CONNECTION_ID_PLACEHOLDER } from '../llmProxy.js';
 import { DEFAULT_ORIGIN, DEFAULT_PORT, isRecognizedOrigin } from './dev.js';
 
@@ -72,9 +73,8 @@ export const buildLlmDeepLink = (
   token: string,
   model?: string,
 ): string =>
-  `${origin.replace(/\/+$/, '')}/agent` +
-  `#ir-endpoint=${encodeURIComponent(`http://127.0.0.1:${port}`)}` +
-  `&ir-token=${encodeURIComponent(token)}&ir-transport=llm` +
+  buildLocatorLink(origin, 'agent', `http://127.0.0.1:${port}`, token) +
+  '&ir-transport=llm' +
   (model ? `&ir-llm-model=${encodeURIComponent(model)}` : '');
 
 export const runLlm = async (args: ParsedArgs): Promise<number> => {

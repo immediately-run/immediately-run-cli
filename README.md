@@ -102,6 +102,56 @@ prints each `{capability, reason}` and **exits non-zero**, so a CI step fails on
 bad policy. Exit codes: `0` applied · `1` refused / mint failed · `2` usage/auth
 error · `3` rate-limited / server / network.
 
+## `git-serve`
+
+Serve a directory of **bare git repositories** on this machine to hosted
+immediately.run. The page mounts a repository read-only at a real commit, with
+no GitHub and no forge in between. Only committed objects are served; no
+working tree is read (that is `dev`'s job).
+
+```sh
+# Create a repository under a root directory, then push to it with plain git:
+npx @immediately-run/cli git-serve init ~/repos notes
+git -C ~/code/notes push ~/repos/notes.git main
+
+# Serve every repository under the root and print a link for each:
+npx @immediately-run/cli git-serve ~/repos
+```
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `<root>` | required | Directory holding the repositories, each `<root>/<name>.git` |
+| `--port` | `7701` | Port to listen on (differs from `dev`'s, so both can run) |
+| `--bind` | `localhost` | `tailscale` is not available yet |
+| `--origin` | `https://immediately.run` | Allowed browser origin and deep-link base; the site's local-development mediator origin is admitted with it |
+| `--origin-unsafe` | off | Allow an `--origin` outside the recognized set |
+| `--json` | off | One JSON line on stdout: `{ endpoint, namespace, port, protocol, allowPush, allowCommit, token, links: [{ repo, url }] }` |
+
+What it serves, to a request that carries the session token:
+
+```
+GET /meta                          the repositories under the root
+GET /meta?repo=<r>                 default branch, branches, tags
+GET /meta?repo=<r>&ref=<ref>       the commit and tree a ref names
+GET /tree?repo=<r>&ref=<ref>       that commit's whole tree: path, mode, blob SHA, size
+GET /blob?repo=<r>&sha=<blobSha>   one blob's bytes
+```
+
+- A **repository is a name**, never a path: letters, digits, `_` and `-`. A
+  symlinked repository, a nested one, and one that borrows objects through
+  `objects/info/alternates` are not served.
+- A **ref is a branch, a tag or a 40-hex commit**, looked up exactly. No
+  revision expression (`HEAD~1`, `a..b`, `x^{tree}`) is evaluated.
+- The **namespace** in the link (`localhost-<20 hex>`) is derived from an id
+  kept in `<root>/.git-serve/`. Deleting that directory gives the root's
+  repositories a new namespace on the host, with new grants and a fresh overlay.
+- Every request must come from the allowed origin (an `Origin` header is
+  required), name the server's own host and port, and carry the token in
+  `Authorization`. The token is minted per start and is not accepted in a URL.
+- A blob stays readable by its SHA for as long as git keeps the object, even
+  after the branch that held it moved on. A secret that was ever committed is
+  served to a token holder.
+
 ## Verify (the CI/deploy gate)
 
 `npm run verify` runs this repo's full CI gate in one command — `test` (build +

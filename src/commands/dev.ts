@@ -18,6 +18,7 @@ import { startDevServer, runUntilShutdown, DEFAULT_ORIGIN, type DevServerOptions
 import type { LlmUpstream } from '../llmProxy.js';
 import { flagValue, type ParsedArgs } from '../args.js';
 import { resolveTailscaleCert, tailscaleSelf } from '../tailscale.js';
+import { buildLocatorLink, buildProviderDeepLink } from '../deepLink.js';
 
 export const DEV_USAGE = `Usage: immediately.run dev [repo-path] [options]
 
@@ -218,8 +219,7 @@ export const buildDeepLink = (
   endpoint: string,
   token: string,
 ): string =>
-  `${origin.replace(/\/+$/, '')}/edit/local/${namespace}/${repository}/live` +
-  `#ir-endpoint=${encodeURIComponent(endpoint)}&ir-token=${encodeURIComponent(token)}`;
+  buildProviderDeepLink(origin, 'local', namespace, repository, 'live', endpoint, token);
 
 // The page/chrome taxonomy, ONE home (R6): a `page.*` region IS the page a
 // present route shows; `stage.*` is where a present route's previewed app
@@ -292,8 +292,7 @@ export const buildRegionDeepLink = (
   token: string,
   previewPath: string,
 ): string =>
-  `${origin.replace(/\/+$/, '')}/${previewPath}` +
-  `#ir-endpoint=${encodeURIComponent(endpoint)}&ir-token=${encodeURIComponent(token)}` +
+  buildLocatorLink(origin, previewPath, endpoint, token) +
   `&ir-dev-region=${encodeURIComponent(region)}&ir-dev-source=${encodeURIComponent(source)}`;
 
 const openInBrowser = (url: string): void => {
