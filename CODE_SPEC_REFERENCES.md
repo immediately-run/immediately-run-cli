@@ -50,3 +50,9 @@ core_concepts §9).
 - **`src/gitServe/pairing.ts` / `connections.ts`** — R-GS-24: a 40-bit one-time code that
   dies on success, on the fifth failure from any caller, or at ten minutes; 256-bit
   connection tokens stored hashed and revocable at the next request.
+- **`src/gitServe/smartHttp.ts`** — R-GS-14/15/17: git's HTTP protocol through
+  `git http-backend`, with the CLI deciding what is served. `matchGitRoute` admits four
+  shapes from the raw request line; the child's `PATH_INFO`/`QUERY_STRING` are rebuilt from
+  the parsed parts; push is the `--allow-push` flag's alone (`forcedConfig`, through
+  `GIT_CONFIG_COUNT`, which outranks the repository's config); browser headers are refused
+  before the peer gate.

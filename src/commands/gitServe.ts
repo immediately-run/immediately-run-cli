@@ -76,6 +76,11 @@ Options:
   --allow-login <login>     With --bind tailscale, also serve devices of this
                             tailnet user (repeatable). Required when this node
                             is itself tagged.
+  --allow-push              With --bind tailscale, let git clients push. A push
+                            must be a fast-forward and cannot delete a branch.
+                            Without the flag every push is refused, whatever a
+                            repository's own config says. \`git clone\` and
+                            \`git fetch\` need no flag.
   --origin <url>            Allowed browser origin and deep-link base
                             (default: https://immediately.run; use
                             https://local.immediately.run against the local
@@ -221,6 +226,7 @@ const serveTailnet = async (
   origin: string,
   port: number,
   allowLogins: readonly string[],
+  allowPush: boolean,
 ): Promise<number> => {
   const bin = resolveTailscaleBin();
   const identity = await readTailnetIdentity(bin);
@@ -244,7 +250,7 @@ const serveTailnet = async (
     key,
     peerGate: { self: identity.self, allowUserIds, whois: tailscaleWhois(bin) },
   };
-  const handle = await startGitServe({ root, origin, port, tailnet });
+  const handle = await startGitServe({ root, origin, port, tailnet, allowPush });
   const repos = await describeRepos(handle.root);
   // A tailnet link carries no endpoint and no credential: the host finds both
   // in the connection the user made (R-GS-9).
@@ -261,7 +267,7 @@ const serveTailnet = async (
         namespace: handle.namespace,
         port: handle.port,
         protocol: GIT_SERVE_PROTOCOL,
-        allowPush: false,
+        allowPush,
         allowCommit: false,
         links,
       }) + '\n',
@@ -274,6 +280,14 @@ const serveTailnet = async (
     console.log(`Allowed origin: ${origin}`);
     console.log(`Namespace: ${handle.namespace}`);
     console.log(`To connect a browser: immediately.run git-serve pair ${root}`);
+    console.log(
+      allowPush
+        ? 'git clients may clone and push (fast-forward only, no branch deletes).'
+        : 'git clients may clone and fetch. Push is off (start with --allow-push to allow it).',
+    );
+    for (const repo of listRepos(handle.root)) {
+      console.log(`git clone ${handle.endpoint}/${repo.name}${REPO_DIR_SUFFIX}`);
+    }
     printRepoLines(root, links, repos.unlinked);
     console.log('Press Ctrl-C to stop.');
   }
@@ -310,6 +324,15 @@ export const runGitServe = async (args: ParsedArgs): Promise<number> => {
   if (bindMode === 'localhost' && allowLogins.length > 0) {
     throw new Error('--allow-login applies to --bind tailscale only.');
   }
+  // R-GS-17: git clients are served on a tailnet only. On localhost the
+  // repository is on the same disk; push to its path.
+  const allowPush = args.flags['allow-push'] === true;
+  if (bindMode === 'localhost' && allowPush) {
+    throw new Error(
+      '--allow-push applies to --bind tailscale only: on localhost, push to the ' +
+        "repository's path on disk (git push <root>/<name>.git <branch>).",
+    );
+  }
 
   const portFlag = flagValue(args.flags, 'port');
   const port = portFlag === undefined ? DEFAULT_GIT_SERVE_PORT : Number(portFlag);
@@ -326,7 +349,7 @@ export const runGitServe = async (args: ParsedArgs): Promise<number> => {
   }
 
   if (bindMode === 'tailscale') {
-    return await serveTailnet(args, root, origin, port, allowLogins);
+    return await serveTailnet(args, root, origin, port, allowLogins, allowPush);
   }
 
   // 256 random bits, minted per start, compared in constant time (guards.ts).

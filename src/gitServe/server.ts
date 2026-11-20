@@ -11,6 +11,8 @@
  *             No peer gate (there is no tailnet), no `/pair`, no git routes.
  *   tailnet   the node's tailnet address, HTTPS. Every request passes the peer
  *             gate. Credentials are per-browser connections minted by `/pair`.
+ *             Stock git clients clone (and, with `allowPush`, push) through the
+ *             smart-HTTP routes (`smartHttp.ts`).
  *
  * It reads committed objects only; there is no working tree and no stream route.
  */
@@ -29,6 +31,7 @@ import { checkPeer, type PeerGateConfig } from './peerGate.js';
 import { GIT_SERVE_PROTOCOL, GIT_SERVE_SERVER, type RunGit } from './protocol.js';
 import { answerRead, type ReadAnswer } from './readRoutes.js';
 import { runGit as realRunGit, spawnGit } from './runGit.js';
+import { hasBrowserHeaders, planGitRequest, runBackend } from './smartHttp.js';
 import { loadInstanceId } from './state.js';
 
 export interface TailnetBinding {
@@ -55,6 +58,9 @@ export interface GitServeOptions {
   token?: string;
   /** Tailnet bind. Exactly one of `token` and `tailnet` is given. */
   tailnet?: TailnetBinding;
+  /** `--allow-push`: git clients may push (fast-forward only, no deletes). It is
+   *  the only thing that turns push on; a repository's own config cannot. */
+  allowPush?: boolean;
   /** Tests inject a `runGit` to move a ref between two of the server's own git calls. */
   runGit?: RunGit;
   /** Where refusals are logged (default: stderr). Never receives a credential. */
@@ -211,19 +217,49 @@ export const startGitServe = (opts: GitServeOptions): Promise<GitServeHandle> =>
       return;
     }
 
+    // A browser cannot use the git-client routes (R-GS-15): a request there
+    // that carries `Origin` or any `Sec-Fetch-*` header is refused before
+    // anything else, the peer gate included.
+    if (admission.kind === 'git' && hasBrowserHeaders(req.headers)) {
+      refuse(403, 'browser', {});
+      return;
+    }
+
     // 2. On a tailnet, the peer gate: every request of both classes, before any
     //    credential is looked at. A valid credential never stands in for it.
+    let peerLogin = '';
     if (tailnet !== undefined) {
       const peer = await checkPeer(req.socket.remoteAddress, tailnet.peerGate);
       if (!peer.ok) {
         refuse(403, peer.reason, admission.kind === 'browser' ? admission.cors : {});
         return;
       }
+      peerLogin = peer.login;
     }
 
-    // The git-client class is routed here and answered by the smart-HTTP item.
+    // The git-client class: no token, no CORS, no OPTIONS. The peer gate above
+    // is its whole gate; what is served is decided by `planGitRequest`.
     if (admission.kind === 'git') {
-      refuse(404, 'not-found', {});
+      // The request line as sent: the route match reads it undecoded.
+      const target = req.url ?? '/';
+      const mark = target.indexOf('?');
+      const planned = planGitRequest(
+        mark === -1 ? target : target.slice(0, mark),
+        mark === -1 ? '' : target.slice(mark),
+        req.method,
+        req.headers,
+        {
+          root,
+          allowPush: opts.allowPush === true,
+          remoteAddress: req.socket.remoteAddress ?? '',
+          remoteUser: peerLogin,
+        },
+      );
+      if (!planned.ok) {
+        refuse(planned.status, planned.reason, {});
+        return;
+      }
+      runBackend(planned.request, req, res, (status, reason) => refuse(status, reason, {}));
       return;
     }
 

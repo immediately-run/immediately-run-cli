@@ -305,7 +305,9 @@ test('G-GS-7 in the server: a valid token does not stand in for the peer check, 
     for (const [reason, whoisAnswer] of refusals) {
       answer = whoisAnswer;
       for (const [path, method] of [['/meta', 'GET'], ['/tree?repo=notes&ref=main', 'GET'], ['/blob?repo=notes&sha=' + '0'.repeat(40), 'GET'], ['/pair', 'POST'], ['/meta', 'OPTIONS'], ['/notes.git/info/refs?service=git-upload-pack', 'GET']]) {
-        const res = await request(handle.port, path, { method, headers });
+        // A git client sends no Origin; with one, the git routes answer `browser` first.
+        const sent = path.includes('.git/') ? { Host: headers.Host } : headers;
+        const res = await request(handle.port, path, { method, headers: sent });
         assert.equal(res.status, 403, `${reason} ${method} ${path}`);
         assert.equal(JSON.parse(res.body).reason, reason, `${method} ${path}`);
       }
