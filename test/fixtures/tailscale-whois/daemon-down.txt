@@ -1,0 +1,2 @@
+exit code: 1
+stderr: Failed to connect to local Tailscale daemon for /localapi/v0/whois; not running? Error: dial unix <socket path with no daemon>: connect: no such file or directory
