@@ -168,7 +168,9 @@ const resolveCommit = async (
     return {
       ok: false,
       answer:
-        resolved.reason === 'malformed' ? refusal(400, 'malformed') : refusal(404, 'not-found'),
+        resolved.reason === 'unknown'
+          ? refusal(404, 'not-found')
+          : refusal(400, resolved.reason), // `malformed`, `ambiguous`
     };
   }
   const tree = await ctx.runGit(dir, [
@@ -185,8 +187,18 @@ const resolveCommit = async (
   return { ok: true, refKind: resolved.refKind, commitSha: resolved.commitSha, treeSha };
 };
 
+/** True when a tree path has a segment no checkout could hold: an empty one,
+ *  `.`, `..`, or `.git` in any case. git never writes such a tree, but
+ *  `git mktree` does, and the host would mount the path as a file name. */
+const isUnsafeTreePath = (path: string): boolean =>
+  path
+    .split('/')
+    .some((part) => part === '' || part === '.' || part === '..' || part.toLowerCase() === '.git');
+
 /** Every blob entry of the commit's tree, or null when the listing is not whole
- *  (R-GS-4: the tree is complete or the request fails). */
+ *  (R-GS-4: the tree is complete or the request fails). A tree with an unsafe
+ *  path is not listed at all: leaving the entry out would show a tree that is
+ *  not the commit's. */
 const listTree = async (
   ctx: ReadContext,
   dir: string,
@@ -216,6 +228,7 @@ const listTree = async (
     return null;
   }
   for (const entry of entries) {
+    if (isUnsafeTreePath(entry.path)) return null;
     if (entry.mode === SUBMODULE_MODE) continue; // left out (R-GS-4)
     if (entry.type !== 'blob' || !FILE_MODES.has(entry.mode) || entry.size === undefined) {
       return null;

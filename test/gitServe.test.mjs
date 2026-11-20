@@ -24,7 +24,7 @@ import http from 'node:http';
 import { createHash } from 'node:crypto';
 
 import { startGitServe } from '../dist/gitServe/server.js';
-import { runGit } from '../dist/gitServe/runGit.js';
+import { GIT_TIMEOUT_MS, runGit } from '../dist/gitServe/runGit.js';
 import { gitServeNamespace, canonicalTailnetOrigin } from '../dist/gitServe/namespace.js';
 import { resolveRef } from '../dist/gitServe/refs.js';
 import { resolveRepo, listRepos } from '../dist/gitServe/repoName.js';
@@ -218,6 +218,88 @@ test('R-GS-4: a submodule entry is left out of the tree', async () => {
   assert.equal(status, 200);
   assert.ok(!body.files.some((f) => f.path.startsWith('vendor/')), 'the gitlink must be omitted');
   assert.ok(body.files.some((f) => f.path === 'a.txt'));
+});
+
+test('R-GS-4: a tree with a `.`, `..` or `.git` path segment is not listed — /tree answers 500', async () => {
+  const bare = join(root, 'notes.git');
+  // Planted on the server's disk with `git mktree`, which checks no entry name.
+  // No checkout and no `git add` could make these trees.
+  const who = { GIT_AUTHOR_NAME: 'T', GIT_AUTHOR_EMAIL: 't@example.com', GIT_COMMITTER_NAME: 'T', GIT_COMMITTER_EMAIL: 't@example.com' };
+  const blob = git(bare, ['rev-parse', 'refs/heads/main:a.txt']);
+  const mktree = (entries) => git(bare, ['mktree'], { input: entries });
+  const inner = mktree(`100644 blob ${blob}\tx\n`);
+  const planted = {
+    'planted-dotdot-file': `100644 blob ${blob}\t..\n`,
+    'planted-dotdot-dir': `040000 tree ${inner}\t..\n`,
+    'planted-dot-dir': `040000 tree ${inner}\t.\n`,
+    'planted-dotgit': `040000 tree ${inner}\t.git\n`,
+    'planted-dotgit-case': `040000 tree ${inner}\t.GiT\n`,
+    'planted-nested': `040000 tree ${mktree(`040000 tree ${inner}\t.git\n`)}\tdir\n`,
+    // Beside an ordinary file: the whole tree is refused, not the one entry.
+    'planted-mixed': `100644 blob ${blob}\t..\n100644 blob ${blob}\tok.txt\n`,
+  };
+  // Names that only look alike are ordinary files.
+  const harmless = mktree(`100644 blob ${blob}\t...\n100644 blob ${blob}\t.gitignore\n100644 blob ${blob}\ta..b\n040000 tree ${inner}\t.github\n`);
+  const branches = [...Object.keys(planted), 'planted-harmless'];
+  try {
+    for (const [name, entries] of Object.entries(planted)) {
+      const commit = git(bare, ['commit-tree', mktree(entries), '-m', name], { env: { ...process.env, ...who } });
+      git(bare, ['update-ref', `refs/heads/${name}`, commit]);
+      const res = await json(`/tree?repo=notes&ref=${name}`);
+      assert.equal(res.status, 500, `${name}: ${res.raw}`);
+      assert.equal(res.body.reason, 'tree-incomplete', name);
+      assert.equal(res.body.files, undefined, name);
+      // The ref itself resolves; it is the listing that is refused.
+      assert.equal((await json(`/meta?repo=notes&ref=${name}`)).body.commitSha, commit);
+    }
+    const commit = git(bare, ['commit-tree', harmless, '-m', 'harmless'], { env: { ...process.env, ...who } });
+    git(bare, ['update-ref', 'refs/heads/planted-harmless', commit]);
+    const fine = await json('/tree?repo=notes&ref=planted-harmless');
+    assert.equal(fine.status, 200);
+    assert.deepEqual(fine.body.files.map((f) => f.path), ['...', '.github/x', '.gitignore', 'a..b']);
+  } finally {
+    for (const name of branches) {
+      try {
+        git(bare, ['update-ref', '-d', `refs/heads/${name}`]);
+      } catch {
+        /* never created */
+      }
+    }
+  }
+});
+
+test('R-GS-3 (amended): a name that is both a branch and a tag is refused as ambiguous; /meta?repo= lists both', async () => {
+  const bare = join(root, 'notes.git');
+  const tagged = git(bare, ['rev-parse', 'refs/tags/v1^{commit}']);
+  const other = git(bare, ['rev-parse', 'refs/heads/feature-x']);
+  assert.notEqual(tagged, other);
+  assert.equal((await json('/meta?repo=notes&ref=v1')).body.commitSha, tagged);
+  // What a push can do: a branch under the tag's name, at another commit.
+  git(bare, ['update-ref', 'refs/heads/v1', other]);
+  try {
+    for (const route of ['/meta', '/tree']) {
+      const res = await json(`${route}?repo=notes&ref=v1`);
+      assert.equal(res.status, 400, route);
+      assert.equal(res.body.reason, 'ambiguous', route);
+      assert.equal(res.body.commitSha, undefined, route);
+    }
+    assert.deepEqual(await resolveRef(bare, 'v1', runGit), { ok: false, reason: 'ambiguous' });
+    // The listing still shows both, each with its own commit, and each commit
+    // is reachable by its SHA.
+    const listed = (await json('/meta?repo=notes')).body;
+    assert.deepEqual(listed.branches.filter((b) => b.name === 'v1'), [{ name: 'v1', sha: other }]);
+    assert.deepEqual(listed.tags.filter((t) => t.name === 'v1'), [{ name: 'v1', sha: tagged }]);
+    assert.equal((await json(`/meta?repo=notes&ref=${other}`)).body.refKind, 'commit');
+    assert.equal((await json(`/meta?repo=notes&ref=${tagged}`)).body.refKind, 'commit');
+    // Names that are one or the other resolve as before.
+    assert.equal((await json('/meta?repo=notes&ref=main')).body.refKind, 'branch');
+    assert.equal((await json('/meta?repo=notes&ref=v1-annotated')).body.refKind, 'tag');
+  } finally {
+    git(bare, ['update-ref', '-d', 'refs/heads/v1']);
+  }
+  const again = (await json('/meta?repo=notes&ref=v1')).body;
+  assert.equal(again.refKind, 'tag');
+  assert.equal(again.commitSha, tagged);
 });
 
 // --- G-GS-1 -----------------------------------------------------------------
@@ -503,7 +585,7 @@ test('§10.1: the Host header is pinned, with its port required', async () => {
 });
 
 test('§10.1: a path in no class is 404, a wrong method is 405, and nothing is writable', async () => {
-  for (const path of ['/', '/watch', '/commit', '/pair', '/notes.git/info/refs', '/notes.git/HEAD', '/meta/', '/META']) {
+  for (const path of ['/', '/watch', '/pair', '/notes.git/info/refs', '/notes.git/HEAD', '/meta/', '/META']) {
     assert.equal((await authed(path)).status, 404, path);
   }
   // A request target the URL parser refuses is a 400, and the server lives on.
@@ -662,6 +744,38 @@ test('resolveRef unit: the reasons', async () => {
   assert.deepEqual(await resolveRef(bare, undefined, runGit), { ok: false, reason: 'malformed' });
   assert.deepEqual(await resolveRef(bare, 'x'.repeat(300), runGit), { ok: false, reason: 'malformed' });
   assert.deepEqual(await resolveRef(bare, 'a\0b', runGit), { ok: false, reason: 'malformed' });
+});
+
+test('runGit: a git that does not finish is killed and reported as a failure', async () => {
+  const bare = join(root, 'notes.git');
+  const started = Date.now();
+  // An alias that runs a shell command stands in for a git that hangs.
+  const hung = await runGit(bare, ['-c', 'alias.hang=!exec sleep 30', 'hang'], { timeoutMs: 300 });
+  assert.equal(hung.code, -1, 'a killed git is the same -1 as a git that could not start');
+  assert.ok(Date.now() - started < 10_000, `returned after ${Date.now() - started} ms`);
+  // Sixty seconds when the caller names no time.
+  assert.equal(GIT_TIMEOUT_MS, 60_000);
+  // A route answers it as it answers any git failure.
+  const slowRoot = join(tmp, 'slow-root');
+  runGitServeInit(slowRoot, 'slow');
+  git(work, ['push', '-q', join(slowRoot, 'slow.git'), 'main:main']);
+  const slow = await startGitServe({
+    root: slowRoot,
+    origin: ORIGIN,
+    token: TOKEN,
+    port: 0,
+    runGit: (repoDir, args, options) =>
+      args[0] === 'ls-tree'
+        ? runGit(repoDir, ['-c', 'alias.hang=!exec sleep 30', 'hang'], { ...options, timeoutMs: 300 })
+        : runGit(repoDir, args, options),
+  });
+  try {
+    const res = await authed('/tree?repo=slow&ref=main', { port: slow.port });
+    assert.equal(res.status, 500);
+    assert.equal(JSON.parse(res.body.toString('utf8')).reason, 'tree-incomplete');
+  } finally {
+    await slow.close();
+  }
 });
 
 // --- the command ------------------------------------------------------------

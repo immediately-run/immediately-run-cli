@@ -10,7 +10,7 @@
 // what the gate does with such an answer, not that the daemon gives it.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -21,6 +21,7 @@ import {
   parseTailnetIdentity,
   parseWhois,
   resolveAllowLogins,
+  tailscaleWhois,
 } from '../dist/gitServe/tailscaleWhois.js';
 import { startGitServe } from '../dist/gitServe/server.js';
 import { addConnection } from '../dist/gitServe/connections.js';
@@ -250,6 +251,30 @@ test('--allow-login resolves to stable ids once; a login that names nobody is a 
 test('parseTailnetIdentity refuses a status it cannot use', () => {
   for (const bad of ['', 'x', '{}', '{"Self":{}}', '{"Self":{"ID":"n"}}', '{"Self":{"ID":"n","TailscaleIPs":["100.64.0.1"]}}']) {
     assert.throws(() => parseTailnetIdentity(bad), JSON.stringify(bad));
+  }
+});
+
+test('at most eight `tailscale whois` processes run at once; the rest wait and are all answered', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ir-git-serve-whois-'));
+  try {
+    // A stand-in for the tailscale binary. Each run leaves a file while it is
+    // alive, and records how many such files it saw when it started.
+    const bin = join(dir, 'tailscale');
+    writeFileSync(
+      bin,
+      '#!/bin/sh\nd="$(dirname "$0")"\nmkdir -p "$d/live"\n: > "$d/live/$$"\nsleep 0.3\n' +
+        'ls "$d/live" | wc -l >> "$d/seen"\nrm "$d/live/$$"\necho "peer not found" >&2\nexit 1\n',
+    );
+    chmodSync(bin, 0o755);
+    const whois = tailscaleWhois(bin);
+    const answers = await Promise.all(Array.from({ length: 20 }, (_, i) => whois(`100.64.0.${i + 1}`)));
+    assert.equal(answers.length, 20);
+    for (const answer of answers) assert.deepEqual(answer, { kind: 'unknown' });
+    const seen = readFileSync(join(dir, 'seen'), 'utf8').trim().split('\n').map(Number);
+    assert.equal(seen.length, 20, 'every lookup ran');
+    assert.equal(Math.max(...seen), 8, `the most alive together: ${seen.join(' ')}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 

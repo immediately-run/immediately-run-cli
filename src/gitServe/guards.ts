@@ -4,7 +4,7 @@
  * Every request passes Host pinning first, with the port required. Then the
  * PATH decides the class, and each class has one gate:
  *
- *   browser   /meta /tree /blob (and /pair on a tailnet)
+ *   browser   /meta /tree /blob /commit (and /pair on a tailnet)
  *             Origin allowlist; on a tailnet, peer identity; then the token,
  *             or for /pair the pairing code.
  *   git       /<repo>.git/…      (tailnet only; filled in by the smart-HTTP item)
@@ -48,10 +48,17 @@ export const READ_ROUTES: RouteTable = Object.freeze({
   '/blob': 'GET',
 });
 
+/** What a loopback server serves: the reads, and the commit route (which is
+ *  refused unless the server was started with `--allow-commit`). */
+export const LOOPBACK_ROUTES: RouteTable = Object.freeze({
+  ...READ_ROUTES,
+  '/commit': 'POST',
+});
+
 /** A tailnet server also exchanges pairing codes. Loopback has no connections,
  *  so `/pair` does not exist there. */
 export const TAILNET_ROUTES: RouteTable = Object.freeze({
-  ...READ_ROUTES,
+  ...LOOPBACK_ROUTES,
   '/pair': 'POST',
 });
 
