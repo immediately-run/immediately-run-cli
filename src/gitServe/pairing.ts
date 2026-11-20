@@ -27,6 +27,7 @@ import {
   addConnectionLocked,
   hashSecret,
   isScope,
+  tryWithStateLock,
   withStateLock,
   writeStateFile,
   type ConnectionRecord,
@@ -131,6 +132,21 @@ export const exchangePairingCode = (
   presented: string,
   now: number = Date.now(),
 ): PairingResult => withStateLock(root, () => exchangeLocked(root, presented, now));
+
+/**
+ * The exchange as the server makes it. The server must not wait for the lock
+ * (the wait is a synchronous sleep), so when another process holds it the
+ * answer is `busy`: nothing was read, no failure was counted, the code is
+ * untouched, and the caller may simply ask again.
+ */
+export const tryExchangePairingCode = (
+  root: string,
+  presented: string,
+  now: number = Date.now(),
+): PairingResult | 'busy' => {
+  const tried = tryWithStateLock(root, () => exchangeLocked(root, presented, now));
+  return tried.ran ? tried.value : 'busy';
+};
 
 const exchangeLocked = (root: string, presented: string, now: number): PairingResult => {
   const record = readPairing(root);

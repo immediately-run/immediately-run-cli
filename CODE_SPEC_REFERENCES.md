@@ -35,8 +35,10 @@ core_concepts §9).
   around the SDK catalog.
 - **`src/gitServe/`** — `immediately-run git-serve` (GIT_SERVE_SPEC §4, §5.1, §9, §10.1).
   `repoName.ts` is R-GS-6 (a repository is a name), `refs.ts` R-GS-3 (exact ref lookup,
-  no revision expression), `readRoutes.ts` the five read answers with R-GS-2's one
-  resolution, `namespace.ts` R-GS-8 (held equal to site-main by
+  no revision expression; a name that is both a branch and a tag is refused 400
+  `ambiguous` rather than read as the branch, a deviation from R-GS-3's stated order that
+  awaits a spec amendment), `readRoutes.ts` the five read answers with R-GS-2's one
+  resolution (`/tree` answers 500 for a tree with a `.`, `..` or `.git` path segment), `namespace.ts` R-GS-8 (held equal to site-main by
   `test/fixtures/git-serve-namespace-vectors.json`), `guards.ts` the browser-class guards
   of §10.1. The guards are deliberately not `devServer.ts`'s: `Origin` is required, the
   token rides in `Authorization` only, and the Host header must carry the port.
@@ -49,17 +51,25 @@ core_concepts §9).
   `test/fixtures/tailscale-whois/`).
 - **`src/gitServe/pairing.ts` / `connections.ts`** — R-GS-24: a 40-bit one-time code that
   dies on success, on the fifth failure from any caller, or at ten minutes; 256-bit
-  connection tokens stored hashed and revocable at the next request.
+  connection tokens stored hashed and revocable at the next request. One lock file guards
+  every read-modify-write of the state files across processes. The commands wait for it
+  (`withStateLock`); the server never does (`tryWithStateLock`) and answers `/pair` with
+  503 `busy`. A dead holder's lock is taken over through a hard link (`takeOverDeadLock`),
+  so two waiters cannot both remove it.
 - **`src/gitServe/smartHttp.ts`** — R-GS-14/15/17: git's HTTP protocol through
   `git http-backend`, with the CLI deciding what is served. `matchGitRoute` admits four
   shapes from the raw request line; the child's `PATH_INFO`/`QUERY_STRING` are rebuilt from
   the parsed parts; push is the `--allow-push` flag's alone (`forcedConfig`, through
-  `GIT_CONFIG_COUNT`, which outranks the repository's config); browser headers are refused
-  before the peer gate.
+  `GIT_CONFIG_COUNT`, which outranks the repository's config), and it forces
+  `receive.fsckObjects` so a pushed tree cannot hold `..` or `.git`; browser headers are
+  refused before the peer gate. `server.ts` sets `requestTimeout = 0` on the tailnet
+  server so a long pack upload is not cut.
 - **`src/gitServe/commit.ts`** — `POST /commit`, R-GS-18 to R-GS-22. `planCommit` is the
   pure check against the parent tree; `applyCommit` builds the tree in a private index
   (`update-index --index-info`, `core.protectHFS`/`core.protectNTFS` forced on, never
   `mktree`) and moves the branch with `update-ref <ref> <new> <old>`. git keeps a refused
   path out of the index by SKIPPING it with exit 0, so `applyCommit` reads the index back
-  and refuses the request unless every planned path is there as planned. The two gates of
+  and refuses the request unless every planned path is there as planned. A new branch
+  under an existing tag's name is refused; `withConnectionTrailer` adds the connection
+  trailer to the message's own trailer block when it ends in one. The two gates of
   R-GS-23 (`--allow-commit`, the `write` scope) are checked in `server.ts` on every request.

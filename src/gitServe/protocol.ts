@@ -18,6 +18,8 @@ export const DEFAULT_GIT_SERVE_PORT = 7701;
 export interface RunGitOptions {
   input?: Buffer;
   env?: Readonly<Record<string, string>>;
+  /** How long the call may take before git is killed (tests shorten it). */
+  timeoutMs?: number;
 }
 
 /** Runs git against one repository: `git --git-dir <repoDir> <args…>`. */

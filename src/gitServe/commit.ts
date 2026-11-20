@@ -243,6 +243,28 @@ export const parseAuthor = (value: string): CommitIdentity | null => {
   return m ? { name: m[1]!, email: m[2]! } : null;
 };
 
+/** One line of a trailer block as git reads it: `Token: value`, or the folded
+ *  continuation of the line above. */
+const TRAILER_LINE_RE = /^(?:[A-Za-z0-9-]+[ \t]*:|[ \t]+\S)/;
+
+/**
+ * The message with the connection trailer added.
+ *
+ * git reads trailers from the LAST paragraph only. When the message already
+ * ends in a trailer block (`Signed-off-by:`, `Co-authored-by:`), the line joins
+ * that block; a paragraph of its own would leave the user's lines as body text.
+ * The first paragraph is the subject and never a trailer block, whatever it
+ * looks like.
+ */
+export const withConnectionTrailer = (message: string, connectionId: string): string => {
+  const body = message.trimEnd();
+  const paragraphs = body.split(/\n[ \t]*\n/);
+  const last = paragraphs[paragraphs.length - 1]!.split('\n');
+  const endsInTrailers =
+    paragraphs.length > 1 && !/^[ \t]/.test(last[0]!) && last.every((line) => TRAILER_LINE_RE.test(line));
+  return `${body}${endsInTrailers ? '\n' : '\n\n'}${CONNECTION_TRAILER}: ${connectionId}\n`;
+};
+
 export interface ApplyContext {
   runGit: RunGit;
   identity: CommitIdentity;
@@ -289,6 +311,13 @@ export const applyCommit = async (
   const tip = await branchTip(repoDir, request.branch, runGit);
   if (request.expectedSha !== tip) {
     return { ok: false, refusal: { status: 409, reason: 'conflict', currentSha: tip } };
+  }
+  // A new branch under an existing tag's name would make the name mean two
+  // things, and every read of it would then be refused as ambiguous
+  // (`resolveRef`). The name is refused as any other unusable branch name is.
+  if (request.expectedSha === null) {
+    const tag = await runGit(repoDir, ['show-ref', '--verify', '-q', '--', `refs/tags/${request.branch}`]);
+    if (tag.code === 0) return bad('branch');
   }
   const parent = request.expectedSha ?? request.baseSha!;
   if (!(await isCommit(repoDir, parent, runGit))) return bad('unknown-base');
@@ -370,7 +399,7 @@ export const applyCommit = async (
     if (text(parentTreeSha.stdout) === treeSha) return bad('no-change');
 
     // Authorship is the server's; the connection is recorded as a trailer.
-    const message = `${request.message.trimEnd()}\n\n${CONNECTION_TRAILER}: ${ctx.connectionId}\n`;
+    const message = withConnectionTrailer(request.message, ctx.connectionId);
     const committed = await runGit(
       repoDir,
       ['commit-tree', treeSha, '-p', parent, '-F', '-'],

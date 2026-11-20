@@ -164,14 +164,38 @@ const run = (
     });
   });
 
-/** The production `whois`: one `tailscale whois --json` per call, never cached,
- *  so a device removed from the tailnet stops being served at its next request. */
-export const tailscaleWhois =
-  (bin: string): Whois =>
-  async (address) => {
-    const result = await run(bin, ['whois', '--json', address]);
-    return parseWhois(result.code, result.stdout, result.stderr);
+/** Runs at most `max` tasks at once; the rest wait their turn, in order. */
+export const limitConcurrency = (max: number) => {
+  let running = 0;
+  const waiting: Array<() => void> = [];
+  return async <T>(task: () => Promise<T>): Promise<T> => {
+    if (running < max) running++;
+    else await new Promise<void>((turn) => waiting.push(turn)); // handed a running slot
+    try {
+      return await task();
+    } finally {
+      const next = waiting.shift();
+      if (next) next();
+      else running--;
+    }
   };
+};
+
+/** Every request starts one `tailscale whois`, so a burst of connections would
+ *  otherwise start a process each, all at once. */
+const MAX_WHOIS_PROCESSES = 8;
+
+/** The production `whois`: one `tailscale whois --json` per call, never cached,
+ *  so a device removed from the tailnet stops being served at its next request.
+ *  At most eight run at a time; further lookups wait. */
+export const tailscaleWhois = (bin: string): Whois => {
+  const limited = limitConcurrency(MAX_WHOIS_PROCESSES);
+  return (address) =>
+    limited(async () => {
+      const result = await run(bin, ['whois', '--json', address]);
+      return parseWhois(result.code, result.stdout, result.stderr);
+    });
+};
 
 export const readTailnetIdentity = async (bin: string): Promise<TailnetIdentity> => {
   const result = await run(bin, ['status', '--json']);

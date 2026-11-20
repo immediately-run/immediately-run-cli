@@ -38,6 +38,15 @@ let seq = 0;
 const git = (cwd, args) =>
   execFileSync('git', ['-C', cwd, ...args], { stdio: 'pipe', encoding: 'utf8' }).trim();
 
+/** The SHA a fully-qualified ref names, or null when there is no such ref. */
+const tryRev = async (cwd, ref) => {
+  try {
+    return git(cwd, ['rev-parse', '--verify', '-q', ref]);
+  } catch {
+    return null;
+  }
+};
+
 /** A served root whose `notes` repository has, on `main`: a.txt, dir/run.sh
  *  (executable), a symlink `link`, a submodule entry `vendor/sub`, and a tag v1. */
 const makeRoot = () => {
@@ -446,15 +455,94 @@ test('G-GS-14: the hostile-path table — each is a 400 naming the path, and the
 });
 
 test('the temp index is removed after a success and after a refusal', async () => {
-  const { root, tip } = makeRoot();
+  const { root, bare, tip } = makeRoot();
   const s = await loopback(root);
   const scratchDirs = () => readdirSync(tmpdir()).filter((n) => n.startsWith('git-serve-commit-'));
   try {
     const before = scratchDirs().length;
-    await s.commit({ repo: 'notes', branch: 'main', expectedSha: tip, message: 'ok', changes: [{ path: 'a.txt', contentBase64: b64('1') }] });
-    await s.commit({ repo: 'notes', branch: 'main', expectedSha: tip, message: 'stale', changes: [{ path: 'a.txt', contentBase64: b64('2') }] });
-    await s.commit({ repo: 'notes', branch: 'main', expectedSha: tip, message: 'bad', changes: [{ path: '.git/x', contentBase64: b64('3') }] });
+    const landed = await s.commit({ repo: 'notes', branch: 'main', expectedSha: tip, message: 'ok', changes: [{ path: 'a.txt', contentBase64: b64('1') }] });
+    assert.equal(landed.status, 200, landed.text);
+    const now = git(bare, ['rev-parse', 'refs/heads/main']);
+    assert.notEqual(now, tip);
+    // Two refusals that are made with the scratch index already on disk. Both
+    // name the CURRENT tip, so neither is turned away earlier as a conflict.
+    // A path only git's own check refuses, found when the index is read back:
+    const hostile = await s.commit({ repo: 'notes', branch: 'main', expectedSha: now, message: 'bad', changes: [{ path: '.git/x', contentBase64: b64('3') }] });
+    assert.equal(hostile.status, 400, hostile.text);
+    assert.equal(hostile.body.reason, 'path-refused');
+    // A change that changes nothing, found after the tree is written:
+    const same = await s.commit({ repo: 'notes', branch: 'main', expectedSha: now, message: 'same', changes: [{ path: 'a.txt', contentBase64: b64('1') }] });
+    assert.equal(same.status, 400, same.text);
+    assert.equal(same.body.reason, 'no-change');
+    // And one refused before any scratch directory is made.
+    const stale = await s.commit({ repo: 'notes', branch: 'main', expectedSha: tip, message: 'stale', changes: [{ path: 'a.txt', contentBase64: b64('2') }] });
+    assert.equal(stale.status, 409, stale.text);
+    assert.equal(git(bare, ['rev-parse', 'refs/heads/main']), now);
     assert.equal(scratchDirs().length, before);
+  } finally {
+    await s.handle.close();
+  }
+});
+
+test('a new branch cannot take the name of an existing tag', async () => {
+  const { root, bare, tip } = makeRoot(); // holds the tag v1
+  const s = await loopback(root);
+  const change = [{ path: 'a.txt', contentBase64: b64('under a tag name\n') }];
+  const refs = () => git(bare, ['for-each-ref', '--format=%(refname) %(objectname)']);
+  try {
+    const before = refs();
+    const res = await s.commit({ repo: 'notes', branch: 'v1', expectedSha: null, baseSha: tip, message: 'm', changes: change });
+    assert.equal(res.status, 400, res.text);
+    assert.equal(res.body.reason, 'branch', 'the reason an unusable branch name gets');
+    assert.equal(refs(), before, 'no ref was created or moved');
+    // A nested tag name is refused the same way; a name no tag has lands.
+    git(bare, ['tag', 'release/1.0', tip]);
+    const nested = await s.commit({ repo: 'notes', branch: 'release/1.0', expectedSha: null, baseSha: tip, message: 'm', changes: change });
+    assert.equal(nested.status, 400, nested.text);
+    assert.equal(nested.body.reason, 'branch');
+    assert.equal((await tryRev(bare, 'refs/heads/release/1.0')), null);
+    const free = await s.commit({ repo: 'notes', branch: 'v1-work', expectedSha: null, baseSha: tip, message: 'm', changes: change });
+    assert.equal(free.status, 200, free.text);
+    assert.equal(git(bare, ['rev-parse', 'refs/heads/v1-work']), free.body.commitSha);
+    assert.equal(git(bare, ['rev-parse', 'refs/tags/v1']), tip, 'the tag is unchanged');
+  } finally {
+    await s.handle.close();
+  }
+});
+
+test('R-GS-22: the connection trailer joins the message\'s own trailer block, so the user\'s trailers survive', async () => {
+  const { root, bare, tip } = makeRoot();
+  const s = await loopback(root);
+  const trailers = () => git(bare, ['log', '-1', '--format=%(trailers:only)', 'refs/heads/main']);
+  const message = () => git(bare, ['log', '-1', '--format=%B', 'refs/heads/main']);
+  let seq = 0;
+  const commit = async (text) => {
+    const res = await s.commit({ repo: 'notes', branch: 'main', expectedSha: git(bare, ['rev-parse', 'refs/heads/main']), message: text, changes: [{ path: 'a.txt', contentBase64: b64(`trailer ${++seq}\n`) }] });
+    assert.equal(res.status, 200, res.text);
+  };
+  try {
+    assert.equal(git(bare, ['rev-parse', 'refs/heads/main']), tip);
+    // The message ends in a trailer block: git must read all three as trailers.
+    await commit('Subject\n\nBody text.\n\nSigned-off-by: Dev <dev@example.com>\nCo-authored-by: Pat <pat@example.com>\n');
+    assert.equal(trailers(), 'Signed-off-by: Dev <dev@example.com>\nCo-authored-by: Pat <pat@example.com>\nGit-Serve-Connection: loopback');
+    assert.equal(message(), 'Subject\n\nBody text.\n\nSigned-off-by: Dev <dev@example.com>\nCo-authored-by: Pat <pat@example.com>\nGit-Serve-Connection: loopback');
+    // A subject and a trailer block, with no body between.
+    await commit('Subject\n\nReviewed-by: Rev <rev@example.com>');
+    assert.equal(trailers(), 'Reviewed-by: Rev <rev@example.com>\nGit-Serve-Connection: loopback');
+    // A last paragraph of prose is not a trailer block: the trailer gets its own.
+    await commit('Subject\n\nNote: this is prose,\nnot a trailer block.');
+    assert.equal(trailers(), 'Git-Serve-Connection: loopback');
+    assert.equal(message(), 'Subject\n\nNote: this is prose,\nnot a trailer block.\n\nGit-Serve-Connection: loopback');
+    // A one-line message that looks like a trailer is a subject.
+    await commit('Fix: the thing');
+    assert.equal(trailers(), 'Git-Serve-Connection: loopback');
+    assert.equal(message(), 'Fix: the thing\n\nGit-Serve-Connection: loopback');
+    // A forged connection trailer inside a real trailer block is still refused.
+    const head = git(bare, ['rev-parse', 'refs/heads/main']);
+    const forged = await s.commit({ repo: 'notes', branch: 'main', expectedSha: head, message: 'Subject\n\nSigned-off-by: Dev <dev@example.com>\ngit-serve-connection : someone-else', changes: [{ path: 'a.txt', contentBase64: b64('forged\n') }] });
+    assert.equal(forged.status, 400);
+    assert.equal(forged.body.reason, 'message');
+    assert.equal(git(bare, ['rev-parse', 'refs/heads/main']), head);
   } finally {
     await s.handle.close();
   }

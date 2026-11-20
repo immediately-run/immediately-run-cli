@@ -35,7 +35,7 @@ import {
 } from './commit.js';
 import { LOOPBACK_ROUTES, TAILNET_ROUTES, admit, authorize, sameSecret } from './guards.js';
 import { gitServeNamespace } from './namespace.js';
-import { exchangePairingCode } from './pairing.js';
+import { tryExchangePairingCode } from './pairing.js';
 import { checkPeer, type PeerGateConfig } from './peerGate.js';
 import { GIT_SERVE_PROTOCOL, GIT_SERVE_SERVER, type RunGit } from './protocol.js';
 import { answerRead, type ReadAnswer } from './readRoutes.js';
@@ -342,7 +342,13 @@ export const startGitServe = (opts: GitServeOptions): Promise<GitServeHandle> =>
     // not enough without it.
     if (url.pathname === '/pair') {
       req.resume(); // the route reads no body
-      const paired = exchangePairingCode(root, bearer, now());
+      const paired = tryExchangePairingCode(root, bearer, now());
+      if (paired === 'busy') {
+        // `pair` or `connections` holds the state lock in another process.
+        // Nothing was counted against the code; the browser asks again.
+        refuse(503, 'busy', { ...cors, 'Retry-After': '1' });
+        return;
+      }
       if (!paired.ok) {
         refuse(401, 'code', cors);
         return;
@@ -464,6 +470,11 @@ export const startGitServe = (opts: GitServeOptions): Promise<GitServeHandle> =>
       tailnet?.cert !== undefined && tailnet.key !== undefined
         ? https.createServer({ cert: tailnet.cert, key: tailnet.key }, handler)
         : http.createServer(handler);
+    // A push uploads its pack in one request, and Node ends any request that
+    // has not fully arrived after `requestTimeout` (300 s by default). Where
+    // the git routes are served there is no such limit. `headersTimeout` stays:
+    // a connection that never finishes its headers is still dropped.
+    if (tailnet !== undefined) server.requestTimeout = 0;
     const sockets = new Set<Socket>();
     server.on('connection', (socket) => {
       sockets.add(socket);
