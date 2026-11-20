@@ -16,7 +16,9 @@
  *  - Push is decided by the `--allow-push` flag alone. `http.receivepack` is
  *    forced through the environment on every request, and environment config
  *    outranks the repository's own. With the flag, a non-fast-forward push and
- *    a ref deletion are forced off the same way (D-GS-10).
+ *    a ref deletion are forced off the same way (D-GS-10), and every ref
+ *    outside `refs/heads/` is hidden from receive-pack, so a push can neither
+ *    create, move nor delete a tag.
  *
  * A browser cannot use these routes: a request that carries `Origin` or any
  * `Sec-Fetch-*` header is refused before anything else, and no CORS header is
@@ -83,6 +85,12 @@ export const forcedConfig = (allowPush: boolean): Array<[string, string]> => [
   // The dumb protocol's file routes are not routed here; this is the same
   // decision stated to the child as well.
   ['http.getanyfile', 'false'],
+  // A push may only touch branches. git's two deny settings below apply to
+  // refs/heads/ alone, so without this a tag (or any other ref) could be
+  // force-moved and deleted. Hiding every ref but refs/heads/ from
+  // receive-pack makes it refuse any update outside them (R-GS-14, R-GS-19).
+  ['receive.hideRefs', 'refs/'],
+  ['receive.hideRefs', '!refs/heads/'],
   ...(allowPush
     ? ([
         ['receive.denyNonFastForwards', 'true'],

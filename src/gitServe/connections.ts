@@ -14,7 +14,16 @@
  */
 
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
-import { existsSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import {
+  closeSync,
+  existsSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { join } from 'node:path';
 
 import { ensureStateDir, stateDirOf } from './state.js';
@@ -59,6 +68,52 @@ export const writeStateFile = (root: string, name: string, content: string): voi
   renameSync(tmp, join(dir, name));
 };
 
+const LOCK_FILE = '.lock';
+const LOCK_WAIT_MS = 5000;
+/** A lock older than this was left by a process that died holding it. */
+const LOCK_STALE_MS = 30_000;
+
+const sleepSync = (ms: number): void => {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+};
+
+/**
+ * Runs `fn` holding the state directory's lock. The server, `git-serve pair`
+ * and `git-serve connections` are separate processes that each read a state
+ * file, change it and write it back; without a lock the last writer wins, and a
+ * pairing racing a revocation could write the revoked connection back.
+ * Not re-entrant: a function that holds the lock calls the unlocked forms.
+ */
+export const withStateLock = <T>(root: string, fn: () => T): T => {
+  const lock = join(ensureStateDir(root), LOCK_FILE);
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  for (;;) {
+    try {
+      closeSync(openSync(lock, 'wx', FILE_MODE));
+      break;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
+      try {
+        if (Date.now() - statSync(lock).mtimeMs > LOCK_STALE_MS) {
+          rmSync(lock, { force: true });
+          continue;
+        }
+      } catch {
+        continue; // released between the open and the stat
+      }
+      if (Date.now() > deadline) {
+        throw new Error(`${lock} is held by another git-serve process; try again.`);
+      }
+      sleepSync(10);
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    rmSync(lock, { force: true });
+  }
+};
+
 /** The stored connections. A missing file is no connections; a file that cannot
  *  be read as a list of records is an error, never an empty list. */
 export const readConnections = (root: string): ConnectionRecord[] => {
@@ -75,8 +130,8 @@ export const readConnections = (root: string): ConnectionRecord[] => {
 const writeConnections = (root: string, list: readonly ConnectionRecord[]): void =>
   writeStateFile(root, CONNECTIONS_FILE, JSON.stringify({ connections: list }, null, 2) + '\n');
 
-/** Mints a connection. The token is returned once and exists nowhere on disk. */
-export const addConnection = (
+/** Mints a connection. The caller holds the state lock. */
+export const addConnectionLocked = (
   root: string,
   scope: ConnectionScope,
   now: Date = new Date(),
@@ -92,14 +147,23 @@ export const addConnection = (
   return { record, token };
 };
 
+/** Mints a connection. The token is returned once and exists nowhere on disk. */
+export const addConnection = (
+  root: string,
+  scope: ConnectionScope,
+  now: Date = new Date(),
+): { record: ConnectionRecord; token: string } =>
+  withStateLock(root, () => addConnectionLocked(root, scope, now));
+
 /** Removes a connection. Returns false when no connection has that id. */
-export const revokeConnection = (root: string, id: string): boolean => {
-  const list = readConnections(root);
-  const kept = list.filter((c) => c.id !== id);
-  if (kept.length === list.length) return false;
-  writeConnections(root, kept);
-  return true;
-};
+export const revokeConnection = (root: string, id: string): boolean =>
+  withStateLock(root, () => {
+    const list = readConnections(root);
+    const kept = list.filter((c) => c.id !== id);
+    if (kept.length === list.length) return false;
+    writeConnections(root, kept);
+    return true;
+  });
 
 export interface ConnectionLookup {
   /** The connection a presented token belongs to, or null. */

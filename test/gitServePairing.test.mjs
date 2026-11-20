@@ -7,8 +7,8 @@
 // `git-serve pair` command calls, and by the built CLI itself in the CLI cases.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, existsSync } from 'node:fs';
+import { execFile, execFileSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, existsSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -349,6 +349,45 @@ test('unit: connectionLookup sees a rewrite at once, and an unreadable file auth
   assert.equal(lookup.find(b.record.tokenHash), null);
   execFileSync('sh', ['-c', `printf 'not json' > "${join(root, '.git-serve', 'connections.json')}"`]);
   assert.equal(lookup.find(b.token), null);
+});
+
+test('the state lock: a revocation and a pairing in two processes never undo each other', async () => {
+  const root = freshRoot('lock');
+  const seeded = Array.from({ length: 40 }, () => addConnection(root, 'read').record.id);
+  // Another process revokes the seeded connections, as `connections --revoke` does…
+  const child = `
+    import { revokeConnection } from ${JSON.stringify(new URL('../dist/gitServe/connections.js', import.meta.url).href)};
+    const out = [];
+    for (const id of ${JSON.stringify(seeded)}) if (revokeConnection(${JSON.stringify(root)}, id)) out.push(id);
+    console.log(JSON.stringify(out));
+  `;
+  const revoking = new Promise((resolvePromise, reject) => {
+    execFile(process.execPath, ['--input-type=module', '-e', child], { encoding: 'utf8' }, (error, stdout) =>
+      error ? reject(error) : resolvePromise(JSON.parse(stdout)),
+    );
+  });
+  // …while this one adds, as the server does on /pair.
+  const added = [];
+  for (let i = 0; i < 300; i++) {
+    added.push(addConnection(root, 'write').record.id);
+    if (i % 10 === 0) await new Promise((r) => setImmediate(r));
+  }
+  const revoked = await revoking;
+  assert.equal(revoked.length, seeded.length, 'every revoke found its connection');
+  const left = new Set(readConnections(root).map((c) => c.id));
+  for (const id of revoked) assert.ok(!left.has(id), `revoked ${id} is back`);
+  for (const id of added) assert.ok(left.has(id), `added ${id} was lost`);
+  assert.equal(existsSync(join(root, '.git-serve', '.lock')), false, 'the lock is released');
+});
+
+test('the state lock: a lock left by a dead process is taken over; a live one is waited for', () => {
+  const root = freshRoot('stale-lock');
+  const lock = join(root, '.git-serve', '.lock');
+  addConnection(root, 'read');
+  writeFileSync(lock, '');
+  utimesSync(lock, new Date(Date.now() - 60_000), new Date(Date.now() - 60_000));
+  assert.equal(addConnection(root, 'read').record.scope, 'read');
+  assert.equal(readConnections(root).length, 2);
 });
 
 // --- the commands ------------------------------------------------------------

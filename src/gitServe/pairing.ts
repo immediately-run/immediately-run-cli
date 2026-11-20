@@ -24,9 +24,10 @@ import { existsSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 
 import {
-  addConnection,
+  addConnectionLocked,
   hashSecret,
   isScope,
+  withStateLock,
   writeStateFile,
   type ConnectionRecord,
   type ConnectionScope,
@@ -95,7 +96,7 @@ export const createPairingCode = (
     expiresAt: now + PAIRING_TTL_MS,
     failures: 0,
   };
-  writeStateFile(root, PAIRING_FILE, JSON.stringify(record) + '\n');
+  withStateLock(root, () => writeStateFile(root, PAIRING_FILE, JSON.stringify(record) + '\n'));
   return { code: formatCode(code), expiresAt: record.expiresAt };
 };
 
@@ -119,15 +120,19 @@ export type PairingResult =
   | { ok: false };
 
 /**
- * Exchanges a presented code for a connection. Synchronous from the first read
- * to the last write, so two requests in one server process cannot both spend
- * the same code or both miss the same failure count.
+ * Exchanges a presented code for a connection. It holds the state lock from the
+ * first read to the last write, so neither two requests in the server nor a
+ * `pair` or `connections --revoke` in another process can interleave with it:
+ * a code is spent once, a failure is counted once, and a code minted meanwhile
+ * is neither spent nor deleted by an exchange of the old one.
  */
 export const exchangePairingCode = (
   root: string,
   presented: string,
   now: number = Date.now(),
-): PairingResult => {
+): PairingResult => withStateLock(root, () => exchangeLocked(root, presented, now));
+
+const exchangeLocked = (root: string, presented: string, now: number): PairingResult => {
   const record = readPairing(root);
   if (record === null) {
     // No code, or a file this code cannot read: remove it so it cannot linger.
@@ -144,9 +149,6 @@ export const exchangePairingCode = (
   );
   if (!matches) {
     const failures = record.failures + 1;
-    // `pair` is another process and may have minted a new code since the read
-    // above. A failure against the old code must not write the old code back.
-    if (readPairing(root)?.codeHash !== record.codeHash) return { ok: false };
     if (failures >= MAX_PAIRING_FAILURES) killCode(root);
     else writeStateFile(root, PAIRING_FILE, JSON.stringify({ ...record, failures }) + '\n');
     return { ok: false };
@@ -154,6 +156,6 @@ export const exchangePairingCode = (
   // The code is spent before the token exists, so a crash between the two
   // leaves no code and no connection, never a reusable code.
   killCode(root);
-  const made = addConnection(root, record.scope, new Date(now));
+  const made = addConnectionLocked(root, record.scope, new Date(now));
   return { ok: true, record: made.record, token: made.token };
 };

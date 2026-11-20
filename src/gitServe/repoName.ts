@@ -7,7 +7,8 @@
  * it must still sit directly under the root once symlinks in the root itself are
  * resolved, and it must hold its own objects. A repository that borrows objects
  * through `objects/info/alternates` is refused, because its object store reaches
- * a directory the root does not contain.
+ * a directory the root does not contain; so is one with a `commondir` file or a
+ * symlink directly under `objects/`.
  *
  * Every refusal after the name check is the same answer as a name that does not
  * exist, so a caller cannot tell a symlinked repository from a missing one.
@@ -48,7 +49,18 @@ export const resolveRepo = (root: string, name: unknown): RepoResolution => {
   } catch {
     return { ok: false, reason: 'unknown' };
   }
+  // A repository must hold its own objects. Three ways it could borrow them,
+  // each refused: an alternates file, a `commondir` file (a linked worktree's
+  // pointer to another repository), and a symlink directly under objects/.
   if (existsSync(join(dir, 'objects', 'info', 'alternates'))) {
+    return { ok: false, reason: 'unknown' };
+  }
+  if (existsSync(join(dir, 'commondir'))) return { ok: false, reason: 'unknown' };
+  try {
+    for (const entry of readdirSync(join(dir, 'objects'), { withFileTypes: true })) {
+      if (entry.isSymbolicLink()) return { ok: false, reason: 'unknown' };
+    }
+  } catch {
     return { ok: false, reason: 'unknown' };
   }
   return { ok: true, name, dir };
