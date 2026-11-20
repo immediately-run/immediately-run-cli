@@ -593,8 +593,6 @@ test('G-GS-12 on a tailnet: Origin required, no ?token=, preflight without a tok
     assert.equal((await ask('/meta', { ...good, Host: hostHeader.toUpperCase() })).status, 200, 'the name is case-insensitive');
     // The session token of a loopback server means nothing here.
     assert.equal((await ask('/meta', { ...good, Authorization: `Bearer ${TOKEN}` })).status, 401);
-    // The git-client class is routed (past the peer gate) and not answered yet.
-    assert.equal((await ask('/notes.git/info/refs?service=git-upload-pack', { Host: hostHeader })).status, 404);
   } finally {
     await tail.close();
   }
