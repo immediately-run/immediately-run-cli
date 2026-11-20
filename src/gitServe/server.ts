@@ -110,10 +110,11 @@ const sendBlob = (
   answer: Extract<ReadAnswer, { kind: 'blob' }>,
   cors: Record<string, string>,
 ): void => {
-  // The bytes are named by their SHA and can never change.
+  // No caching header: the host keeps its own verified blob cache, and the
+  // spec's review dropped a browser-cache header for these bytes.
   const headers = {
     'Content-Type': 'application/octet-stream',
-    'Cache-Control': 'private, max-age=31536000, immutable',
+    'Cache-Control': 'no-store',
     'X-Content-Type-Options': 'nosniff',
     ...cors,
   };
