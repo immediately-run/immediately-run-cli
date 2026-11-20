@@ -10,7 +10,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile, execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync, existsSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -314,6 +314,13 @@ test('G-GS-13: with --allow-push a fast-forward lands; a forced rewrite and a de
   // The repository explicitly allows both; the forced environment config must outrank it.
   git(bare, ['config', 'receive.denyNonFastForwards', 'false']);
   git(bare, ['config', 'receive.denyDeletes', 'false']);
+  // A hook that records who git was told the pusher is: the server's wiring of
+  // REMOTE_USER, observed from inside a real receive-pack.
+  writeFileSync(join(bare, 'hooks', 'pre-receive'), '#!/bin/sh\nprintf "%s" "$REMOTE_USER" > remote-user.txt\ncat > /dev/null\n');
+  chmodSync(join(bare, 'hooks', 'pre-receive'), 0o755);
+  // A tag that exists before any push, and its commit.
+  const tagged = git(bare, ['rev-parse', 'refs/heads/main']);
+  git(bare, ['tag', 'v1', tagged]);
   const s = await serve(root, { allowPush: true });
   try {
     // A fast-forward push lands.
@@ -323,6 +330,26 @@ test('G-GS-13: with --allow-push a fast-forward lands; a forced rewrite and a de
     const ff = await tryGit(work, [...s.client, 'push', s.url('notes'), 'main:main']);
     assert.equal(ff.code, 0, ff.out);
     assert.equal(git(bare, ['rev-parse', 'refs/heads/main']), pushed);
+    assert.equal(readFileSync(join(bare, 'remote-user.txt'), 'utf8'), 'owner@example.com', 'REMOTE_USER is the peer\'s login');
+
+    // Only branches are writable. A tag cannot be moved (forced or not), deleted
+    // or created, and neither can any other ref.
+    const refsBefore = git(bare, ['for-each-ref', '--format=%(refname) %(objectname)']);
+    for (const args of [
+      ['push', '--force', s.url('notes'), 'main:refs/tags/v1'],
+      ['push', s.url('notes'), 'main:refs/tags/v1'],
+      ['push', s.url('notes'), ':refs/tags/v1'],
+      ['push', '--delete', s.url('notes'), 'refs/tags/v1'],
+      ['push', s.url('notes'), 'main:refs/tags/brand-new'],
+      ['push', s.url('notes'), 'main:refs/keep/x'],
+      ['push', s.url('notes'), 'main:refs/notes/commits'],
+      ['push', s.url('notes'), 'main:refs/remotes/origin/x'],
+    ]) {
+      const res = await tryGit(work, [...s.client, ...args]);
+      assert.notEqual(res.code, 0, `${args.join(' ')}\n${res.out}`);
+      assert.equal(git(bare, ['for-each-ref', '--format=%(refname) %(objectname)']), refsBefore, args.join(' '));
+    }
+    assert.equal(git(bare, ['rev-parse', 'refs/tags/v1']), tagged, 'the tag still names its commit');
     // A new branch is a fast-forward of nothing and lands too.
     assert.equal((await tryGit(work, [...s.client, 'push', s.url('notes'), 'main:feature'])).code, 0);
     assert.equal(git(bare, ['rev-parse', 'refs/heads/feature']), pushed);
@@ -363,6 +390,7 @@ test('the forced config: push is the flag\'s alone, and never the request\'s', (
   assert.equal(on['http.receivepack'], 'true');
   assert.equal(on['receive.denyNonFastForwards'], 'true');
   assert.equal(on['receive.denyDeletes'], 'true');
+  assert.deepEqual(forcedConfig(true).filter(([k]) => k === 'receive.hideRefs').map(([, v]) => v), ['refs/', '!refs/heads/']);
   // The child's environment carries exactly these, and nothing inherited.
   process.env.GIT_CONFIG_COUNT = '1';
   process.env.GIT_CONFIG_KEY_0 = 'http.receivepack';
