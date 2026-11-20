@@ -1,0 +1,52 @@
+{
+  "Node": {
+    "ID": 2000000000000001,
+    "StableID": "nSELF000000CNTRL",
+    "Name": "serving-node.example-tailnet.ts.net.",
+    "User": 1000000000000001,
+    "Key": "nodekey:0000000000000000000000000000000000000000000000000000000000000000",
+    "KeyExpiry": "2027-03-15T13:57:25Z",
+    "DiscoKey": "discokey:0000000000000000000000000000000000000000000000000000000000000000",
+    "Addresses": [
+      "100.64.0.1/32",
+      "fd7a:115c:a1e0::1/128"
+    ],
+    "AllowedIPs": [
+      "100.64.0.1/32",
+      "fd7a:115c:a1e0::1/128"
+    ],
+    "Endpoints": [
+      "192.0.2.1:41641"
+    ],
+    "Hostinfo": {
+      "Hostname": "serving-node",
+      "Services": []
+    },
+    "Created": "2026-09-16T13:57:25.862350339Z",
+    "MachineAuthorized": true,
+    "CapMap": {
+      "default-auto-update": null,
+      "https": null,
+      "https://tailscale.com/cap/file-sharing": null,
+      "https://tailscale.com/cap/is-admin": null,
+      "https://tailscale.com/cap/is-owner": null,
+      "https://tailscale.com/cap/ssh": null,
+      "https://tailscale.com/cap/tailnet-lock": null,
+      "never-gso-equal-tail": null,
+      "probe-udp-lifetime": null,
+      "ssh-behavior-v1": null,
+      "ssh-env-vars": null,
+      "store-appc-routes": null,
+      "tailnet-display-name": null
+    },
+    "ComputedName": "serving-node",
+    "ComputedNameWithHost": "serving-node",
+    "StableTailnetID": "TEXAMPLE0000CNTRL"
+  },
+  "UserProfile": {
+    "ID": 1000000000000001,
+    "LoginName": "owner@example.com",
+    "DisplayName": "Owner Example"
+  },
+  "CapMap": null
+}

@@ -1,0 +1,39 @@
+{
+  "Node": {
+    "ID": 2000000000000002,
+    "StableID": "nPEER000001CNTRL",
+    "Name": "second-device.example-tailnet.ts.net.",
+    "User": 1000000000000001,
+    "Key": "nodekey:0000000000000000000000000000000000000000000000000000000000000000",
+    "DiscoKey": "discokey:0000000000000000000000000000000000000000000000000000000000000000",
+    "Addresses": [
+      "100.64.0.2/32",
+      "fd7a:115c:a1e0::2/128"
+    ],
+    "AllowedIPs": [
+      "100.64.0.2/32",
+      "fd7a:115c:a1e0::2/128"
+    ],
+    "Endpoints": [
+      "192.0.2.1:41641"
+    ],
+    "HomeDERP": 26,
+    "Hostinfo": {
+      "OS": "linux",
+      "Hostname": "second-device",
+      "Services": []
+    },
+    "Created": "2025-06-19T06:38:02.656626498Z",
+    "Cap": 148,
+    "LastSeen": "2026-11-20T17:02:53.1Z",
+    "Online": true,
+    "ComputedName": "second-device",
+    "ComputedNameWithHost": "second-device"
+  },
+  "UserProfile": {
+    "ID": 1000000000000001,
+    "LoginName": "owner@example.com",
+    "DisplayName": "Owner Example"
+  },
+  "CapMap": null
+}

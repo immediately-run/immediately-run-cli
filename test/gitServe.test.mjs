@@ -28,7 +28,9 @@ import { runGit } from '../dist/gitServe/runGit.js';
 import { gitServeNamespace, canonicalTailnetOrigin } from '../dist/gitServe/namespace.js';
 import { resolveRef } from '../dist/gitServe/refs.js';
 import { resolveRepo, listRepos } from '../dist/gitServe/repoName.js';
-import { guardRequest, classify, isPinnedHost } from '../dist/gitServe/guards.js';
+import { guardRequest, classify, isPinnedHost, TAILNET_ROUTES } from '../dist/gitServe/guards.js';
+import { addConnection } from '../dist/gitServe/connections.js';
+import { parseTailnetIdentity, parseWhois } from '../dist/gitServe/tailscaleWhois.js';
 import { GIT_SERVE_PROTOCOL, GIT_SERVE_SERVER } from '../dist/gitServe/protocol.js';
 import { runGitServeInit } from '../dist/commands/gitServe.js';
 import { parseLsTreeLong, treeEntries } from '../dist/git.js';
@@ -525,10 +527,71 @@ test('guards: the verdicts, in order, without a socket', () => {
   assert.equal(guardRequest({ ...base, method: 'OPTIONS', authorization: undefined }).kind, 'preflight');
   assert.equal(guardRequest({ ...base, authorization: undefined }).reason, 'token');
   assert.equal(classify('/meta'), 'browser');
-  assert.equal(classify('/notes.git/info/refs'), 'none');
+  assert.equal(classify('/notes.git/info/refs'), 'git');
+  assert.equal(classify('/notes.git'), 'git');
+  assert.equal(classify('/a/b.git/info/refs'), 'none');
+  assert.equal(classify('/pair'), 'none', 'no /pair in the loopback table');
+  assert.equal(classify('/pair', TAILNET_ROUTES), 'browser');
   assert.equal(classify('constructor'), 'none');
   assert.equal(isPinnedHost('[::1]:7701', 7701, new Set(['::1'])), true);
   assert.equal(isPinnedHost('[::1]', 7701, new Set(['::1'])), false);
+});
+
+// --- G-GS-12 again, under the tailnet configuration --------------------------
+
+test('G-GS-12 on a tailnet: Origin required, no ?token=, preflight without a token, Host with its port', async () => {
+  const FIX = fileURLToPath(new URL('./fixtures/tailscale-whois/', import.meta.url));
+  const identity = parseTailnetIdentity(readFileSync(join(FIX, 'status.json'), 'utf8'));
+  const sameUser = parseWhois(0, readFileSync(join(FIX, 'same-user.json'), 'utf8'), '');
+  const HOST = 'serving-node.example-tailnet.ts.net';
+  const tailRoot = join(tmp, 'tailnet-root');
+  runGitServeInit(tailRoot, 'notes');
+  const { token } = addConnection(tailRoot, 'read');
+  // Started through the programmatic entry with an injected listen address and
+  // whois; this seam is not a CLI flag.
+  const tail = await startGitServe({
+    root: tailRoot,
+    origin: ORIGIN,
+    port: 0,
+    log: () => {},
+    tailnet: {
+      host: HOST,
+      address: '127.0.0.1',
+      peerGate: { self: identity.self, allowUserIds: new Set(), whois: async () => sameUser },
+    },
+  });
+  const hostHeader = `${HOST}:${tail.port}`;
+  const ask = (path, headers, method = 'GET') => request(path, { port: tail.port, method, headers });
+  try {
+    const good = { Host: hostHeader, Origin: MEDIATOR, Authorization: `Bearer ${token}` };
+    assert.equal((await ask('/meta', good)).status, 200);
+    // Origin is required.
+    assert.equal((await ask('/meta', { Host: hostHeader, Authorization: `Bearer ${token}` })).status, 403);
+    assert.equal((await ask('/meta', { ...good, Origin: 'https://evil.example' })).status, 403);
+    // The token rides in Authorization only.
+    assert.equal((await ask(`/meta?token=${token}`, { Host: hostHeader, Origin: MEDIATOR })).status, 401);
+    // Preflight is answered without a token.
+    const preflight = await ask('/meta', { Host: hostHeader, Origin: MEDIATOR }, 'OPTIONS');
+    assert.equal(preflight.status, 204);
+    assert.equal(preflight.headers['access-control-allow-origin'], MEDIATOR);
+    // The Host pin is the MagicDNS name WITH its port; loopback names are not it.
+    assert.equal((await ask('/meta', { ...good, Host: HOST })).status, 403, 'Host without the port');
+    assert.equal((await ask('/meta', { ...good, Host: `${HOST}:${tail.port + 1}` })).status, 403);
+    assert.equal((await ask('/meta', { ...good, Host: `127.0.0.1:${tail.port}` })).status, 403);
+    assert.equal((await ask('/meta', { ...good, Host: `other.example-tailnet.ts.net:${tail.port}` })).status, 403);
+    assert.equal((await ask('/meta', { ...good, Host: hostHeader.toUpperCase() })).status, 200, 'the name is case-insensitive');
+    // The session token of a loopback server means nothing here.
+    assert.equal((await ask('/meta', { ...good, Authorization: `Bearer ${TOKEN}` })).status, 401);
+    // The git-client class is routed (past the peer gate) and not answered yet.
+    assert.equal((await ask('/notes.git/info/refs?service=git-upload-pack', { Host: hostHeader })).status, 404);
+  } finally {
+    await tail.close();
+  }
+});
+
+test('the two binds are exclusive: startGitServe takes a token or a tailnet binding, never both or neither', () => {
+  assert.throws(() => startGitServe({ root, origin: ORIGIN, port: 0 }), /exactly one/);
+  assert.throws(() => startGitServe({ root, origin: ORIGIN, port: 0, token: 't', tailnet: {} }), /exactly one/);
 });
 
 // --- namespace --------------------------------------------------------------
@@ -658,12 +721,6 @@ const runCli = (args) => {
     return { code: e.status, out: `${e.stdout}${e.stderr}` };
   }
 };
-
-test('cli: --bind tailscale is refused with a message naming R3-1360', () => {
-  const res = runCli(['git-serve', root, '--bind', 'tailscale']);
-  assert.equal(res.code, 1);
-  assert.match(res.out, /R3-1360/);
-});
 
 test('cli: git-serve init makes a bare repository, refuses a bad name and an existing one', () => {
   const initRoot = join(tmp, 'init-root');

@@ -1,0 +1,395 @@
+// G-GS-11 — pairing codes and connection tokens (GIT_SERVE_SPEC §10.2 R-GS-24;
+// roadmap R3-1360). Runs against the compiled dist/.
+//
+// The server is started through its programmatic entry in the tailnet
+// configuration, listening on loopback with an injected `whois`, so no test
+// needs a tailnet. The pairing code is minted by the same function the
+// `git-serve pair` command calls, and by the built CLI itself in the CLI cases.
+import { test, before, after } from 'node:test';
+import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import http from 'node:http';
+
+import { startGitServe } from '../dist/gitServe/server.js';
+import {
+  createPairingCode,
+  exchangePairingCode,
+  normalizeCode,
+} from '../dist/gitServe/pairing.js';
+import {
+  addConnection,
+  connectionLookup,
+  readConnections,
+  revokeConnection,
+} from '../dist/gitServe/connections.js';
+import { gitServeNamespace } from '../dist/gitServe/namespace.js';
+import { parseTailnetIdentity, parseWhois } from '../dist/gitServe/tailscaleWhois.js';
+import { GIT_SERVE_PROTOCOL, GIT_SERVE_SERVER } from '../dist/gitServe/protocol.js';
+import { runGitServeInit } from '../dist/commands/gitServe.js';
+
+const CLI_ENTRY = fileURLToPath(new URL('../dist/cli.js', import.meta.url));
+const FIXTURES = fileURLToPath(new URL('./fixtures/tailscale-whois/', import.meta.url));
+const identity = parseTailnetIdentity(readFileSync(join(FIXTURES, 'status.json'), 'utf8'));
+const sameUser = parseWhois(0, readFileSync(join(FIXTURES, 'same-user.json'), 'utf8'), '');
+
+const HOST = 'serving-node.example-tailnet.ts.net';
+const ORIGIN = 'https://local.immediately.run';
+const MEDIATOR = 'https://staging-immediately-run-devbridge.web.app';
+const CODE_RE = /^[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}$/;
+
+let tmp;
+const freshRoot = (name) => {
+  const root = join(tmp, name);
+  runGitServeInit(root, 'notes');
+  return root;
+};
+
+before(() => {
+  tmp = mkdtempSync(join(tmpdir(), 'ir-git-serve-pair-'));
+});
+after(() => rmSync(tmp, { recursive: true, force: true }));
+
+/** Start the tailnet configuration on loopback. `clock.t` is the server's time. */
+const start = async (root, clock = { t: Date.now() }) => {
+  const logs = [];
+  const handle = await startGitServe({
+    root,
+    origin: ORIGIN,
+    port: 0,
+    now: () => clock.t,
+    log: (line) => logs.push(line),
+    tailnet: {
+      host: HOST,
+      address: '127.0.0.1',
+      peerGate: { self: identity.self, allowUserIds: new Set(), whois: async () => sameUser },
+    },
+  });
+  const request = (path, { method = 'GET', bearer, headers = {}, localAddress } = {}) =>
+    new Promise((resolvePromise, reject) => {
+      const req = http.request(
+        {
+          host: '127.0.0.1',
+          port: handle.port,
+          path,
+          method,
+          ...(localAddress ? { localAddress } : {}),
+          headers: {
+            Host: `${HOST}:${handle.port}`,
+            Origin: MEDIATOR,
+            ...(bearer !== undefined ? { Authorization: `Bearer ${bearer}` } : {}),
+            ...headers,
+          },
+        },
+        (res) => {
+          const chunks = [];
+          res.on('data', (c) => chunks.push(c));
+          res.on('end', () => {
+            const text = Buffer.concat(chunks).toString('utf8');
+            let body = null;
+            try {
+              body = JSON.parse(text);
+            } catch {
+              /* not JSON */
+            }
+            resolvePromise({ status: res.statusCode, headers: res.headers, text, body });
+          });
+        },
+      );
+      req.on('error', reject);
+      req.end();
+    });
+  const pair = (code, extra) => request('/pair', { method: 'POST', bearer: code, ...extra });
+  return { handle, logs, request, pair, clock };
+};
+
+test('G-GS-11: a code is exchanged once for a token, and the token then reads', async () => {
+  const root = freshRoot('once');
+  const s = await start(root);
+  try {
+    const { code } = createPairingCode(root, 'read', s.clock.t);
+    assert.match(code, CODE_RE);
+    const res = await s.pair(code);
+    assert.equal(res.status, 200);
+    assert.deepEqual(Object.keys(res.body).sort(), ['connectionId', 'namespace', 'protocol', 'scope', 'server', 'token']);
+    assert.equal(res.body.server, GIT_SERVE_SERVER);
+    assert.equal(res.body.protocol, GIT_SERVE_PROTOCOL);
+    assert.equal(res.body.scope, 'read');
+    assert.ok(Buffer.from(res.body.token, 'base64url').length >= 32, 'a token of at least 256 bits');
+    // The namespace is the tailnet one, over the lowercase origin with its port.
+    assert.equal(res.body.namespace, gitServeNamespace({ kind: 'tailnet', origin: `https://${HOST}:${s.handle.port}` }));
+    assert.equal(res.body.namespace, s.handle.namespace);
+    assert.match(res.body.namespace, /^serving-node-[0-9a-f]{20}$/);
+    // The token reads.
+    const meta = await s.request('/meta', { bearer: res.body.token });
+    assert.equal(meta.status, 200);
+    assert.deepEqual(meta.body.repos, ['notes']);
+    // Success killed the code: the same code again fails, and so does the code as a token.
+    assert.equal((await s.pair(code)).status, 401);
+    assert.equal((await s.pair(code)).body.reason, 'code');
+    assert.equal((await s.request('/meta', { bearer: normalizeCode(code) })).status, 401);
+    assert.equal(existsSync(join(root, '.git-serve', 'pairing.json')), false);
+  } finally {
+    await s.handle.close();
+  }
+});
+
+test('G-GS-11: the code is accepted as typed — lower case, with or without the dash', async () => {
+  for (const typed of [(c) => c.toLowerCase(), (c) => c.replace('-', ''), (c) => c]) {
+    const root = freshRoot(`typed-${Math.random().toString(36).slice(2)}`);
+    const s = await start(root);
+    try {
+      const { code } = createPairingCode(root, 'read', s.clock.t);
+      assert.equal((await s.pair(typed(code))).status, 200);
+    } finally {
+      await s.handle.close();
+    }
+  }
+});
+
+test('G-GS-11: the fifth failure kills the code, though the failures come from different addresses', async (t) => {
+  const root = freshRoot('five');
+  const s = await start(root);
+  try {
+    const { code } = createPairingCode(root, 'read', s.clock.t);
+    const wrong = code === 'AAAA-AAAA' ? 'BBBB-BBBB' : 'AAAA-AAAA';
+    // Two source addresses where the platform has them (Linux routes all of 127/8).
+    const sources = process.platform === 'linux' ? ['127.0.0.1', '127.0.0.2', '127.0.0.3'] : [undefined];
+    if (sources.length === 1) t.diagnostic('one loopback address on this platform: the count is still global, by the file');
+    // Five, as R-GS-24 states it; the literal is the spec's, not read from the code.
+    for (let i = 0; i < 5; i++) {
+      const res = await s.pair(wrong, { localAddress: sources[i % sources.length] });
+      assert.equal(res.status, 401, `failure ${i + 1}`);
+    }
+    if (sources.length > 1) {
+      const seen = new Set(s.logs.filter((l) => l.includes('(code)')).map((l) => l.split(' from ')[1]));
+      assert.ok(seen.size >= 2, `the failures came from ${[...seen].join(', ')}`);
+    }
+    // The right code is now dead.
+    assert.equal((await s.pair(code)).status, 401);
+    assert.equal(readConnections(root).length, 0);
+  } finally {
+    await s.handle.close();
+  }
+});
+
+test('G-GS-11: four failures leave the code alive; the count is kept across them', async () => {
+  const root = freshRoot('four');
+  const s = await start(root);
+  try {
+    const { code } = createPairingCode(root, 'write', s.clock.t);
+    for (let i = 0; i < 4; i++) assert.equal((await s.pair('ZZZZ-ZZZZ')).status, 401);
+    assert.equal(JSON.parse(readFileSync(join(root, '.git-serve', 'pairing.json'), 'utf8')).failures, 4);
+    const res = await s.pair(code);
+    assert.equal(res.status, 200);
+    assert.equal(res.body.scope, 'write', 'the scope is the one `pair` was given');
+  } finally {
+    await s.handle.close();
+  }
+});
+
+test('G-GS-11: a code older than ten minutes fails', async () => {
+  const root = freshRoot('old');
+  const clock = { t: 1_800_000_000_000 };
+  const s = await start(root, clock);
+  try {
+    const { code, expiresAt } = createPairingCode(root, 'read', clock.t);
+    const TEN_MINUTES = 10 * 60 * 1000; // R-GS-24's number, not read from the code
+    assert.equal(expiresAt, clock.t + TEN_MINUTES);
+    clock.t += TEN_MINUTES; // exactly ten minutes later: dead
+    assert.equal((await s.pair(code)).status, 401);
+    assert.equal(existsSync(join(root, '.git-serve', 'pairing.json')), false, 'an expired code is removed');
+    // One millisecond before the limit it would have worked.
+    const again = createPairingCode(root, 'read', clock.t);
+    clock.t += TEN_MINUTES - 1;
+    assert.equal((await s.pair(again.code)).status, 200);
+  } finally {
+    await s.handle.close();
+  }
+});
+
+test('G-GS-11: minting a new code kills the old one', async () => {
+  const root = freshRoot('remint');
+  const s = await start(root);
+  try {
+    const first = createPairingCode(root, 'read', s.clock.t);
+    const second = createPairingCode(root, 'read', s.clock.t);
+    assert.notEqual(first.code, second.code);
+    assert.equal((await s.pair(first.code)).status, 401);
+    assert.equal((await s.pair(second.code)).status, 200);
+  } finally {
+    await s.handle.close();
+  }
+});
+
+test('G-GS-11: a revoked token fails on its next request', async () => {
+  const root = freshRoot('revoke');
+  const s = await start(root);
+  try {
+    const a = (await s.pair(createPairingCode(root, 'read', s.clock.t).code)).body;
+    const b = (await s.pair(createPairingCode(root, 'read', s.clock.t).code)).body;
+    assert.equal((await s.request('/meta', { bearer: a.token })).status, 200);
+    assert.equal((await s.request('/meta', { bearer: b.token })).status, 200);
+    // Revocation is what `git-serve connections --revoke` does, from another process.
+    execFileSync(process.execPath, [CLI_ENTRY, 'git-serve', 'connections', root, '--revoke', a.connectionId], { stdio: 'pipe' });
+    const refused = await s.request('/meta', { bearer: a.token });
+    assert.equal(refused.status, 401);
+    assert.equal(refused.body.reason, 'token');
+    assert.equal((await s.request('/meta', { bearer: b.token })).status, 200, 'the other connection is untouched');
+  } finally {
+    await s.handle.close();
+  }
+});
+
+test('R-GS-24: the token is stored hashed, the state files are 0600, and nothing prints a credential', async () => {
+  const root = freshRoot('hashed');
+  const s = await start(root);
+  try {
+    const { code } = createPairingCode(root, 'read', s.clock.t);
+    const pairingOnDisk = readFileSync(join(root, '.git-serve', 'pairing.json'), 'utf8');
+    assert.ok(!pairingOnDisk.includes(normalizeCode(code)), 'the code is stored as a hash');
+    const res = await s.pair(code);
+    await s.request('/meta', { bearer: res.body.token });
+    await s.request('/meta', { bearer: 'wrong-token' });
+    const stateDir = join(root, '.git-serve');
+    for (const name of readdirSync(stateDir)) {
+      const content = readFileSync(join(stateDir, name), 'utf8');
+      assert.ok(!content.includes(res.body.token), `${name} must not hold the token`);
+      assert.equal(statSync(join(stateDir, name)).mode & 0o777, 0o600, name);
+    }
+    assert.equal(statSync(stateDir).mode & 0o777, 0o700);
+    const stored = readConnections(root);
+    assert.deepEqual(Object.keys(stored[0]).sort(), ['createdAt', 'id', 'scope', 'tokenHash']);
+    for (const line of s.logs) {
+      assert.ok(!line.includes(res.body.token) && !line.includes(normalizeCode(code)) && !line.includes('wrong-token'), line);
+    }
+  } finally {
+    await s.handle.close();
+  }
+});
+
+test('§10.1 on a tailnet: /pair is POST, needs the Origin, answers preflight without a code', async () => {
+  const root = freshRoot('pair-guards');
+  const s = await start(root);
+  try {
+    const { code } = createPairingCode(root, 'read', s.clock.t);
+    assert.equal((await s.request('/pair', { method: 'GET', bearer: code })).status, 405);
+    assert.equal((await s.request('/pair', { method: 'POST', bearer: code, headers: { Origin: 'https://evil.example' } })).status, 403);
+    assert.equal((await s.request(`/pair?token=${normalizeCode(code)}`, { method: 'POST' })).status, 401);
+    const preflight = await s.request('/pair', { method: 'OPTIONS' });
+    assert.equal(preflight.status, 204);
+    assert.equal(preflight.headers['access-control-allow-methods'], 'POST');
+    // None of those spent the code or counted as a failure.
+    assert.equal(JSON.parse(readFileSync(join(root, '.git-serve', 'pairing.json'), 'utf8')).failures, 0);
+    assert.equal((await s.pair(code)).status, 200);
+  } finally {
+    await s.handle.close();
+  }
+});
+
+test('R-GS-17: on loopback there are no connections — /pair does not exist', async () => {
+  const root = freshRoot('loopback');
+  createPairingCode(root, 'read');
+  const handle = await startGitServe({ root, origin: ORIGIN, token: 'session', port: 0, log: () => {} });
+  try {
+    const res = await new Promise((resolvePromise, reject) => {
+      const req = http.request(
+        { host: '127.0.0.1', port: handle.port, path: '/pair', method: 'POST', headers: { Origin: MEDIATOR, Authorization: 'Bearer session' } },
+        (r) => r.resume().on('end', () => resolvePromise(r.statusCode)),
+      );
+      req.on('error', reject);
+      req.end();
+    });
+    assert.equal(res, 404);
+  } finally {
+    await handle.close();
+  }
+});
+
+// --- the stores, without a server -------------------------------------------
+
+test('unit: exchangePairingCode — no code, a dead code and a wrong code are one answer', () => {
+  const root = freshRoot('unit');
+  assert.deepEqual(exchangePairingCode(root, 'AAAA-AAAA'), { ok: false });
+  const { code } = createPairingCode(root, 'read', 1000);
+  assert.deepEqual(exchangePairingCode(root, 'AAAA-AAA0', 1000), { ok: false });
+  const made = exchangePairingCode(root, code, 1000);
+  assert.equal(made.ok, true);
+  assert.equal(made.record.createdAt, new Date(1000).toISOString());
+  assert.deepEqual(exchangePairingCode(root, code, 1000), { ok: false });
+});
+
+test('unit: a new code starts with a clean count and replaces the old one', () => {
+  const root = freshRoot('race');
+  const first = createPairingCode(root, 'read', 1000);
+  // Three failures recorded against the first code.
+  for (let i = 0; i < 3; i++) exchangePairingCode(root, 'ZZZZ-ZZZZ', 1000);
+  const second = createPairingCode(root, 'read', 1000);
+  assert.equal(JSON.parse(readFileSync(join(root, '.git-serve', 'pairing.json'), 'utf8')).failures, 0, 'a new code starts at zero');
+  assert.equal(exchangePairingCode(root, first.code, 1000).ok, false);
+  assert.equal(exchangePairingCode(root, second.code, 1000).ok, true);
+});
+
+test('unit: connectionLookup sees a rewrite at once, and an unreadable file authorizes nobody', () => {
+  const root = freshRoot('lookup');
+  const lookup = connectionLookup(root);
+  assert.equal(lookup.find('anything'), null);
+  const a = addConnection(root, 'read');
+  const b = addConnection(root, 'write');
+  assert.equal(lookup.find(a.token).id, a.record.id);
+  assert.equal(lookup.find(b.token).scope, 'write');
+  assert.equal(revokeConnection(root, a.record.id), true);
+  assert.equal(lookup.find(a.token), null);
+  assert.equal(lookup.find(b.token).id, b.record.id);
+  assert.equal(revokeConnection(root, 'no-such-id'), false);
+  // The stored hash is not a credential.
+  assert.equal(lookup.find(b.record.tokenHash), null);
+  execFileSync('sh', ['-c', `printf 'not json' > "${join(root, '.git-serve', 'connections.json')}"`]);
+  assert.equal(lookup.find(b.token), null);
+});
+
+// --- the commands ------------------------------------------------------------
+
+const cli = (args) => {
+  try {
+    return { code: 0, out: execFileSync(process.execPath, [CLI_ENTRY, ...args], { encoding: 'utf8', stdio: 'pipe' }) };
+  } catch (e) {
+    return { code: e.status, out: `${e.stdout}${e.stderr}` };
+  }
+};
+
+test('cli: `git-serve pair` prints a code the server accepts; `connections` lists and revokes', async () => {
+  const root = freshRoot('cli');
+  const s = await start(root);
+  try {
+    const printed = cli(['git-serve', 'pair', root, '--scope', 'write']);
+    assert.equal(printed.code, 0);
+    const code = /Pairing code: (\S+)/.exec(printed.out)[1];
+    assert.match(code, CODE_RE);
+    const res = await s.pair(code);
+    assert.equal(res.status, 200);
+    assert.equal(res.body.scope, 'write');
+    const listed = cli(['git-serve', 'connections', root]);
+    assert.equal(listed.code, 0);
+    assert.match(listed.out, new RegExp(`^${res.body.connectionId}\\s+write\\s+connected `, 'm'));
+    assert.ok(!listed.out.includes(res.body.token));
+    assert.ok(!listed.out.includes(readConnections(root)[0].tokenHash), 'the listing prints no hash either');
+    assert.equal(cli(['git-serve', 'connections', root, '--revoke', res.body.connectionId]).code, 0);
+    assert.equal((await s.request('/meta', { bearer: res.body.token })).status, 401);
+    assert.match(cli(['git-serve', 'connections', root]).out, /No connections/);
+    assert.equal(cli(['git-serve', 'connections', root, '--revoke', 'nope']).code, 1);
+    assert.equal(cli(['git-serve', 'pair', root, '--scope', 'admin']).code, 1);
+  } finally {
+    await s.handle.close();
+  }
+});
+
+test('cli: --allow-login without --bind tailscale is refused', () => {
+  const root = freshRoot('flags');
+  const res = cli(['git-serve', root, '--allow-login', 'someone@example.com']);
+  assert.equal(res.code, 1);
+  assert.match(res.out, /--bind tailscale/);
+});

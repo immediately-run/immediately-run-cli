@@ -42,3 +42,11 @@ core_concepts §9).
   token rides in `Authorization` only, and the Host header must carry the port.
 - **`src/deepLink.ts`** — the one place the `ir-endpoint`/`ir-token` fragment is written;
   `dev`, `agent`, `llm` and `git-serve` build their links through it.
+- **`src/gitServe/peerGate.ts`** — R-GS-16, the tailnet peer gate: stable user ids only,
+  fail closed, tagged nodes and the node's own address refused. Pure over an injected
+  `whois`; `tailscaleWhois.ts` reads `tailscale whois --json` and `status --json`. The
+  field names come from recordings made on a live tailnet (roadmap R3-1356,
+  `test/fixtures/tailscale-whois/`).
+- **`src/gitServe/pairing.ts` / `connections.ts`** — R-GS-24: a 40-bit one-time code that
+  dies on success, on the fifth failure from any caller, or at ten minutes; 256-bit
+  connection tokens stored hashed and revocable at the next request.
