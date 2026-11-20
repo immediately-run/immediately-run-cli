@@ -10,6 +10,7 @@ import { parseArgs } from './args.js';
 import { runAgent } from './commands/agent.js';
 import { runCacheZip } from './commands/cacheZip.js';
 import { runDev } from './commands/dev.js';
+import { runGitServe } from './commands/gitServe.js';
 import { runLlm } from './commands/llm.js';
 import { runPinRelease } from './commands/pinRelease.js';
 import { runPreAuth } from './commands/preauth.js';
@@ -20,6 +21,7 @@ const COMMANDS: Record<string, (args: ReturnType<typeof parseArgs>) => number | 
   agent: runAgent,
   'cache-zip': runCacheZip,
   dev: runDev,
+  'git-serve': runGitServe,
   llm: runLlm,
   'pin-release': runPinRelease,
   preauth: runPreAuth,
@@ -33,6 +35,7 @@ Commands:
   agent       Bridge a local Claude Code to the in-browser host (MCP over stdio)
   cache-zip   Build a cached repository zip (with a contribute manifest sidecar)
   dev         Serve the current project to hosted immediately.run over localhost
+  git-serve   Serve a directory of bare git repositories to hosted immediately.run
   llm         Localhost LLM proxy to a single configured upstream (local models)
   pin-release Resolve UI release authoring files into pinned lock artifacts
   preauth     Apply an M1 pre-authorization policy to an app (headless/CI)

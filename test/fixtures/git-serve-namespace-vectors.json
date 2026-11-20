@@ -1,0 +1,35 @@
+{
+  "comment": "GIT_SERVE_SPEC R-GS-8. One home for the namespace rule shared by immediately-run-cli (src/gitServe/namespace.ts) and immediately-run-site-main (src/filesystem/gitNamespace.ts). The two copies of this file are byte-identical; change both in step. Each expected value was computed with sha256sum over the identity input, not with either implementation. Tailnet names here are placeholders.",
+  "vectors": [
+    {
+      "name": "loopback: the identity input is the instanceId",
+      "input": { "kind": "loopback", "instanceId": "0123456789abcdef0123456789abcdef" },
+      "identityInput": "0123456789abcdef0123456789abcdef",
+      "namespace": "localhost-3eb1bd439947eb762998"
+    },
+    {
+      "name": "tailnet: lowercase origin with its port",
+      "input": { "kind": "tailnet", "origin": "https://mac.tail0a1b2c.ts.net:7701" },
+      "identityInput": "https://mac.tail0a1b2c.ts.net:7701",
+      "namespace": "mac-d71c4b74722b0d0fe3ff"
+    },
+    {
+      "name": "tailnet: an uppercase spelling and a trailing slash are the same origin",
+      "input": { "kind": "tailnet", "origin": "HTTPS://Mac.Tail0A1B2C.TS.NET:7701/" },
+      "identityInput": "https://mac.tail0a1b2c.ts.net:7701",
+      "namespace": "mac-d71c4b74722b0d0fe3ff"
+    },
+    {
+      "name": "tailnet: the default port is written as 443",
+      "input": { "kind": "tailnet", "origin": "https://mac.tail0a1b2c.ts.net" },
+      "identityInput": "https://mac.tail0a1b2c.ts.net:443",
+      "namespace": "mac-f43da9339ad31e5956b2"
+    },
+    {
+      "name": "tailnet: another machine and port; the label keeps its hyphen",
+      "input": { "kind": "tailnet", "origin": "https://build-box.tail0a1b2c.ts.net:8443" },
+      "identityInput": "https://build-box.tail0a1b2c.ts.net:8443",
+      "namespace": "build-box-60c24ee86d8eb63df5d9"
+    }
+  ]
+}
