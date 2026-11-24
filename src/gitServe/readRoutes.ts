@@ -82,7 +82,7 @@ const onlyParams = (query: URLSearchParams, allowed: readonly string[]): boolean
 };
 
 /** `sha1`, another format name, or null when git could not say. */
-const objectFormat = async (repoDir: string, runGit: RunGit): Promise<string | null> => {
+export const objectFormat = async (repoDir: string, runGit: RunGit): Promise<string | null> => {
   const r = await runGit(repoDir, ['rev-parse', '--show-object-format']);
   return r.code === 0 ? text(r.stdout) : null;
 };
@@ -168,7 +168,9 @@ const resolveCommit = async (
     return {
       ok: false,
       answer:
-        resolved.reason === 'malformed' ? refusal(400, 'malformed') : refusal(404, 'not-found'),
+        resolved.reason === 'unknown'
+          ? refusal(404, 'not-found')
+          : refusal(400, resolved.reason), // 'malformed' or 'ambiguous' (R-GS-3)
     };
   }
   const tree = await ctx.runGit(dir, [

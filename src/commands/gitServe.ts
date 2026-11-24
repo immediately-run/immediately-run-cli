@@ -16,6 +16,7 @@ import { buildProviderDeepLink } from '../deepLink.js';
 import { DEFAULT_ORIGIN, runUntilShutdown } from '../devServer.js';
 import { gitServeNamespace } from '../gitServe/namespace.js';
 import { DEFAULT_GIT_SERVE_PORT, GIT_SERVE_PROTOCOL } from '../gitServe/protocol.js';
+import { objectFormat } from '../gitServe/readRoutes.js';
 import { resolveRef } from '../gitServe/refs.js';
 import { REPO_DIR_SUFFIX, isRepoName, listRepos } from '../gitServe/repoName.js';
 import { gitEnv, runGit } from '../gitServe/runGit.js';
@@ -88,13 +89,31 @@ export const runGitServeInit = (rootArg: string | undefined, name: string | unde
   return 0;
 };
 
-/** The default branch of a repository, when it names a commit; else null. */
-const defaultBranchOf = async (repoDir: string): Promise<string | null> => {
-  const head = await runGit(repoDir, ['symbolic-ref', '-q', '--short', 'HEAD']);
-  const branch = head.stdout.toString('utf8').trim();
-  if (head.code !== 0 || branch === '') return null;
+/**
+ * The default branch a repository's link opens, or why it gets no link: the
+ * line printed for an unlinked repository names the real cause, never a
+ * generic "no commit yet" for a repository that has commits.
+ */
+export const linkBranchOf = async (
+  repoDir: string,
+): Promise<{ ok: true; branch: string } | { ok: false; why: string }> => {
+  const format = await objectFormat(repoDir, runGit);
+  if (format !== 'sha1') {
+    // Left out exactly as /meta leaves it out (§2).
+    return { ok: false, why: `object format ${format ?? 'unknown'} is not served (SHA-1 only)` };
+  }
+  // The full ref, stripped here: `--short` disambiguates, printing `heads/v1`
+  // for a branch v1 that is also a tag, which is not the branch's name.
+  const head = await runGit(repoDir, ['symbolic-ref', '-q', 'HEAD']);
+  const full = head.stdout.toString('utf8').trim();
+  const branch = full.startsWith('refs/heads/') ? full.slice('refs/heads/'.length) : '';
+  if (head.code !== 0 || branch === '') return { ok: false, why: 'HEAD names no branch' };
   const resolved = await resolveRef(repoDir, branch, runGit);
-  return resolved.ok && resolved.refKind === 'branch' ? branch : null;
+  if (resolved.ok && resolved.refKind === 'branch') return { ok: true, branch };
+  if (!resolved.ok && resolved.reason === 'ambiguous') {
+    return { ok: false, why: `its default branch ${branch} is also a tag name, so a link to it would not resolve` };
+  }
+  return { ok: false, why: 'no commit on its default branch yet; push one, then restart for its link' };
 };
 
 export const runGitServe = async (args: ParsedArgs): Promise<number> => {
@@ -143,16 +162,16 @@ export const runGitServe = async (args: ParsedArgs): Promise<number> => {
   const endpoint = `http://127.0.0.1:${handle.port}`;
   const namespace = gitServeNamespace({ kind: 'loopback', instanceId: handle.instanceId });
   const links: Array<{ repo: string; url: string }> = [];
-  const unlinked: string[] = [];
+  const unlinked: Array<{ repo: string; why: string }> = [];
   for (const repo of listRepos(handle.root)) {
-    const branch = await defaultBranchOf(repo.dir);
-    if (branch === null) {
-      unlinked.push(repo.name);
+    const link = await linkBranchOf(repo.dir);
+    if (!link.ok) {
+      unlinked.push({ repo: repo.name, why: link.why });
       continue;
     }
     links.push({
       repo: repo.name,
-      url: buildProviderDeepLink(origin, 'git', namespace, repo.name, branch, endpoint, token),
+      url: buildProviderDeepLink(origin, 'git', namespace, repo.name, link.branch, endpoint, token),
     });
   }
 
@@ -181,9 +200,7 @@ export const runGitServe = async (args: ParsedArgs): Promise<number> => {
       );
     }
     for (const link of links) console.log(`immediately.run git URL (${link.repo}): ${link.url}`);
-    for (const name of unlinked) {
-      console.log(`${name}: no commit on its default branch yet; push one, then restart for its link.`);
-    }
+    for (const { repo, why } of unlinked) console.log(`${repo}: no link — ${why}.`);
     console.log('Press Ctrl-C to stop. Keep this running while a page is open.');
   }
 
