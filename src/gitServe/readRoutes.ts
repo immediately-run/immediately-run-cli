@@ -24,7 +24,7 @@ import {
   GIT_SERVE_SERVER,
   type RunGit,
 } from './protocol.js';
-import { peelToCommit, resolveRef, type RefKind } from './refs.js';
+import { headBranchOf, peelToCommit, resolveRef, type RefKind } from './refs.js';
 import { listRepos, resolveRepo } from './repoName.js';
 
 export interface ReadContext {
@@ -118,9 +118,8 @@ const openRepo = async (
 };
 
 const repoMeta = async (ctx: ReadContext, name: string, dir: string): Promise<ReadAnswer> => {
-  const head = await ctx.runGit(dir, ['symbolic-ref', '-q', '--short', 'HEAD']);
   // A detached HEAD has no default branch; the host then needs a ref in the URL.
-  const defaultBranch = head.code === 0 && text(head.stdout) !== '' ? text(head.stdout) : null;
+  const defaultBranch = await headBranchOf(dir, ctx.runGit);
 
   const listed = await ctx.runGit(dir, [
     'for-each-ref',

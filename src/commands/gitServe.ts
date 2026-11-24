@@ -17,7 +17,7 @@ import { DEFAULT_ORIGIN, runUntilShutdown } from '../devServer.js';
 import { gitServeNamespace } from '../gitServe/namespace.js';
 import { DEFAULT_GIT_SERVE_PORT, GIT_SERVE_PROTOCOL } from '../gitServe/protocol.js';
 import { objectFormat } from '../gitServe/readRoutes.js';
-import { resolveRef } from '../gitServe/refs.js';
+import { headBranchOf, resolveRef } from '../gitServe/refs.js';
 import { REPO_DIR_SUFFIX, isRepoName, listRepos } from '../gitServe/repoName.js';
 import { gitEnv, runGit } from '../gitServe/runGit.js';
 import { startGitServe } from '../gitServe/server.js';
@@ -102,12 +102,8 @@ export const linkBranchOf = async (
     // Left out exactly as /meta leaves it out (§2).
     return { ok: false, why: `object format ${format ?? 'unknown'} is not served (SHA-1 only)` };
   }
-  // The full ref, stripped here: `--short` disambiguates, printing `heads/v1`
-  // for a branch v1 that is also a tag, which is not the branch's name.
-  const head = await runGit(repoDir, ['symbolic-ref', '-q', 'HEAD']);
-  const full = head.stdout.toString('utf8').trim();
-  const branch = full.startsWith('refs/heads/') ? full.slice('refs/heads/'.length) : '';
-  if (head.code !== 0 || branch === '') return { ok: false, why: 'HEAD names no branch' };
+  const branch = await headBranchOf(repoDir, runGit);
+  if (branch === null) return { ok: false, why: 'HEAD names no branch' };
   const resolved = await resolveRef(repoDir, branch, runGit);
   if (resolved.ok && resolved.refKind === 'branch') return { ok: true, branch };
   if (!resolved.ok && resolved.reason === 'ambiguous') {

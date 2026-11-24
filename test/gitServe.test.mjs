@@ -381,6 +381,9 @@ test('R-GS-3: a name that is both a branch and a tag is 400 ambiguous on /meta a
     assert.deepEqual(await resolveRef(bare, 'v1', runGit), { ok: false, reason: 'ambiguous' });
     // A default branch whose name is also a tag gets no link, and says why.
     git(bare, ['symbolic-ref', 'HEAD', 'refs/heads/v1']);
+    // /meta names the branch itself, never git's disambiguated `heads/v1` (review 2-r2-0),
+    // so the host's request for it gets R-GS-3's 400 ambiguous, not a 404.
+    assert.equal((await json('/meta?repo=notes')).body.defaultBranch, 'v1');
     const link = await linkBranchOf(bare);
     assert.equal(link.ok, false);
     assert.match(link.why, /also a tag name/);

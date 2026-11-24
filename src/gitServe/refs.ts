@@ -66,6 +66,21 @@ export const peelToCommit = async (
   return peeled.code === 0 && COMMIT_SHA_RE.test(commit) ? commit : null;
 };
 
+/**
+ * The branch HEAD names, or null for a detached or unborn-without-branch HEAD.
+ * Read as the full ref and stripped here: `symbolic-ref --short` disambiguates,
+ * printing `heads/v1` for a branch `v1` that is also a tag, which is not the
+ * branch's name (cli#61 review). Every caller that needs the default branch
+ * goes through this one helper.
+ */
+export const headBranchOf = async (repoDir: string, runGit: RunGit): Promise<string | null> => {
+  const head = await runGit(repoDir, ['symbolic-ref', '-q', 'HEAD']);
+  const full = text(head.stdout);
+  if (head.code !== 0 || !full.startsWith('refs/heads/')) return null;
+  const branch = full.slice('refs/heads/'.length);
+  return branch === '' ? null : branch;
+};
+
 /** The object SHA a fully-qualified ref names, looked up exactly, or null. */
 const exactRef = async (
   repoDir: string,
