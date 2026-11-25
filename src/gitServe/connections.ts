@@ -17,6 +17,7 @@ import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import {
   closeSync,
   existsSync,
+  linkSync,
   openSync,
   readFileSync,
   renameSync,
@@ -77,40 +78,96 @@ const sleepSync = (ms: number): void => {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 };
 
+/** One attempt at the lock: its inode when taken, else whether to wait. */
+const tryLock = (lock: string): { held: number } | 'retry' | 'wait' => {
+  try {
+    closeSync(openSync(lock, 'wx', FILE_MODE));
+    return { held: statSync(lock).ino };
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
+  }
+  let seen;
+  try {
+    seen = statSync(lock);
+  } catch {
+    return 'retry'; // released between the open and the stat
+  }
+  if (Date.now() - seen.mtimeMs <= LOCK_STALE_MS) return 'wait';
+  // A stale lock is taken over by moving it aside, which only one waiter can
+  // do. A waiter that judged the old lock stale but moved a fresh one (another
+  // waiter took over first) puts it back: `link` refuses if the path is taken.
+  const aside = `${lock}.${process.pid}.${randomBytes(4).toString('hex')}.stale`;
+  try {
+    renameSync(lock, aside);
+  } catch {
+    return 'retry';
+  }
+  try {
+    if (statSync(aside).ino !== seen.ino) linkSync(aside, lock);
+  } catch {
+    // The path was taken again meanwhile; that holder keeps it.
+  }
+  rmSync(aside, { force: true });
+  return 'retry';
+};
+
+/** Releases the lock only if it is still the one this holder created. */
+const unlock = (lock: string, held: number): void => {
+  try {
+    if (statSync(lock).ino === held) rmSync(lock, { force: true });
+  } catch {
+    // Already gone.
+  }
+};
+
+const busy = (lock: string): Error =>
+  new Error(`${lock} is held by another git-serve process; try again.`);
+
 /**
  * Runs `fn` holding the state directory's lock. The server, `git-serve pair`
  * and `git-serve connections` are separate processes that each read a state
  * file, change it and write it back; without a lock the last writer wins, and a
  * pairing racing a revocation could write the revoked connection back.
  * Not re-entrant: a function that holds the lock calls the unlocked forms.
+ * The two CLI commands use this blocking form; the server uses
+ * `withStateLockAsync`, so a held lock never stalls its other requests.
  */
 export const withStateLock = <T>(root: string, fn: () => T): T => {
   const lock = join(ensureStateDir(root), LOCK_FILE);
   const deadline = Date.now() + LOCK_WAIT_MS;
   for (;;) {
-    try {
-      closeSync(openSync(lock, 'wx', FILE_MODE));
-      break;
-    } catch (e) {
-      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
+    const got = tryLock(lock);
+    if (typeof got === 'object') {
       try {
-        if (Date.now() - statSync(lock).mtimeMs > LOCK_STALE_MS) {
-          rmSync(lock, { force: true });
-          continue;
-        }
-      } catch {
-        continue; // released between the open and the stat
+        return fn();
+      } finally {
+        unlock(lock, got.held);
       }
-      if (Date.now() > deadline) {
-        throw new Error(`${lock} is held by another git-serve process; try again.`);
-      }
+    }
+    if (got === 'wait') {
+      if (Date.now() > deadline) throw busy(lock);
       sleepSync(10);
     }
   }
-  try {
-    return fn();
-  } finally {
-    rmSync(lock, { force: true });
+};
+
+/** `withStateLock` for the server: it waits without blocking the event loop. */
+export const withStateLockAsync = async <T>(root: string, fn: () => T): Promise<T> => {
+  const lock = join(ensureStateDir(root), LOCK_FILE);
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  for (;;) {
+    const got = tryLock(lock);
+    if (typeof got === 'object') {
+      try {
+        return fn();
+      } finally {
+        unlock(lock, got.held);
+      }
+    }
+    if (got === 'wait') {
+      if (Date.now() > deadline) throw busy(lock);
+      await new Promise((r) => setTimeout(r, 10));
+    }
   }
 };
 

@@ -12,7 +12,7 @@ import { existsSync, mkdirSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
 import { flagValue, type ParsedArgs } from '../args.js';
-import { buildProviderDeepLink } from '../deepLink.js';
+import { buildProviderDeepLink, buildProviderLink } from '../deepLink.js';
 import { DEFAULT_ORIGIN, runUntilShutdown } from '../devServer.js';
 import {
   isScope,
@@ -264,10 +264,9 @@ const serveTailnet = async (
   const repos = await describeRepos(handle.root);
   // A tailnet link carries no endpoint and no credential: the host finds both
   // in the connection the user made (R-GS-9).
-  const base = origin.replace(/\/+$/, '');
   const links = repos.linked.map(({ repo, branch }) => ({
     repo,
-    url: `${base}/edit/git/${handle.namespace}/${repo}/${encodeURIComponent(branch)}`,
+    url: buildProviderLink(origin, 'git', handle.namespace, repo, branch),
   }));
 
   if (args.flags.json === true) {

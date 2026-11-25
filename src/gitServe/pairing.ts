@@ -28,6 +28,7 @@ import {
   hashSecret,
   isScope,
   withStateLock,
+  withStateLockAsync,
   writeStateFile,
   type ConnectionRecord,
   type ConnectionScope,
@@ -131,6 +132,13 @@ export const exchangePairingCode = (
   presented: string,
   now: number = Date.now(),
 ): PairingResult => withStateLock(root, () => exchangeLocked(root, presented, now));
+
+/** The same exchange for the server, waiting for the lock without blocking. */
+export const exchangePairingCodeAsync = (
+  root: string,
+  presented: string,
+  now: number = Date.now(),
+): Promise<PairingResult> => withStateLockAsync(root, () => exchangeLocked(root, presented, now));
 
 const exchangeLocked = (root: string, presented: string, now: number): PairingResult => {
   const record = readPairing(root);

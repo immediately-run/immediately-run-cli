@@ -4,8 +4,7 @@
 // The daemon's answers are the recordings in test/fixtures/tailscale-whois/,
 // made on a live tailnet by scripts/record-tailscale-whois.mjs (R3-1356). Two
 // of them, another user's device and a tagged node, needed the admin console;
-// the cases that read them skip BY NAME if either file is ever removed, and are
-// then not passing. Cases marked "derived"
+// the cases that read them FAIL if either file is ever removed. Cases marked "derived"
 // edit one field of a real recording to exercise a branch of the gate. They show
 // what the gate does with such an answer, not that the daemon gives it.
 import { test } from 'node:test';
@@ -28,7 +27,6 @@ import { runGitServeInit } from '../dist/commands/gitServe.js';
 
 const FIXTURES = fileURLToPath(new URL('./fixtures/tailscale-whois/', import.meta.url));
 const fixture = (name) => readFileSync(join(FIXTURES, name), 'utf8');
-const has = (name) => existsSync(join(FIXTURES, name));
 
 /** A recorded successful `tailscale whois --json`: exit 0, the file on stdout. */
 const recorded = (name) => parseWhois(0, fixture(name), '');
@@ -37,10 +35,6 @@ const identity = parseTailnetIdentity(fixture('status.json'));
 const PEER_ADDRESS = '100.64.0.2'; // the same-user fixture's placeholder address
 const config = (whois, allowUserIds = new Set()) => ({ self: identity.self, allowUserIds, whois });
 const answering = (answer) => async () => answer;
-
-const NEEDS_OPERATOR =
-  'not recorded yet: needs the tailnet admin console (R3-1356); run ' +
-  'scripts/record-tailscale-whois.mjs sanitize';
 
 // --- the recordings, read by the production parser ---------------------------
 
@@ -134,7 +128,7 @@ test('G-GS-7: a connection with no remote address is refused', async () => {
   assert.deepEqual(await checkPeer('', config(whois)), { ok: false, reason: 'no-address' });
 });
 
-test('G-GS-7 (recorded): another user\'s device is refused; allow-listed, it passes', { skip: has('other-user.json') ? false : NEEDS_OPERATOR }, async () => {
+test('G-GS-7 (recorded): another user\'s device is refused; allow-listed, it passes', async () => {
   const answer = recorded('other-user.json');
   assert.equal(answer.kind, 'peer');
   assert.notEqual(answer.peer.profileUserId, identity.self.userId);
@@ -143,7 +137,7 @@ test('G-GS-7 (recorded): another user\'s device is refused; allow-listed, it pas
   assert.equal(allowed.ok, true);
 });
 
-test('G-GS-7 (recorded): a tagged node is refused, even when its creator is allow-listed', { skip: has('tagged.json') ? false : NEEDS_OPERATOR }, async () => {
+test('G-GS-7 (recorded): a tagged node is refused, even when its creator is allow-listed', async () => {
   const answer = recorded('tagged.json');
   assert.equal(answer.kind, 'peer', 'the parser must be able to read what the daemon says about a tagged node');
   const everyId = new Set([answer.peer.profileUserId, answer.peer.nodeUserId]);

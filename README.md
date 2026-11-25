@@ -147,7 +147,7 @@ npx @immediately-run/cli git-serve ~/repos
 | `--port` | `7701` | Port to listen on (differs from `dev`'s, so both can run) |
 | `--bind` | `localhost` | `tailscale` serves HTTPS on this node's tailnet address to your own devices (below) |
 | `--host` | this node's MagicDNS name | Hostname for `--bind tailscale` |
-| `--cert` | `<host>.crt` beside the root, else minted by `tailscale cert` | TLS certificate for `--bind tailscale`; its `.key` sibling is the key |
+| `--cert` | `<host>.crt` in `<root>/.git-serve/`, `<root>` or the current directory, else minted into `<root>/.git-serve/` by `tailscale cert` | TLS certificate for `--bind tailscale`; its `.key` sibling is the key |
 | `--allow-login` | none | With `--bind tailscale`, also serve devices of this tailnet user (repeatable) |
 | `--origin` | `https://immediately.run` | Allowed browser origin and deep-link base; the site's local-development mediator origin is admitted with it |
 | `--origin-unsafe` | off | Allow an `--origin` outside the recognized set |

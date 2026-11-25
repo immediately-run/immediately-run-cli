@@ -8,7 +8,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile, execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, existsSync, utimesSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, existsSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -21,6 +21,7 @@ import {
   normalizeCode,
 } from '../dist/gitServe/pairing.js';
 import {
+  withStateLock,
   addConnection,
   connectionLookup,
   readConnections,
@@ -278,7 +279,15 @@ test('§10.1 on a tailnet: /pair is POST, needs the Origin, answers preflight wi
     const { code } = createPairingCode(root, 'read', s.clock.t);
     assert.equal((await s.request('/pair', { method: 'GET', bearer: code })).status, 405);
     assert.equal((await s.request('/pair', { method: 'POST', bearer: code, headers: { Origin: 'https://evil.example' } })).status, 403);
-    assert.equal((await s.request(`/pair?token=${normalizeCode(code)}`, { method: 'POST' })).status, 401);
+    // An absent code, in the query or nowhere, and one Authorization cannot
+    // carry as a bearer, are each an absent CODE (R-GS-24), not a token refusal.
+    const inQuery = await s.request(`/pair?token=${normalizeCode(code)}`, { method: 'POST' });
+    assert.equal(inQuery.status, 401);
+    assert.equal(inQuery.body.reason, 'code');
+    const none = await s.request('/pair', { method: 'POST' });
+    assert.deepEqual([none.status, none.body.reason], [401, 'code']);
+    const spaced = await s.request('/pair', { method: 'POST', headers: { Authorization: `Bearer ${code.replace('-', ' ')}` } });
+    assert.deepEqual([spaced.status, spaced.body.reason], [401, 'code']);
     const preflight = await s.request('/pair', { method: 'OPTIONS' });
     assert.equal(preflight.status, 204);
     assert.equal(preflight.headers['access-control-allow-methods'], 'POST');
@@ -431,4 +440,86 @@ test('cli: --allow-login without --bind tailscale is refused', () => {
   const res = cli(['git-serve', root, '--allow-login', 'someone@example.com']);
   assert.equal(res.code, 1);
   assert.match(res.out, /--bind tailscale/);
+});
+
+test('R-GS-24: a paired connection survives a restart of the server over the same root', async () => {
+  const root = freshRoot('restart');
+  const first = await start(root);
+  let token;
+  try {
+    const { code } = createPairingCode(root, 'read', first.clock.t);
+    token = (await first.pair(code)).body.token;
+    assert.equal((await first.request('/meta', { bearer: token })).status, 200);
+  } finally {
+    await first.handle.close();
+  }
+  const second = await start(root);
+  try {
+    // The second server read the stored connection; nothing was re-paired.
+    assert.equal((await second.request('/meta', { bearer: token })).status, 200);
+    assert.equal(readConnections(root).length, 1);
+  } finally {
+    await second.handle.close();
+  }
+});
+
+test('R17: a held state lock does not stall the server; /pair waits for it, then pairs', async () => {
+  const root = freshRoot('lock-held');
+  const s = await start(root);
+  try {
+    const { code } = createPairingCode(root, 'read', s.clock.t);
+    // Another process holds the lock (a fresh lock file, as `pair` leaves it).
+    const lock = join(root, '.git-serve', '.lock');
+    writeFileSync(lock, '');
+    const pairing = s.pair(code);
+    // While /pair waits, the server still answers: a preflight is not queued
+    // behind it, as it was when the lock spun on the event loop.
+    const t0 = Date.now();
+    assert.equal((await s.request('/pair', { method: 'OPTIONS' })).status, 204);
+    assert.ok(Date.now() - t0 < 1000, 'answered while the lock was held');
+    rmSync(lock);
+    assert.equal((await pairing).status, 200);
+  } finally {
+    await s.handle.close();
+  }
+});
+
+test('R17: a stale lock is taken over, and the takeover never removes a fresh lock', () => {
+  const root = freshRoot('lock-stale');
+  mkdirSync(join(root, '.git-serve'), { recursive: true, mode: 0o700 });
+  const lock = join(root, '.git-serve', '.lock');
+  writeFileSync(lock, '');
+  const old = (Date.now() - 60_000) / 1000;
+  utimesSync(lock, old, old);
+  // A stale lock does not block.
+  assert.equal(withStateLock(root, () => 'ran'), 'ran');
+  assert.equal(existsSync(lock), false, 'the holder released it');
+  // Release removes only the holder's own lock: if the lock was replaced while
+  // held (another process took it over), the replacement stays.
+  withStateLock(root, () => {
+    rmSync(lock);
+    writeFileSync(lock, 'someone else');
+  });
+  assert.equal(readFileSync(lock, 'utf8'), 'someone else');
+  rmSync(lock);
+  // No stray takeover files are left behind.
+  assert.deepEqual(readdirSync(join(root, '.git-serve')).filter((f) => f.endsWith('.stale')), []);
+});
+
+test('R-GS-9: a tailnet binding off loopback without its certificate does not start', () => {
+  const root = freshRoot('no-cert');
+  assert.throws(
+    () =>
+      startGitServe({
+        root,
+        origin: ORIGIN,
+        port: 0,
+        tailnet: {
+          host: HOST,
+          address: '100.64.0.1',
+          peerGate: { self: identity.self, allowUserIds: new Set(), whois: async () => sameUser },
+        },
+      }),
+    /needs its certificate and key/,
+  );
 });
