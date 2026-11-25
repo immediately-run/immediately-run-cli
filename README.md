@@ -145,10 +145,13 @@ npx @immediately-run/cli git-serve ~/repos
 | --- | --- | --- |
 | `<root>` | required | Directory holding the repositories, each `<root>/<name>.git` |
 | `--port` | `7701` | Port to listen on (differs from `dev`'s, so both can run) |
-| `--bind` | `localhost` | `tailscale` is not available yet |
+| `--bind` | `localhost` | `tailscale` serves HTTPS on this node's tailnet address to your own devices (below) |
+| `--host` | this node's MagicDNS name | Hostname for `--bind tailscale` |
+| `--cert` | `<host>.crt` in `<root>/.git-serve/`, `<root>` or the current directory, else minted into `<root>/.git-serve/` by `tailscale cert` | TLS certificate for `--bind tailscale`; its `.key` sibling is the key |
+| `--allow-login` | none | With `--bind tailscale`, also serve devices of this tailnet user (repeatable) |
 | `--origin` | `https://immediately.run` | Allowed browser origin and deep-link base; the site's local-development mediator origin is admitted with it |
 | `--origin-unsafe` | off | Allow an `--origin` outside the recognized set |
-| `--json` | off | One JSON line on stdout: `{ endpoint, namespace, port, protocol, allowPush, allowCommit, token, links: [{ repo, url }] }` |
+| `--json` | off | One JSON line on stdout: `{ endpoint, namespace, port, protocol, allowPush, allowCommit, links: [{ repo, url }] }`, plus `token` on `localhost` only |
 
 What it serves, to a request that carries the session token:
 
@@ -174,6 +177,41 @@ GET /blob?repo=<r>&sha=<blobSha>   one blob's bytes
 - A blob stays readable by its SHA for as long as git keeps the object, even
   after the branch that held it moved on. A secret that was ever committed is
   served to a token holder.
+
+### On your tailnet
+
+```sh
+# On the machine that holds the repositories:
+npx @immediately-run/cli git-serve ~/repos --bind tailscale
+
+# In a second terminal, to connect a browser on any of your devices:
+npx @immediately-run/cli git-serve pair ~/repos
+```
+
+`pair` prints a one-time code. In the browser, open Settings, Local endpoints,
+and enter the endpoint the server printed and the code. The link for a
+repository then opens on every device you have connected; it carries no
+endpoint and no credential.
+
+- **Only your own devices are served.** For every request the server asks the
+  local Tailscale daemon who owns the connecting address, and serves it only if
+  that device is signed in as the same tailnet user as this machine (or one
+  named with `--allow-login`). A tagged node, an address the daemon does not
+  know, the machine's own address and a daemon that does not answer are each
+  refused. Do not put `tailscale serve`, Funnel or another proxy in front: every
+  request would then arrive from this machine itself and be refused.
+- **A device is not enough for a browser.** A browser request also needs the
+  token its pairing produced. The server prints no token on a tailnet.
+- **A code** works once, for ten minutes, and dies after five wrong guesses from
+  anyone. `pair --scope write` grants the `write` scope; the default is `read`.
+- **`git-serve connections <root>`** lists the browsers that have paired, and
+  `--revoke <id>` removes one: its next request fails. Tokens are stored hashed
+  in `<root>/.git-serve/`.
+- The namespace on a tailnet is derived from the endpoint
+  (`<machine>-<20 hex>` over `https://<machine>.<tailnet>.ts.net:<port>`), so
+  changing the port or the machine name makes a new one.
+- Peer identity is device identity: every process and every OS user on a device
+  signed in as you can reach the server.
 
 ## Verify (the CI/deploy gate)
 

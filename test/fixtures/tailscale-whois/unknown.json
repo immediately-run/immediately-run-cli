@@ -1,0 +1,6 @@
+{
+  "command": "tailscale whois --json <an unused 100.x address>",
+  "exitCode": 1,
+  "stdout": "",
+  "stderr": "peer not found\n"
+}

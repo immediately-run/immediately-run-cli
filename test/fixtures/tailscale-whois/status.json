@@ -1,0 +1,18 @@
+{
+  "Self": {
+    "ID": "nSELF000000CNTRL",
+    "UserID": 1000000000000001,
+    "DNSName": "serving-node.example-tailnet.ts.net.",
+    "TailscaleIPs": [
+      "100.64.0.1",
+      "fd7a:115c:a1e0::1"
+    ]
+  },
+  "User": {
+    "1000000000000001": {
+      "ID": 1000000000000001,
+      "LoginName": "owner@example.com",
+      "DisplayName": "Owner Example"
+    }
+  }
+}

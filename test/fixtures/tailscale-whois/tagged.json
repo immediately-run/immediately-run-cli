@@ -1,0 +1,41 @@
+{
+  "Node": {
+    "ID": 2000000000000004,
+    "StableID": "nPEER000003CNTRL",
+    "Name": "tagged-node.example-tailnet.ts.net.",
+    "User": 4216239236938359,
+    "Key": "nodekey:0000000000000000000000000000000000000000000000000000000000000000",
+    "DiscoKey": "discokey:0000000000000000000000000000000000000000000000000000000000000000",
+    "Addresses": [
+      "100.64.0.4/32",
+      "fd7a:115c:a1e0::4/128"
+    ],
+    "AllowedIPs": [
+      "100.64.0.4/32",
+      "fd7a:115c:a1e0::4/128"
+    ],
+    "Endpoints": [
+      "192.0.2.1:41641"
+    ],
+    "HomeDERP": 26,
+    "Hostinfo": {
+      "OS": "linux",
+      "Hostname": "tagged-node",
+      "Services": []
+    },
+    "Created": "2026-11-25T10:48:17.461586362Z",
+    "Cap": 148,
+    "Tags": [
+      "tag:probe"
+    ],
+    "Online": true,
+    "ComputedName": "tagged-node",
+    "ComputedNameWithHost": "tagged-node"
+  },
+  "UserProfile": {
+    "ID": 4216239236938359,
+    "LoginName": "tagged-devices",
+    "DisplayName": "Tagged Devices"
+  },
+  "CapMap": null
+}

@@ -40,5 +40,15 @@ core_concepts §9).
   `test/fixtures/git-serve-namespace-vectors.json`), `guards.ts` the browser-class guards
   of §10.1. The guards are deliberately not `devServer.ts`'s: `Origin` is required, the
   token rides in `Authorization` only, and the Host header must carry the port.
-- **`src/deepLink.ts`** — the one place the `ir-endpoint`/`ir-token` fragment is written;
-  `dev`, `agent`, `llm` and `git-serve` build their links through it.
+- **`src/deepLink.ts`** — the one place the `ir-endpoint`/`ir-token` fragment and the
+  `/edit/<provider>/…` route are written; `dev`, `agent`, `llm` and `git-serve` build their
+  links through it, a tailnet `git-serve` link through `buildProviderLink` (no fragment).
+  Verified on 2026-11-25.
+- **`src/gitServe/peerGate.ts`** — R-GS-16, the tailnet peer gate: stable user ids only,
+  fail closed, tagged nodes and the node's own address refused. Pure over an injected
+  `whois`; `tailscaleWhois.ts` reads `tailscale whois --json` and `status --json`. The
+  field names come from recordings made on a live tailnet (roadmap R3-1356,
+  `test/fixtures/tailscale-whois/`). Verified on 2026-11-25.
+- **`src/gitServe/pairing.ts` / `connections.ts`** — R-GS-24: a 40-bit one-time code that
+  dies on success, on the fifth failure from any caller, or at ten minutes; 256-bit
+  connection tokens stored hashed and revocable at the next request. Verified on 2026-11-25.
