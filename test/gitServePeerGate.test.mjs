@@ -3,9 +3,9 @@
 //
 // The daemon's answers are the recordings in test/fixtures/tailscale-whois/,
 // made on a live tailnet by scripts/record-tailscale-whois.mjs (R3-1356). Two
-// recordings need the tailnet's admin console and do not exist yet: another
-// user's device and a tagged node. The cases that read them are SKIPPED BY NAME
-// until the files are recorded; they are not passing. Cases marked "derived"
+// of them, another user's device and a tagged node, needed the admin console;
+// the cases that read them skip BY NAME if either file is ever removed, and are
+// then not passing. Cases marked "derived"
 // edit one field of a real recording to exercise a branch of the gate. They show
 // what the gate does with such an answer, not that the daemon gives it.
 import { test } from 'node:test';
