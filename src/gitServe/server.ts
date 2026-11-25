@@ -11,6 +11,8 @@
  *             No peer gate (there is no tailnet), no `/pair`, no git routes.
  *   tailnet   the node's tailnet address, HTTPS. Every request passes the peer
  *             gate. Credentials are per-browser connections minted by `/pair`.
+ *             Stock git clients clone (and, with `allowPush`, push) through the
+ *             smart-HTTP routes (`smartHttp.ts`).
  *
  * It reads committed objects only; there is no working tree and no stream route.
  */
@@ -29,7 +31,12 @@ import { checkPeer, type PeerGateConfig } from './peerGate.js';
 import { GIT_SERVE_PROTOCOL, GIT_SERVE_SERVER, type RunGit } from './protocol.js';
 import { answerRead, type ReadAnswer } from './readRoutes.js';
 import { runGit as realRunGit, spawnGit } from './runGit.js';
+import { hasBrowserHeaders, planGitRequest, runBackend } from './smartHttp.js';
 import { loadInstanceId } from './state.js';
+
+/** How long a connection whose answer went out before its body was read stays
+ *  half-open for that answer to be read. */
+export const UNREAD_BODY_GRACE_MS = 2000;
 
 export interface TailnetBinding {
   /** The MagicDNS name: the Host pin, and the origin the namespace is bound to. */
@@ -55,6 +62,11 @@ export interface GitServeOptions {
   token?: string;
   /** Tailnet bind. Exactly one of `token` and `tailnet` is given. */
   tailnet?: TailnetBinding;
+  /** `--allow-push`: git clients may push (fast-forward only, no deletes). It is
+   *  the only thing that turns push on; a repository's own config cannot. */
+  allowPush?: boolean;
+  /** The git routes' idle bound (default `GIT_IDLE_TIMEOUT_MS`); tests shorten it. */
+  gitIdleTimeoutMs?: number;
   /** Tests inject a `runGit` to move a ref between two of the server's own git calls. */
   runGit?: RunGit;
   /** Where refusals are logged (default: stderr). Never receives a credential. */
@@ -169,6 +181,8 @@ export const startGitServe = (opts: GitServeOptions): Promise<GitServeHandle> =>
   const instanceId = loadInstanceId(root);
   const runGit = opts.runGit ?? realRunGit;
   const log = opts.log ?? ((line: string) => console.error(line));
+  /** Responses streamed from `git http-backend` (see `handler`). */
+  const piped = new WeakSet<http.ServerResponse>();
   const now = opts.now ?? (() => Date.now());
   const origins = admittedOrigins(opts.origin);
   const tailnet = opts.tailnet;
@@ -226,8 +240,17 @@ export const startGitServe = (opts: GitServeOptions): Promise<GitServeHandle> =>
       return;
     }
 
+    // A browser cannot use the git-client routes (R-GS-15): a request there
+    // that carries `Origin` or any `Sec-Fetch-*` header is refused before
+    // anything else, the peer gate included.
+    if (admission.kind === 'git' && hasBrowserHeaders(req.headers)) {
+      refuse(403, 'browser', {});
+      return;
+    }
+
     // 2. On a tailnet, the peer gate: every request of both classes, before any
     //    credential is looked at. A valid credential never stands in for it.
+    let peerLogin = '';
     if (tailnet !== undefined) {
       const peer = await checkPeer(req.socket.remoteAddress, tailnet.peerGate);
       if (!peer.ok) {
@@ -238,11 +261,36 @@ export const startGitServe = (opts: GitServeOptions): Promise<GitServeHandle> =>
         refuse(403, reason, admission.kind === 'browser' ? admission.cors : {});
         return;
       }
+      peerLogin = peer.login;
     }
 
-    // The git-client class is routed here and answered by the smart-HTTP item.
+    // The git-client class: no token, no CORS, no OPTIONS. The peer gate above
+    // is its whole gate; what is served is decided by `planGitRequest`.
     if (admission.kind === 'git') {
-      refuse(404, 'not-found', {});
+      // The request line as sent: the route match reads it undecoded.
+      const target = req.url ?? '/';
+      const mark = target.indexOf('?');
+      const planned = planGitRequest(
+        mark === -1 ? target : target.slice(0, mark),
+        mark === -1 ? '' : target.slice(mark),
+        req.method,
+        req.headers,
+        {
+          root,
+          allowPush: opts.allowPush === true,
+          remoteAddress: req.socket.remoteAddress ?? '',
+          remoteUser: peerLogin,
+        },
+      );
+      if (!planned.ok) {
+        refuse(planned.status, planned.reason, {});
+        return;
+      }
+      piped.add(res);
+      runBackend(planned.request, req, res, (status, reason) => refuse(status, reason, {}), {
+        idleTimeoutMs: opts.gitIdleTimeoutMs,
+        log,
+      });
       return;
     }
 
@@ -306,6 +354,29 @@ export const startGitServe = (opts: GitServeOptions): Promise<GitServeHandle> =>
   };
 
   const handler: http.RequestListener = (req, res) => {
+    // An answer sent before the request's body was read (a refusal, or any route
+    // that takes no body) closes the connection: on a tailnet `requestTimeout`
+    // is off, so otherwise a client could trickle an endless body into it. The
+    // answer says `Connection: close`, so no client reuses the connection; it
+    // is half-closed so the answer is read, then cut after a grace. A git
+    // request piped to `http-backend` keeps its connection (git reuses it
+    // between rounds) and has its own idle bound.
+    const writeHead = res.writeHead;
+    res.writeHead = function (this: http.ServerResponse, ...args: unknown[]) {
+      if (!req.complete && !piped.has(res)) res.setHeader('Connection', 'close');
+      return (writeHead as (...a: unknown[]) => http.ServerResponse).apply(this, args);
+    } as typeof res.writeHead;
+    res.once('finish', () => {
+      if (req.complete) return;
+      if (piped.has(res)) {
+        // http-backend answered without reading the whole body: nothing more
+        // can be said on this connection.
+        req.socket.destroy();
+        return;
+      }
+      req.socket.end();
+      setTimeout(() => req.socket.destroy(), UNREAD_BODY_GRACE_MS).unref();
+    });
     serve(req, res).catch(() => {
       // Any failure while answering ends the request: a 500 if nothing was sent
       // yet, a cut connection otherwise. A request is never left open, and a
@@ -320,6 +391,12 @@ export const startGitServe = (opts: GitServeOptions): Promise<GitServeHandle> =>
       tailnet?.cert !== undefined && tailnet.key !== undefined
         ? https.createServer({ cert: tailnet.cert, key: tailnet.key }, handler)
         : http.createServer(handler);
+    // Node's default `requestTimeout` (300 s) bounds a whole request, body
+    // included, which would cut a long push. On a tailnet the git routes carry
+    // their own idle bound instead (`GIT_IDLE_TIMEOUT_MS`, smartHttp.ts);
+    // `headersTimeout` still bounds a request's head, and an answer sent before
+    // its body was read closes the connection (`handler`).
+    if (tailnet !== undefined) server.requestTimeout = 0;
     const sockets = new Set<Socket>();
     server.on('connection', (socket) => {
       sockets.add(socket);

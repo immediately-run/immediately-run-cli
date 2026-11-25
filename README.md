@@ -149,6 +149,7 @@ npx @immediately-run/cli git-serve ~/repos
 | `--host` | this node's MagicDNS name | Hostname for `--bind tailscale` |
 | `--cert` | `<host>.crt` in `<root>/.git-serve/`, `<root>` or the current directory, else minted into `<root>/.git-serve/` by `tailscale cert` | TLS certificate for `--bind tailscale`; its `.key` sibling is the key |
 | `--allow-login` | none | With `--bind tailscale`, also serve devices of this tailnet user (repeatable) |
+| `--allow-push` | off | With `--bind tailscale`, let git clients push branches (fast-forward only, no branch deletes; tags and other refs cannot be pushed) |
 | `--origin` | `https://immediately.run` | Allowed browser origin and deep-link base; the site's local-development mediator origin is admitted with it |
 | `--origin-unsafe` | off | Allow an `--origin` outside the recognized set |
 | `--json` | off | One JSON line on stdout: `{ endpoint, namespace, port, protocol, allowPush, allowCommit, links: [{ repo, url }] }`, plus `token` on `localhost` only |
@@ -212,6 +213,38 @@ endpoint and no credential.
   changing the port or the machine name makes a new one.
 - Peer identity is device identity: every process and every OS user on a device
   signed in as you can reach the server.
+
+### Plain git against the same server
+
+On a tailnet the server also answers git's own HTTP protocol, so stock git
+works from any of your devices, with no credential helper to set up:
+
+```sh
+git clone https://<machine>.<tailnet>.ts.net:7701/notes.git
+```
+
+- `git clone` and `git fetch` are always on for your own devices (the peer
+  check above is the whole gate; there is no token on these routes).
+- `git push` needs the server started with `--allow-push`. A push must be a
+  fast-forward and cannot delete a branch. Rewriting a branch means doing it on
+  the serving machine's disk.
+- A push can only update branches (`refs/heads/`). Tags and every other ref
+  are hidden from push, so `git push --tags` (or `push.followTags`) fails with
+  "deny updating a hidden ref"; create tags on the serving machine. git's
+  fast-forward and delete rules cover branches only, so without this a pushed
+  tag could be moved or deleted.
+- A repository's own config cannot turn push on, or force-pushes and deletes
+  back on: the server sets `http.receivepack`, `receive.denyNonFastForwards`,
+  `receive.denyDeletes` and `receive.hideRefs` itself for every request.
+- Only `/<name>.git/info/refs?service=…`, `/<name>.git/git-upload-pack` and
+  `/<name>.git/git-receive-pack` are served. The file routes of the older
+  "dumb" protocol are not.
+- Nothing is created by pushing to a name that does not exist. Use
+  `git-serve init`.
+- A browser cannot use these routes: a request that carries an `Origin` or a
+  `Sec-Fetch-*` header is refused, and no CORS header is ever sent.
+- On `localhost` these routes do not exist: the repository is on the same disk,
+  so push to its path.
 
 ## Verify (the CI/deploy gate)
 
