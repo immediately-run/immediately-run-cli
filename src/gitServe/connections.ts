@@ -17,7 +17,6 @@ import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import {
   closeSync,
   existsSync,
-  linkSync,
   openSync,
   readFileSync,
   renameSync,
@@ -72,15 +71,17 @@ export const writeStateFile = (root: string, name: string, content: string): voi
 
 const LOCK_FILE = '.lock';
 const LOCK_WAIT_MS = 5000;
-/** A lock older than this was left by a process that died holding it. */
+/** A lock in the old format (no holder pid) is stale after this long. */
 const LOCK_STALE_MS = 30_000;
+/** A live holder never holds the lock this long; past it, a reused pid is assumed. */
+const LOCK_ABANDONED_MS = 10 * 60_000;
 
 const sleepSync = (ms: number): void => {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 };
 
-/** The nonce a lock file holds, or null when it is gone or unreadable. */
-const lockNonce = (path: string): string | null => {
+/** A lock file's content, or null when it is gone or unreadable. */
+const readLock = (path: string): string | null => {
   try {
     return readFileSync(path, 'utf8');
   } catch {
@@ -88,54 +89,92 @@ const lockNonce = (path: string): string | null => {
   }
 };
 
-/**
- * One attempt at the lock: the holder's nonce when taken, else whether to wait.
- * A lock is identified by a random nonce written into it, never by its inode:
- * a file created just after another is removed can reuse its inode number.
- */
-const tryLock = (lock: string): { held: string } | 'retry' | 'wait' => {
-  const nonce = randomBytes(16).toString('hex');
+const processAlive = (pid: number): boolean => {
   try {
-    const fd = openSync(lock, 'wx', FILE_MODE);
-    try {
-      writeSync(fd, nonce);
-    } finally {
-      closeSync(fd);
-    }
-    return { held: nonce };
+    process.kill(pid, 0);
+    return true;
   } catch (e) {
-    if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
+    return (e as NodeJS.ErrnoException).code === 'EPERM';
   }
-  let mtimeMs: number;
-  try {
-    mtimeMs = statSync(lock).mtimeMs;
-  } catch {
-    return 'retry'; // released between the open and the stat
-  }
-  if (Date.now() - mtimeMs <= LOCK_STALE_MS) return 'wait';
-  const seen = lockNonce(lock);
-  // A stale lock is taken over by moving it aside, which only one waiter can
-  // do. A waiter that judged the old lock stale but moved a different one
-  // (another waiter took over first) puts it back: `link` refuses if the path
-  // is taken again.
-  const aside = `${lock}.${process.pid}.${randomBytes(4).toString('hex')}.stale`;
-  try {
-    renameSync(lock, aside);
-  } catch {
-    return 'retry';
-  }
-  try {
-    if (lockNonce(aside) !== seen) linkSync(aside, lock);
-  } catch {
-    // The path was taken again meanwhile; that holder keeps it.
-  }
-  rmSync(aside, { force: true });
-  return 'retry';
 };
 
-/** Releases the lock only if it still holds this holder's nonce. */
-const unlock = (lock: string, held: string): void => {
-  if (lockNonce(lock) === held) rmSync(lock, { force: true });
+/**
+ * Whether a lock was left by a holder that can no longer release it. A lock
+ * holds `<pid> <nonce>`; it is stale when that process is gone (the state
+ * directory is local, so the pid is this machine's). Age alone never makes a
+ * live holder's lock stale: a slow holder could release it and another take it
+ * between the judgement and the removal (cli#63 review, round 2).
+ */
+const isStale = (content: string, mtimeMs: number): boolean => {
+  const age = Date.now() - mtimeMs;
+  const m = /^(\d+) [0-9a-f]+$/.exec(content);
+  if (m === null) return age > LOCK_STALE_MS; // the old format, or a half-written lock
+  return !processAlive(Number(m[1])) || age > LOCK_ABANDONED_MS;
+};
+
+/** Creates `path` exclusively with this holder's line; the line, or null if taken. */
+const createLock = (path: string): string | null => {
+  const line = `${process.pid} ${randomBytes(16).toString('hex')}`;
+  let fd: number;
+  try {
+    fd = openSync(path, 'wx', FILE_MODE);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'EEXIST') return null;
+    throw e;
+  }
+  try {
+    writeSync(fd, line);
+  } finally {
+    closeSync(fd);
+  }
+  return line;
+};
+
+/** Releases a lock only if it still holds this holder's line. */
+const unlock = (path: string, held: string): void => {
+  if (readLock(path) === held) rmSync(path, { force: true });
+};
+
+/** Whether `path` exists and is stale. */
+const staleAt = (path: string): boolean => {
+  const content = readLock(path);
+  if (content === null) return false;
+  try {
+    return isStale(content, statSync(path).mtimeMs);
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Removes a stale lock. Only the holder of `<lock>.takeover` may, and it judges
+ * the lock again while holding it. While the stale lock exists no one can create
+ * a fresh one, and its dead holder cannot remove it, so what is judged stale is
+ * what is removed. A takeover lock whose holder died is removed the same way;
+ * that case needs a process to die inside the takeover itself.
+ */
+/** True when this waiter held the takeover (whether or not it removed anything). */
+const takeOver = (lock: string): boolean => {
+  const takeover = `${lock}.takeover`;
+  const mine = createLock(takeover);
+  if (mine === null) {
+    if (staleAt(takeover)) rmSync(takeover, { force: true });
+    return false;
+  }
+  try {
+    if (staleAt(lock)) rmSync(lock, { force: true });
+  } finally {
+    unlock(takeover, mine);
+  }
+  return true;
+};
+
+/** One attempt at the lock: the holder's line when taken, else whether to wait. */
+const tryLock = (lock: string): { held: string } | 'retry' | 'wait' => {
+  const held = createLock(lock);
+  if (held !== null) return { held };
+  if (!staleAt(lock)) return 'wait';
+  return takeOver(lock) ? 'retry' : 'wait';
 };
 
 const busy = (lock: string): Error =>

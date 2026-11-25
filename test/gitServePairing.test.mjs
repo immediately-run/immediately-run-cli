@@ -7,7 +7,9 @@
 // `git-serve pair` command calls, and by the built CLI itself in the CLI cases.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFile, execFileSync } from 'node:child_process';
+import { execFile, execFileSync, spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, existsSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -22,6 +24,7 @@ import {
 } from '../dist/gitServe/pairing.js';
 import {
   withStateLock,
+  withStateLockAsync,
   addConnection,
   connectionLookup,
   readConnections,
@@ -522,4 +525,65 @@ test('R-GS-9: a tailnet binding off loopback without its certificate does not st
       }),
     /needs its certificate and key/,
   );
+});
+
+const lockedRoot = (name, content, ageMs = 0) => {
+  const root = freshRoot(name);
+  mkdirSync(join(root, '.git-serve'), { recursive: true, mode: 0o700 });
+  const lock = join(root, '.git-serve', '.lock');
+  writeFileSync(lock, content);
+  const t = (Date.now() - ageMs) / 1000;
+  utimesSync(lock, t, t);
+  return { root, lock };
+};
+
+test('R17 (round 2): a lock taken over between the stale judgement and the removal survives', async () => {
+  // The reviewer's interleaving: this waiter judges an old lock stale, and
+  // before it acts another waiter has taken over and holds a fresh lock.
+  const { root, lock } = lockedRoot('lock-race', 'n0', 60_000);
+  const fresh = `${process.pid} 00ff00ff`;
+  const realStat = fs.statSync;
+  let fired = false;
+  fs.statSync = function (p, ...rest) {
+    const r = realStat.call(this, p, ...rest);
+    if (!fired && p === lock) {
+      fired = true;
+      fs.rmSync(lock);
+      fs.writeFileSync(lock, fresh);
+    }
+    return r;
+  };
+  syncBuiltinESMExports();
+  try {
+    let seenWhileWaiting;
+    setTimeout(() => {
+      seenWhileWaiting = readFileSync(lock, 'utf8');
+      rmSync(lock); // the other holder releases
+    }, 300);
+    const inside = await withStateLockAsync(root, () => readFileSync(lock, 'utf8'));
+    assert.equal(fired, true, 'the interleaving was injected');
+    assert.equal(seenWhileWaiting, fresh, "the other holder's lock was not removed");
+    assert.notEqual(inside, fresh);
+  } finally {
+    fs.statSync = realStat;
+    syncBuiltinESMExports();
+  }
+});
+
+test("R17 (round 2): a lock whose holder process is gone is taken over at once; a live holder's is not", async () => {
+  const dead = spawnSync(process.execPath, ['-e', '0']).pid;
+  const { root: r1, lock: l1 } = lockedRoot('lock-dead', `${dead} 00ff`);
+  const t0 = Date.now();
+  assert.equal(withStateLock(r1, () => 'ran'), 'ran');
+  assert.ok(Date.now() - t0 < 1000, 'no wait for a dead holder');
+  assert.equal(existsSync(l1), false);
+  // A live holder's lock is not stale however old it looks, short of abandonment.
+  const { root: r2, lock: l2 } = lockedRoot('lock-live', `${process.pid} 00ff`, 60_000);
+  let waited = false;
+  setTimeout(() => {
+    waited = true;
+    rmSync(l2);
+  }, 300);
+  assert.equal(await withStateLockAsync(r2, () => waited), true, 'it waited for the live holder');
+  assert.equal(existsSync(`${l2}.takeover`), false);
 });
