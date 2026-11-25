@@ -24,6 +24,7 @@ import {
   rmSync,
   statSync,
   writeFileSync,
+  writeSync,
 } from 'node:fs';
 import { join } from 'node:path';
 
@@ -78,24 +79,45 @@ const sleepSync = (ms: number): void => {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 };
 
-/** One attempt at the lock: its inode when taken, else whether to wait. */
-const tryLock = (lock: string): { held: number } | 'retry' | 'wait' => {
+/** The nonce a lock file holds, or null when it is gone or unreadable. */
+const lockNonce = (path: string): string | null => {
   try {
-    closeSync(openSync(lock, 'wx', FILE_MODE));
-    return { held: statSync(lock).ino };
+    return readFileSync(path, 'utf8');
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * One attempt at the lock: the holder's nonce when taken, else whether to wait.
+ * A lock is identified by a random nonce written into it, never by its inode:
+ * a file created just after another is removed can reuse its inode number.
+ */
+const tryLock = (lock: string): { held: string } | 'retry' | 'wait' => {
+  const nonce = randomBytes(16).toString('hex');
+  try {
+    const fd = openSync(lock, 'wx', FILE_MODE);
+    try {
+      writeSync(fd, nonce);
+    } finally {
+      closeSync(fd);
+    }
+    return { held: nonce };
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
   }
-  let seen;
+  let mtimeMs: number;
   try {
-    seen = statSync(lock);
+    mtimeMs = statSync(lock).mtimeMs;
   } catch {
     return 'retry'; // released between the open and the stat
   }
-  if (Date.now() - seen.mtimeMs <= LOCK_STALE_MS) return 'wait';
+  if (Date.now() - mtimeMs <= LOCK_STALE_MS) return 'wait';
+  const seen = lockNonce(lock);
   // A stale lock is taken over by moving it aside, which only one waiter can
-  // do. A waiter that judged the old lock stale but moved a fresh one (another
-  // waiter took over first) puts it back: `link` refuses if the path is taken.
+  // do. A waiter that judged the old lock stale but moved a different one
+  // (another waiter took over first) puts it back: `link` refuses if the path
+  // is taken again.
   const aside = `${lock}.${process.pid}.${randomBytes(4).toString('hex')}.stale`;
   try {
     renameSync(lock, aside);
@@ -103,7 +125,7 @@ const tryLock = (lock: string): { held: number } | 'retry' | 'wait' => {
     return 'retry';
   }
   try {
-    if (statSync(aside).ino !== seen.ino) linkSync(aside, lock);
+    if (lockNonce(aside) !== seen) linkSync(aside, lock);
   } catch {
     // The path was taken again meanwhile; that holder keeps it.
   }
@@ -111,13 +133,9 @@ const tryLock = (lock: string): { held: number } | 'retry' | 'wait' => {
   return 'retry';
 };
 
-/** Releases the lock only if it is still the one this holder created. */
-const unlock = (lock: string, held: number): void => {
-  try {
-    if (statSync(lock).ino === held) rmSync(lock, { force: true });
-  } catch {
-    // Already gone.
-  }
+/** Releases the lock only if it still holds this holder's nonce. */
+const unlock = (lock: string, held: string): void => {
+  if (lockNonce(lock) === held) rmSync(lock, { force: true });
 };
 
 const busy = (lock: string): Error =>
