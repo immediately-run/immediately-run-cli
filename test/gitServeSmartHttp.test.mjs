@@ -545,11 +545,22 @@ test('a fetch with many haves goes up gzipped and is answered', async () => {
     const clone = join(dir, 'clone');
     const cloned = await tryGit(dir, [...s.client, 'clone', '-q', s.url('notes'), clone]);
     assert.equal(cloned.code, 0, cloned.out);
-    // Local commits the server has never seen: each is a `have` line, enough
-    // of them that the client gzips its request body.
-    git(clone, ['config', 'user.email', 'test@example.com']);
-    git(clone, ['config', 'user.name', 'Test']);
-    for (let i = 0; i < 60; i++) git(clone, ['commit', '-q', '--allow-empty', '-m', `local ${i}`]);
+    // Local commits the server has never seen: each is a `have` line. git
+    // gzips a request body over 1 KiB; 60 haves stayed under it on git 2.56,
+    // 300 do not. Made in one fast-import rather than 300 commits.
+    const tip = git(clone, ['rev-parse', 'HEAD']);
+    // Dated after the clone's tip: git walks haves newest first, and the tip
+    // (which the server has) would otherwise end the negotiation at once.
+    const now = Math.floor(Date.now() / 1000) + 3600;
+    let stream = '';
+    for (let i = 0; i < 300; i++) {
+      const msg = `local ${i}\n`;
+      stream += `commit refs/heads/main\ncommitter Test <test@example.com> ${now + i} +0000\ndata ${msg.length}\n${msg}`;
+      if (i === 0) stream += `from ${tip}\n`;
+      stream += '\n';
+    }
+    execFileSync('git', ['-C', clone, 'fast-import', '--quiet'], { input: stream });
+    git(clone, ['reset', '-q', '--hard', 'main']);
     // And a commit on the server the clone does not have.
     writeFileSync(join(work, 'a.txt'), 'three\n');
     git(work, ['commit', '-q', '-am', 'three']);
