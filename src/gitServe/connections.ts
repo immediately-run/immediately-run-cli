@@ -150,10 +150,15 @@ const staleAt = (path: string): boolean => {
  * Removes a stale lock. Only the holder of `<lock>.takeover` may, and it judges
  * the lock again while holding it. While the stale lock exists no one can create
  * a fresh one, and its dead holder cannot remove it, so what is judged stale is
- * what is removed. A takeover lock whose holder died is removed the same way;
- * that case needs a process to die inside the takeover itself.
+ * what is removed. Returns true when this waiter held the takeover, whether or
+ * not it removed anything.
+ *
+ * Residual, accepted: a takeover lock whose holder DIED is removed by judging
+ * and then removing, with no guard, so another waiter's live takeover lock
+ * could be removed in between. That needs a process killed inside the
+ * takeover section (a few microseconds), and then a second takeover racing
+ * through the same gap; the result would be two holders of the state lock.
  */
-/** True when this waiter held the takeover (whether or not it removed anything). */
 const takeOver = (lock: string): boolean => {
   const takeover = `${lock}.takeover`;
   const mine = createLock(takeover);

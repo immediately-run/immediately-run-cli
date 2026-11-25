@@ -505,8 +505,8 @@ test('R17: a stale lock is taken over, and the takeover never removes a fresh lo
   });
   assert.equal(readFileSync(lock, 'utf8'), 'someone else');
   rmSync(lock);
-  // No stray takeover files are left behind.
-  assert.deepEqual(readdirSync(join(root, '.git-serve')).filter((f) => f.endsWith('.stale')), []);
+  // The takeover of the stale lock left no takeover lock behind.
+  assert.equal(existsSync(`${lock}.takeover`), false);
 });
 
 test('R-GS-9: a tailnet binding off loopback without its certificate does not start', () => {
@@ -577,6 +577,7 @@ test("R17 (round 2): a lock whose holder process is gone is taken over at once; 
   assert.equal(withStateLock(r1, () => 'ran'), 'ran');
   assert.ok(Date.now() - t0 < 1000, 'no wait for a dead holder');
   assert.equal(existsSync(l1), false);
+  assert.equal(existsSync(`${l1}.takeover`), false, 'the takeover lock was released');
   // A live holder's lock is not stale however old it looks, short of abandonment.
   const { root: r2, lock: l2 } = lockedRoot('lock-live', `${process.pid} 00ff`, 60_000);
   let waited = false;
