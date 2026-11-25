@@ -119,17 +119,22 @@ export interface BackendRequest {
  *  be read by `http-backend` as if the request had sent it. */
 const INHERITED_ENV = new Set([
   'PATH', 'HOME', 'TMPDIR', 'TMP', 'TEMP', 'LANG', 'LANGUAGE', 'TZ', 'USER', 'LOGNAME',
-  // Windows
-  'SystemRoot', 'SYSTEMROOT', 'windir', 'ComSpec', 'PATHEXT', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'ProgramData',
+  // Windows, where names are case-insensitive (`Path`, `SystemRoot`): matched uppercased there.
+  'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'PROGRAMDATA',
 ]);
 
 /** The whole environment of the `git http-backend` child. Built, never copied
  *  from the request: every request-derived value here was parsed or checked,
  *  and of this process's own environment only `INHERITED_ENV` and `LC_*` pass. */
-export const backendEnv = (req: BackendRequest, base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv => {
+export const backendEnv = (
+  req: BackendRequest,
+  base: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): NodeJS.ProcessEnv => {
   const kept: NodeJS.ProcessEnv = {};
   for (const [k, v] of Object.entries(base)) {
-    if (INHERITED_ENV.has(k) || k.startsWith('LC_')) kept[k] = v;
+    const name = platform === 'win32' ? k.toUpperCase() : k;
+    if (INHERITED_ENV.has(name) || name.startsWith('LC_')) kept[k] = v;
   }
   const env = gitEnv(kept); // adds git's own no-prompt, no-lock settings
   const suffix = req.route.phase === 'advertise' ? 'info/refs' : req.route.service;

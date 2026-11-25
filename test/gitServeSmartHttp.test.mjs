@@ -421,6 +421,14 @@ test('the forced config: push is the flag\'s alone, and never the request\'s', (
     }
     assert.equal(env.REMOTE_USER, 'owner@example.com', 'REMOTE_USER is the peer gate\'s, never inherited');
     assert.equal(env.PATH, process.env.PATH, 'PATH passes, so git finds its helpers');
+    // Windows spells it `Path`; there the allowlist ignores case. Elsewhere it does not.
+    const route = { repo: 'notes', service: 'git-upload-pack', phase: 'rpc' };
+    const req = { root: '/srv/repos', route, method: 'POST', allowPush: false, remoteAddress: '', remoteUser: '' };
+    const win = backendEnv(req, { Path: 'C:\\Windows', SystemRoot: 'C:\\Windows', CONTENT_LENGTH: '1' }, 'win32');
+    assert.equal(win.Path, 'C:\\Windows');
+    assert.equal(win.SystemRoot, 'C:\\Windows');
+    assert.equal(win.CONTENT_LENGTH, undefined);
+    assert.equal(backendEnv(req, { Path: '/x' }, 'linux').Path, undefined);
     const count = Number(env.GIT_CONFIG_COUNT);
     const forced = {};
     for (let i = 0; i < count; i++) forced[env[`GIT_CONFIG_KEY_${i}`]] = env[`GIT_CONFIG_VALUE_${i}`];
@@ -623,6 +631,42 @@ test('the child\'s stderr reaches the server log, never the client', async () =>
     assert.ok(logged(), s.logs.join('\n'));
     assert.doesNotMatch(res.body.toString('latin1'), /fatal:/);
   } finally {
+    await s.handle.close();
+  }
+});
+
+test('a refused request\'s unread body cannot hold the connection open: it is closed after the answer', async () => {
+  const { root } = makeRoot();
+  const unknown = JSON.parse(readFileSync(join(FIXTURES, 'unknown.json'), 'utf8'));
+  const s = await serve(root, { allowPush: true, whois: async () => parseWhois(unknown.exitCode, unknown.stdout, unknown.stderr) });
+  let trickle;
+  try {
+    const started = Date.now();
+    const outcome = await new Promise((resolvePromise) => {
+      let status;
+      let connection;
+      const req = http.request({
+        host: '127.0.0.1',
+        port: s.handle.port,
+        path: '/notes.git/git-receive-pack',
+        method: 'POST',
+        headers: { Host: `${HOST}:${s.handle.port}`, 'Content-Type': 'application/x-git-receive-pack-request', 'Content-Length': '1000000000' },
+      }, (res) => {
+        status = res.statusCode;
+        connection = res.headers.connection;
+        res.resume();
+      });
+      req.on('error', () => {});
+      req.on('socket', (socket) => socket.on('close', () => resolvePromise({ status, connection, closedAfter: Date.now() - started })));
+      // One byte every 100 ms, forever: only the server can end this.
+      trickle = setInterval(() => req.write('0'), 100);
+    });
+    assert.equal(outcome.status, 403, 'the refusal is read before the connection closes');
+    assert.equal(outcome.connection, 'close', 'no client reuses the connection');
+    assert.ok(outcome.closedAfter < 10000, `closed after ${outcome.closedAfter} ms`);
+    assert.ok(s.logs.some((l) => l.includes('(unknown-peer)')), s.logs.join('\n'));
+  } finally {
+    clearInterval(trickle);
     await s.handle.close();
   }
 });

@@ -34,6 +34,10 @@ import { runGit as realRunGit, spawnGit } from './runGit.js';
 import { hasBrowserHeaders, planGitRequest, runBackend } from './smartHttp.js';
 import { loadInstanceId } from './state.js';
 
+/** How long a connection whose answer went out before its body was read stays
+ *  half-open for that answer to be read. */
+export const UNREAD_BODY_GRACE_MS = 2000;
+
 export interface TailnetBinding {
   /** The MagicDNS name: the Host pin, and the origin the namespace is bound to. */
   host: string;
@@ -177,6 +181,8 @@ export const startGitServe = (opts: GitServeOptions): Promise<GitServeHandle> =>
   const instanceId = loadInstanceId(root);
   const runGit = opts.runGit ?? realRunGit;
   const log = opts.log ?? ((line: string) => console.error(line));
+  /** Responses streamed from `git http-backend` (see `handler`). */
+  const piped = new WeakSet<http.ServerResponse>();
   const now = opts.now ?? (() => Date.now());
   const origins = admittedOrigins(opts.origin);
   const tailnet = opts.tailnet;
@@ -280,6 +286,7 @@ export const startGitServe = (opts: GitServeOptions): Promise<GitServeHandle> =>
         refuse(planned.status, planned.reason, {});
         return;
       }
+      piped.add(res);
       runBackend(planned.request, req, res, (status, reason) => refuse(status, reason, {}), {
         idleTimeoutMs: opts.gitIdleTimeoutMs,
         log,
@@ -347,6 +354,29 @@ export const startGitServe = (opts: GitServeOptions): Promise<GitServeHandle> =>
   };
 
   const handler: http.RequestListener = (req, res) => {
+    // An answer sent before the request's body was read (a refusal, or any route
+    // that takes no body) closes the connection: on a tailnet `requestTimeout`
+    // is off, so otherwise a client could trickle an endless body into it. The
+    // answer says `Connection: close`, so no client reuses the connection; it
+    // is half-closed so the answer is read, then cut after a grace. A git
+    // request piped to `http-backend` keeps its connection (git reuses it
+    // between rounds) and has its own idle bound.
+    const writeHead = res.writeHead;
+    res.writeHead = function (this: http.ServerResponse, ...args: unknown[]) {
+      if (!req.complete && !piped.has(res)) res.setHeader('Connection', 'close');
+      return (writeHead as (...a: unknown[]) => http.ServerResponse).apply(this, args);
+    } as typeof res.writeHead;
+    res.once('finish', () => {
+      if (req.complete) return;
+      if (piped.has(res)) {
+        // http-backend answered without reading the whole body: nothing more
+        // can be said on this connection.
+        req.socket.destroy();
+        return;
+      }
+      req.socket.end();
+      setTimeout(() => req.socket.destroy(), UNREAD_BODY_GRACE_MS).unref();
+    });
     serve(req, res).catch(() => {
       // Any failure while answering ends the request: a 500 if nothing was sent
       // yet, a cut connection otherwise. A request is never left open, and a
@@ -364,7 +394,8 @@ export const startGitServe = (opts: GitServeOptions): Promise<GitServeHandle> =>
     // Node's default `requestTimeout` (300 s) bounds a whole request, body
     // included, which would cut a long push. On a tailnet the git routes carry
     // their own idle bound instead (`GIT_IDLE_TIMEOUT_MS`, smartHttp.ts);
-    // `headersTimeout` still bounds a request's head.
+    // `headersTimeout` still bounds a request's head, and an answer sent before
+    // its body was read closes the connection (`handler`).
     if (tailnet !== undefined) server.requestTimeout = 0;
     const sockets = new Set<Socket>();
     server.on('connection', (socket) => {
