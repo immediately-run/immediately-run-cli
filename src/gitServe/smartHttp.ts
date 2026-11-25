@@ -113,10 +113,25 @@ export interface BackendRequest {
   gitProtocol?: string;
 }
 
+/** The only variables the child takes from this process's environment: what
+ *  git needs to find its binaries, home, temp space and locale. Everything else
+ *  — a CGI meta-variable (`CONTENT_LENGTH`, `PATH_INFO`, …) above all — would
+ *  be read by `http-backend` as if the request had sent it. */
+const INHERITED_ENV = new Set([
+  'PATH', 'HOME', 'TMPDIR', 'TMP', 'TEMP', 'LANG', 'LANGUAGE', 'TZ', 'USER', 'LOGNAME',
+  // Windows
+  'SystemRoot', 'SYSTEMROOT', 'windir', 'ComSpec', 'PATHEXT', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'ProgramData',
+]);
+
 /** The whole environment of the `git http-backend` child. Built, never copied
- *  from the request: every request-derived value here was parsed or checked. */
-export const backendEnv = (req: BackendRequest): NodeJS.ProcessEnv => {
-  const env = gitEnv(); // drops every inherited GIT_* variable
+ *  from the request: every request-derived value here was parsed or checked,
+ *  and of this process's own environment only `INHERITED_ENV` and `LC_*` pass. */
+export const backendEnv = (req: BackendRequest, base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv => {
+  const kept: NodeJS.ProcessEnv = {};
+  for (const [k, v] of Object.entries(base)) {
+    if (INHERITED_ENV.has(k) || k.startsWith('LC_')) kept[k] = v;
+  }
+  const env = gitEnv(kept); // adds git's own no-prompt, no-lock settings
   const suffix = req.route.phase === 'advertise' ? 'info/refs' : req.route.service;
   env.GIT_PROJECT_ROOT = req.root;
   env.GIT_HTTP_EXPORT_ALL = '1';
@@ -230,6 +245,22 @@ export const planGitRequest = (
 /** How much of a child's output may arrive before its header block ends. */
 const MAX_CGI_HEAD_BYTES = 16 * 1024;
 
+/** How long a git request may sit with neither the client's upload nor the
+ *  child's output moving before the child is killed and the connection cut.
+ *  It is an idle bound, not a total one: a large pack keeps streaming past it. */
+export const GIT_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
+
+/** How much of the child's stderr is kept for the server's own log. */
+const MAX_STDERR_TAIL_BYTES = 2 * 1024;
+
+export interface RunBackendOptions {
+  /** Default `GIT_IDLE_TIMEOUT_MS`; tests shorten it. */
+  idleTimeoutMs?: number;
+  /** The server's log. Receives the tail of the child's stderr when a request
+   *  fails; that text never reaches the client. */
+  log?: (line: string) => void;
+}
+
 /**
  * Runs `git http-backend` for a planned request and streams both ways. The
  * request body is piped in without a size limit of this server's own (a pack
@@ -240,15 +271,26 @@ export const runBackend = (
   req: http.IncomingMessage,
   res: http.ServerResponse,
   fail: (status: number, reason: string) => void,
+  options: RunBackendOptions = {},
 ): void => {
   const child = spawn('git', ['http-backend'], {
     env: backendEnv(request),
-    stdio: ['pipe', 'pipe', 'ignore'],
+    stdio: ['pipe', 'pipe', 'pipe'],
   });
   let headDone = false;
   let pending = Buffer.alloc(0);
+  let stderrTail = Buffer.alloc(0);
+  const logStderr = (): void => {
+    const text = stderrTail.toString('utf8').trim();
+    if (text !== '' && options.log !== undefined) {
+      options.log(`git-serve: git http-backend (${request.route.repo}): ${text.replace(/\s+/g, ' ')}`);
+    }
+  };
   const refuse = (status: number, reason: string): void => {
+    logStderr();
     if (headDone) {
+      // The status is already sent; the server's refusal log never sees this.
+      options.log?.(`git-serve: cut (${reason}) ${request.method} /${request.route.repo}${REPO_DIR_SUFFIX}`);
       if (!res.writableEnded) res.destroy();
       return;
     }
@@ -256,12 +298,37 @@ export const runBackend = (
     fail(status, reason);
   };
 
+  // The idle bound: reset by every chunk either way.
+  const idleMs = options.idleTimeoutMs ?? GIT_IDLE_TIMEOUT_MS;
+  let idle: NodeJS.Timeout | undefined;
+  const touch = (): void => {
+    if (idle !== undefined) clearTimeout(idle);
+    idle = setTimeout(() => {
+      // `git http-backend` writes its header block before the service reads a
+      // byte, so a stall is past the status line: kill the child and cut the
+      // connection (a stalled client gets no further answer).
+      headDone = true;
+      child.kill();
+      options.log?.(`git-serve: cut (git-idle) ${request.method} /${request.route.repo}${REPO_DIR_SUFFIX}`);
+      req.socket.destroy();
+    }, idleMs);
+  };
+  touch();
+  req.on('data', touch);
+
+  child.stderr.on('data', (chunk: Buffer) => {
+    stderrTail = Buffer.concat([stderrTail, chunk]);
+    if (stderrTail.length > MAX_STDERR_TAIL_BYTES) {
+      stderrTail = stderrTail.subarray(stderrTail.length - MAX_STDERR_TAIL_BYTES);
+    }
+  });
   child.on('error', () => refuse(500, 'git-failed'));
   // A client that goes away mid-upload closes stdin; the child then exits.
   child.stdin.on('error', () => {});
   req.pipe(child.stdin);
 
   child.stdout.on('data', (chunk: Buffer) => {
+    touch();
     if (headDone) return; // piped from here on
     pending = Buffer.concat([pending, chunk]);
     // The header block ends at the first empty line.
@@ -291,11 +358,14 @@ export const runBackend = (
     if (rest.length > 0) res.write(rest);
     child.stdout.pipe(res);
   });
-  child.on('close', () => {
+  child.on('close', (code) => {
+    if (idle !== undefined) clearTimeout(idle);
     // A child that exits without a header block answered nothing.
     if (!headDone) refuse(500, 'git-failed');
+    else if (code !== 0) logStderr();
   });
   res.on('close', () => {
+    if (idle !== undefined) clearTimeout(idle);
     if (child.exitCode === null) child.kill();
   });
 };

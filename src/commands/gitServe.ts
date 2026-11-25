@@ -78,7 +78,8 @@ Options:
                             tailnet user (repeatable). Required when this node
                             is itself tagged.
   --allow-push              With --bind tailscale, let git clients push. A push
-                            must be a fast-forward and cannot delete a branch.
+                            must be a fast-forward and cannot delete a branch;
+                            only branches can be pushed (no tags or other refs).
                             Without the flag every push is refused, whatever a
                             repository's own config says. \`git clone\` and
                             \`git fetch\` need no flag.
@@ -297,7 +298,7 @@ const serveTailnet = async (
     console.log(`To connect a browser: immediately.run git-serve pair ${root}`);
     console.log(
       allowPush
-        ? 'git clients may clone and push (fast-forward only, no branch deletes).'
+        ? 'git clients may clone and push branches (fast-forward only, no branch deletes, no tags).'
         : 'git clients may clone and fetch. Push is off (start with --allow-push to allow it).',
     );
     for (const repo of listRepos(handle.root)) {

@@ -61,6 +61,8 @@ export interface GitServeOptions {
   /** `--allow-push`: git clients may push (fast-forward only, no deletes). It is
    *  the only thing that turns push on; a repository's own config cannot. */
   allowPush?: boolean;
+  /** The git routes' idle bound (default `GIT_IDLE_TIMEOUT_MS`); tests shorten it. */
+  gitIdleTimeoutMs?: number;
   /** Tests inject a `runGit` to move a ref between two of the server's own git calls. */
   runGit?: RunGit;
   /** Where refusals are logged (default: stderr). Never receives a credential. */
@@ -278,7 +280,10 @@ export const startGitServe = (opts: GitServeOptions): Promise<GitServeHandle> =>
         refuse(planned.status, planned.reason, {});
         return;
       }
-      runBackend(planned.request, req, res, (status, reason) => refuse(status, reason, {}));
+      runBackend(planned.request, req, res, (status, reason) => refuse(status, reason, {}), {
+        idleTimeoutMs: opts.gitIdleTimeoutMs,
+        log,
+      });
       return;
     }
 
@@ -356,6 +361,11 @@ export const startGitServe = (opts: GitServeOptions): Promise<GitServeHandle> =>
       tailnet?.cert !== undefined && tailnet.key !== undefined
         ? https.createServer({ cert: tailnet.cert, key: tailnet.key }, handler)
         : http.createServer(handler);
+    // Node's default `requestTimeout` (300 s) bounds a whole request, body
+    // included, which would cut a long push. On a tailnet the git routes carry
+    // their own idle bound instead (`GIT_IDLE_TIMEOUT_MS`, smartHttp.ts);
+    // `headersTimeout` still bounds a request's head.
+    if (tailnet !== undefined) server.requestTimeout = 0;
     const sockets = new Set<Socket>();
     server.on('connection', (socket) => {
       sockets.add(socket);

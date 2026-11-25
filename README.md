@@ -149,7 +149,7 @@ npx @immediately-run/cli git-serve ~/repos
 | `--host` | this node's MagicDNS name | Hostname for `--bind tailscale` |
 | `--cert` | `<host>.crt` in `<root>/.git-serve/`, `<root>` or the current directory, else minted into `<root>/.git-serve/` by `tailscale cert` | TLS certificate for `--bind tailscale`; its `.key` sibling is the key |
 | `--allow-login` | none | With `--bind tailscale`, also serve devices of this tailnet user (repeatable) |
-| `--allow-push` | off | With `--bind tailscale`, let git clients push (fast-forward only, no branch deletes) |
+| `--allow-push` | off | With `--bind tailscale`, let git clients push branches (fast-forward only, no branch deletes; tags and other refs cannot be pushed) |
 | `--origin` | `https://immediately.run` | Allowed browser origin and deep-link base; the site's local-development mediator origin is admitted with it |
 | `--origin-unsafe` | off | Allow an `--origin` outside the recognized set |
 | `--json` | off | One JSON line on stdout: `{ endpoint, namespace, port, protocol, allowPush, allowCommit, links: [{ repo, url }] }`, plus `token` on `localhost` only |
@@ -228,9 +228,14 @@ git clone https://<machine>.<tailnet>.ts.net:7701/notes.git
 - `git push` needs the server started with `--allow-push`. A push must be a
   fast-forward and cannot delete a branch. Rewriting a branch means doing it on
   the serving machine's disk.
+- A push can only update branches (`refs/heads/`). Tags and every other ref
+  are hidden from push, so `git push --tags` (or `push.followTags`) fails with
+  "deny updating a hidden ref"; create tags on the serving machine. git's
+  fast-forward and delete rules cover branches only, so without this a pushed
+  tag could be moved or deleted.
 - A repository's own config cannot turn push on, or force-pushes and deletes
-  back on: the server sets `http.receivepack`, `receive.denyNonFastForwards`
-  and `receive.denyDeletes` itself for every request.
+  back on: the server sets `http.receivepack`, `receive.denyNonFastForwards`,
+  `receive.denyDeletes` and `receive.hideRefs` itself for every request.
 - Only `/<name>.git/info/refs?service=…`, `/<name>.git/git-upload-pack` and
   `/<name>.git/git-receive-pack` are served. The file routes of the older
   "dumb" protocol are not.

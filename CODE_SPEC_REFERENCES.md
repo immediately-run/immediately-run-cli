@@ -57,4 +57,6 @@ core_concepts §9).
   shapes from the raw request line; the child's `PATH_INFO`/`QUERY_STRING` are rebuilt from
   the parsed parts; push is the `--allow-push` flag's alone (`forcedConfig`, through
   `GIT_CONFIG_COUNT`, which outranks the repository's config); browser headers are refused
-  before the peer gate.
+  before the peer gate. The child's environment is built from an allowlist (no inherited CGI
+  variable reaches it); the git routes carry an idle bound, not Node's whole-request timeout.
+  Verified on 2026-11-25.
