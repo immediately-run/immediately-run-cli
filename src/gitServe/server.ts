@@ -26,7 +26,7 @@ import { LOOPBACK_HOSTS, admittedOrigins } from '../devServer.js';
 import { connectionLookup, type ConnectionScope } from './connections.js';
 import { READ_ROUTES, TAILNET_ROUTES, admit, authorize, sameSecret } from './guards.js';
 import { gitServeNamespace } from './namespace.js';
-import { exchangePairingCode } from './pairing.js';
+import { exchangePairingCodeAsync } from './pairing.js';
 import { checkPeer, type PeerGateConfig } from './peerGate.js';
 import { GIT_SERVE_PROTOCOL, GIT_SERVE_SERVER, type RunGit } from './protocol.js';
 import { answerRead, type ReadAnswer } from './readRoutes.js';
@@ -165,6 +165,12 @@ export const startGitServe = (opts: GitServeOptions): Promise<GitServeHandle> =>
   if ((opts.token === undefined) === (opts.tailnet === undefined)) {
     throw new Error('startGitServe takes exactly one of `token` (loopback) and `tailnet`.');
   }
+  // HTTPS on the tailnet address (R-GS-9): a binding without the certificate
+  // pair may only listen on loopback, which is how the tests drive this entry.
+  const t = opts.tailnet;
+  if (t !== undefined && (t.cert === undefined || t.key === undefined) && t.address !== '127.0.0.1') {
+    throw new Error(`startGitServe: a tailnet binding on ${t.address} needs its certificate and key.`);
+  }
   const root = realpathSync(opts.root);
   const instanceId = loadInstanceId(root);
   const runGit = opts.runGit ?? realRunGit;
@@ -240,7 +246,11 @@ export const startGitServe = (opts: GitServeOptions): Promise<GitServeHandle> =>
     if (tailnet !== undefined) {
       const peer = await checkPeer(req.socket.remoteAddress, tailnet.peerGate);
       if (!peer.ok) {
-        refuse(403, peer.reason, admission.kind === 'browser' ? admission.cors : {});
+        // A connection with no remote address is answered as an unknown peer:
+        // §10.2 names five reasons, and the distinction is kept in the log.
+        if (peer.reason === 'no-address') log('git-serve: refused a connection with no remote address');
+        const reason = peer.reason === 'no-address' ? 'unknown-peer' : peer.reason;
+        refuse(403, reason, admission.kind === 'browser' ? admission.cors : {});
         return;
       }
       peerLogin = peer.login;
@@ -280,7 +290,11 @@ export const startGitServe = (opts: GitServeOptions): Promise<GitServeHandle> =>
       return;
     }
     if (authorization.kind === 'refuse') {
-      refuse(authorization.status, authorization.reason, authorization.cors);
+      // On `/pair` the bearer value is the code, so an absent or unreadable one
+      // is an absent code (R-GS-24), not a token refusal.
+      const reason =
+        url.pathname === '/pair' && authorization.reason === 'token' ? 'code' : authorization.reason;
+      refuse(authorization.status, reason, authorization.cors);
       return;
     }
     const { cors, bearer } = authorization;
@@ -289,7 +303,7 @@ export const startGitServe = (opts: GitServeOptions): Promise<GitServeHandle> =>
     // not enough without it.
     if (url.pathname === '/pair') {
       req.resume(); // the route reads no body
-      const paired = exchangePairingCode(root, bearer, now());
+      const paired = await exchangePairingCodeAsync(root, bearer, now());
       if (!paired.ok) {
         refuse(401, 'code', cors);
         return;

@@ -24,7 +24,7 @@ import {
   GIT_SERVE_SERVER,
   type RunGit,
 } from './protocol.js';
-import { peelToCommit, resolveRef, type RefKind } from './refs.js';
+import { headBranchOf, peelToCommit, resolveRef, type RefKind } from './refs.js';
 import { listRepos, resolveRepo } from './repoName.js';
 
 export interface ReadContext {
@@ -82,7 +82,7 @@ const onlyParams = (query: URLSearchParams, allowed: readonly string[]): boolean
 };
 
 /** `sha1`, another format name, or null when git could not say. */
-const objectFormat = async (repoDir: string, runGit: RunGit): Promise<string | null> => {
+export const objectFormat = async (repoDir: string, runGit: RunGit): Promise<string | null> => {
   const r = await runGit(repoDir, ['rev-parse', '--show-object-format']);
   return r.code === 0 ? text(r.stdout) : null;
 };
@@ -118,9 +118,8 @@ const openRepo = async (
 };
 
 const repoMeta = async (ctx: ReadContext, name: string, dir: string): Promise<ReadAnswer> => {
-  const head = await ctx.runGit(dir, ['symbolic-ref', '-q', '--short', 'HEAD']);
   // A detached HEAD has no default branch; the host then needs a ref in the URL.
-  const defaultBranch = head.code === 0 && text(head.stdout) !== '' ? text(head.stdout) : null;
+  const defaultBranch = await headBranchOf(dir, ctx.runGit);
 
   const listed = await ctx.runGit(dir, [
     'for-each-ref',
@@ -168,7 +167,9 @@ const resolveCommit = async (
     return {
       ok: false,
       answer:
-        resolved.reason === 'malformed' ? refusal(400, 'malformed') : refusal(404, 'not-found'),
+        resolved.reason === 'unknown'
+          ? refusal(404, 'not-found')
+          : refusal(400, resolved.reason), // 'malformed' or 'ambiguous' (R-GS-3)
     };
   }
   const tree = await ctx.runGit(dir, [

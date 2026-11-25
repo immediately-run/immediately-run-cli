@@ -8,8 +8,9 @@
  *    prints back must be the value itself. That refuses a leading dash, `..`,
  *    `~`, `^`, `:`, `@{`, a backslash and control characters, and it refuses the
  *    `@{-1}` shorthand, which `--branch` would otherwise expand.
- *  - The name is then looked up as exactly `refs/heads/<ref>`, then exactly
- *    `refs/tags/<ref>`, with `show-ref --verify`. `rev-parse refs/heads/<ref>`
+ *  - The name is then looked up as exactly `refs/heads/<ref>` and exactly
+ *    `refs/tags/<ref>`, with `show-ref --verify`; when both exist the name is
+ *    `ambiguous` and does not resolve. `rev-parse refs/heads/<ref>`
  *    is not used for this step: it falls back through git's search list, so a
  *    branch literally named `refs/heads/x` would answer for `x`.
  *  - The object the ref names is peeled to a commit by its SHA. A tag that does
@@ -26,8 +27,9 @@ export type RefKind = 'commit' | 'branch' | 'tag';
 
 export type RefResolution =
   | { ok: true; refKind: RefKind; commitSha: string }
-  /** `malformed`: not a ref this server looks up. `unknown`: well-formed, not there. */
-  | { ok: false; reason: 'malformed' | 'unknown' };
+  /** `malformed`: not a ref this server looks up. `unknown`: well-formed, not there.
+   *  `ambiguous`: both a branch and a tag of that name exist (R-GS-3). */
+  | { ok: false; reason: 'malformed' | 'unknown' | 'ambiguous' };
 
 /** Longer than any ref git will store in a file name; refused before git is asked. */
 export const MAX_REF_LENGTH = 255;
@@ -64,6 +66,21 @@ export const peelToCommit = async (
   return peeled.code === 0 && COMMIT_SHA_RE.test(commit) ? commit : null;
 };
 
+/**
+ * The branch HEAD names, or null for a detached or unborn-without-branch HEAD.
+ * Read as the full ref and stripped here: `symbolic-ref --short` disambiguates,
+ * printing `heads/v1` for a branch `v1` that is also a tag, which is not the
+ * branch's name (cli#61 review). Every caller that needs the default branch
+ * goes through this one helper.
+ */
+export const headBranchOf = async (repoDir: string, runGit: RunGit): Promise<string | null> => {
+  const head = await runGit(repoDir, ['symbolic-ref', '-q', 'HEAD']);
+  const full = text(head.stdout);
+  if (head.code !== 0 || !full.startsWith('refs/heads/')) return null;
+  const branch = full.slice('refs/heads/'.length);
+  return branch === '' ? null : branch;
+};
+
 /** The object SHA a fully-qualified ref names, looked up exactly, or null. */
 const exactRef = async (
   repoDir: string,
@@ -92,6 +109,12 @@ export const resolveRef = async (
 
   if (!(await isBranchName(repoDir, ref, runGit))) return { ok: false, reason: 'malformed' };
 
+  // Both namespaces are looked up, never the first hit alone: a name that is a
+  // branch AND a tag does not resolve (R-GS-3). A push can create a branch under
+  // an existing tag's name, and preferring either would silently change the
+  // commit a link opens. A tag that does not peel to a commit is not listed and
+  // does not resolve, so it does not make a name ambiguous either.
+  const found: Array<{ refKind: RefKind; commitSha: string }> = [];
   for (const [prefix, refKind] of [
     ['refs/heads/', 'branch'],
     ['refs/tags/', 'tag'],
@@ -99,7 +122,9 @@ export const resolveRef = async (
     const sha = await exactRef(repoDir, prefix + ref, runGit);
     if (sha === null) continue;
     const commitSha = await peelToCommit(repoDir, sha, runGit);
-    if (commitSha !== null) return { ok: true, refKind, commitSha };
+    if (commitSha !== null) found.push({ refKind, commitSha });
   }
+  if (found.length > 1) return { ok: false, reason: 'ambiguous' };
+  if (found.length === 1) return { ok: true, ...found[0] };
   return { ok: false, reason: 'unknown' };
 };

@@ -23,6 +23,7 @@ import {
   rmSync,
   statSync,
   writeFileSync,
+  writeSync,
 } from 'node:fs';
 import { join } from 'node:path';
 
@@ -70,12 +71,119 @@ export const writeStateFile = (root: string, name: string, content: string): voi
 
 const LOCK_FILE = '.lock';
 const LOCK_WAIT_MS = 5000;
-/** A lock older than this was left by a process that died holding it. */
+/** A lock in the old format (no holder pid) is stale after this long. */
 const LOCK_STALE_MS = 30_000;
+/** A live holder never holds the lock this long; past it, a reused pid is assumed. */
+const LOCK_ABANDONED_MS = 10 * 60_000;
 
 const sleepSync = (ms: number): void => {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 };
+
+/** A lock file's content, or null when it is gone or unreadable. */
+const readLock = (path: string): string | null => {
+  try {
+    return readFileSync(path, 'utf8');
+  } catch {
+    return null;
+  }
+};
+
+const processAlive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === 'EPERM';
+  }
+};
+
+/**
+ * Whether a lock was left by a holder that can no longer release it. A lock
+ * holds `<pid> <nonce>`; it is stale when that process is gone (the state
+ * directory is local, so the pid is this machine's). Age alone never makes a
+ * live holder's lock stale: a slow holder could release it and another take it
+ * between the judgement and the removal (cli#63 review, round 2).
+ */
+const isStale = (content: string, mtimeMs: number): boolean => {
+  const age = Date.now() - mtimeMs;
+  const m = /^(\d+) [0-9a-f]+$/.exec(content);
+  if (m === null) return age > LOCK_STALE_MS; // the old format, or a half-written lock
+  return !processAlive(Number(m[1])) || age > LOCK_ABANDONED_MS;
+};
+
+/** Creates `path` exclusively with this holder's line; the line, or null if taken. */
+const createLock = (path: string): string | null => {
+  const line = `${process.pid} ${randomBytes(16).toString('hex')}`;
+  let fd: number;
+  try {
+    fd = openSync(path, 'wx', FILE_MODE);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'EEXIST') return null;
+    throw e;
+  }
+  try {
+    writeSync(fd, line);
+  } finally {
+    closeSync(fd);
+  }
+  return line;
+};
+
+/** Releases a lock only if it still holds this holder's line. */
+const unlock = (path: string, held: string): void => {
+  if (readLock(path) === held) rmSync(path, { force: true });
+};
+
+/** Whether `path` exists and is stale. */
+const staleAt = (path: string): boolean => {
+  const content = readLock(path);
+  if (content === null) return false;
+  try {
+    return isStale(content, statSync(path).mtimeMs);
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Removes a stale lock. Only the holder of `<lock>.takeover` may, and it judges
+ * the lock again while holding it. While the stale lock exists no one can create
+ * a fresh one, and its dead holder cannot remove it, so what is judged stale is
+ * what is removed. Returns true when this waiter held the takeover, whether or
+ * not it removed anything.
+ *
+ * Residual, accepted: a takeover lock whose holder DIED is removed by judging
+ * and then removing, with no guard, so another waiter's live takeover lock
+ * could be removed in between. That needs a process killed inside the
+ * takeover section (a few microseconds), and then a second takeover racing
+ * through the same gap; the result would be two holders of the state lock.
+ */
+const takeOver = (lock: string): boolean => {
+  const takeover = `${lock}.takeover`;
+  const mine = createLock(takeover);
+  if (mine === null) {
+    if (staleAt(takeover)) rmSync(takeover, { force: true });
+    return false;
+  }
+  try {
+    if (staleAt(lock)) rmSync(lock, { force: true });
+  } finally {
+    unlock(takeover, mine);
+  }
+  return true;
+};
+
+/** One attempt at the lock: the holder's line when taken, else whether to wait. */
+const tryLock = (lock: string): { held: string } | 'retry' | 'wait' => {
+  const held = createLock(lock);
+  if (held !== null) return { held };
+  if (!staleAt(lock)) return 'wait';
+  return takeOver(lock) ? 'retry' : 'wait';
+};
+
+const busy = (lock: string): Error =>
+  new Error(`${lock} is held by another git-serve process; try again.`);
 
 /**
  * Runs `fn` holding the state directory's lock. The server, `git-serve pair`
@@ -83,34 +191,45 @@ const sleepSync = (ms: number): void => {
  * file, change it and write it back; without a lock the last writer wins, and a
  * pairing racing a revocation could write the revoked connection back.
  * Not re-entrant: a function that holds the lock calls the unlocked forms.
+ * The two CLI commands use this blocking form; the server uses
+ * `withStateLockAsync`, so a held lock never stalls its other requests.
  */
 export const withStateLock = <T>(root: string, fn: () => T): T => {
   const lock = join(ensureStateDir(root), LOCK_FILE);
   const deadline = Date.now() + LOCK_WAIT_MS;
   for (;;) {
-    try {
-      closeSync(openSync(lock, 'wx', FILE_MODE));
-      break;
-    } catch (e) {
-      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
+    const got = tryLock(lock);
+    if (typeof got === 'object') {
       try {
-        if (Date.now() - statSync(lock).mtimeMs > LOCK_STALE_MS) {
-          rmSync(lock, { force: true });
-          continue;
-        }
-      } catch {
-        continue; // released between the open and the stat
+        return fn();
+      } finally {
+        unlock(lock, got.held);
       }
-      if (Date.now() > deadline) {
-        throw new Error(`${lock} is held by another git-serve process; try again.`);
-      }
+    }
+    if (got === 'wait') {
+      if (Date.now() > deadline) throw busy(lock);
       sleepSync(10);
     }
   }
-  try {
-    return fn();
-  } finally {
-    rmSync(lock, { force: true });
+};
+
+/** `withStateLock` for the server: it waits without blocking the event loop. */
+export const withStateLockAsync = async <T>(root: string, fn: () => T): Promise<T> => {
+  const lock = join(ensureStateDir(root), LOCK_FILE);
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  for (;;) {
+    const got = tryLock(lock);
+    if (typeof got === 'object') {
+      try {
+        return fn();
+      } finally {
+        unlock(lock, got.held);
+      }
+    }
+    if (got === 'wait') {
+      if (Date.now() > deadline) throw busy(lock);
+      await new Promise((r) => setTimeout(r, 10));
+    }
   }
 };
 
