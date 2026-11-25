@@ -33,3 +33,12 @@ core_concepts §9).
 - **`src/mcp.ts` `tools/list`** — the grant-filtered method catalog IS the agent's tool
   list (core_concepts §6 Service surface; UI_AS_APPS §5.5/§5.9). Don't hand-roll tools
   around the SDK catalog.
+- **`src/gitServe/`** — `immediately-run git-serve` (GIT_SERVE_SPEC §4, §5.1, §9, §10.1).
+  `repoName.ts` is R-GS-6 (a repository is a name), `refs.ts` R-GS-3 (exact ref lookup,
+  no revision expression), `readRoutes.ts` the five read answers with R-GS-2's one
+  resolution, `namespace.ts` R-GS-8 (held equal to site-main by
+  `test/fixtures/git-serve-namespace-vectors.json`), `guards.ts` the browser-class guards
+  of §10.1. The guards are deliberately not `devServer.ts`'s: `Origin` is required, the
+  token rides in `Authorization` only, and the Host header must carry the port.
+- **`src/deepLink.ts`** — the one place the `ir-endpoint`/`ir-token` fragment is written;
+  `dev`, `agent`, `llm` and `git-serve` build their links through it.

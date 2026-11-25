@@ -67,10 +67,12 @@ export const headCommitSha = (repo: string): string =>
 export const headTreeSha = (repo: string): string =>
   git(repo, ['rev-parse', 'HEAD^{tree}']);
 
-// Parse `git ls-tree -r -z --long HEAD` into manifest entries. -z disables path
-// quoting; --long adds the object size. Submodules appear as type `commit`.
-export const treeEntries = (repo: string): ManifestEntry[] =>
-  git(repo, ['ls-tree', '-r', '-z', '--long', 'HEAD'])
+// Parse the output of `git ls-tree -r -z --long <commit>` into entries, in git's
+// order. -z disables path quoting; --long adds the object size. Submodules
+// appear as type `commit`, with `-` for a size. Shared by the cache-zip manifest
+// (treeEntries, below) and git-serve's `/tree` (src/gitServe/readRoutes.ts).
+export const parseLsTreeLong = (output: string): ManifestEntry[] =>
+  output
     .split('\0')
     .filter(Boolean)
     .map((record): ManifestEntry => {
@@ -85,6 +87,9 @@ export const treeEntries = (repo: string): ManifestEntry[] =>
       };
       if (/^\d+$/.test(sizeStr!)) entry.size = Number(sizeStr);
       return entry;
-    })
+    });
+
+export const treeEntries = (repo: string): ManifestEntry[] =>
+  parseLsTreeLong(git(repo, ['ls-tree', '-r', '-z', '--long', 'HEAD']))
     .filter((e) => e.type === 'blob' || e.type === 'commit')
     .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));

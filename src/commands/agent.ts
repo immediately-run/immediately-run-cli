@@ -26,6 +26,7 @@ import { startDevServer, runUntilShutdown } from '../devServer.js';
 import { AgentBridge, DEFAULT_CALL_TIMEOUT_MS } from '../bridge.js';
 import { runMcpStdio } from '../mcp.js';
 import { flagValue, type ParsedArgs } from '../args.js';
+import { buildLocatorLink } from '../deepLink.js';
 import {
   DEFAULT_ORIGIN,
   DEFAULT_PORT,
@@ -60,8 +61,7 @@ Options:
 // like the dev deep link — the in-browser Agent panel parses ir-endpoint/ir-token
 // out of the hash (site-main localLocator). The path names the agent surface.
 export const buildAgentDeepLink = (origin: string, port: number, token: string): string =>
-  `${origin.replace(/\/+$/, '')}/agent` +
-  `#ir-endpoint=${encodeURIComponent(`http://127.0.0.1:${port}`)}&ir-token=${encodeURIComponent(token)}`;
+  buildLocatorLink(origin, 'agent', `http://127.0.0.1:${port}`, token);
 
 export const runAgent = async (args: ParsedArgs): Promise<number> => {
   if (args.flags.help || args.flags.h) {
