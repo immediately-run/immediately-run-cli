@@ -40,9 +40,32 @@ npx @immediately-run/cli cache-zip \
 | `--ref` | current branch | Ref to cache; also the default output filename |
 | `--default-branch` | `origin/HEAD` | Repository default branch |
 | `--out` | `public/cached_repositories/<owner>/<repo>/<ref>.zip` | Output zip path |
+| `--bundle-packages` | off | Bundle the resolved dependency content into the zip (requires the lockset) |
+| `--no-prune-packages` | pruning on | With `--bundle-packages`: ship every bundled package whole |
 
 The zip's contents are exactly `git archive HEAD` (the tracked tree) plus the
 manifest sidecar.
+
+#### Bundled packages are pruned to what the app reaches
+
+With `--bundle-packages`, a package file is inlined only if an import can reach
+it: the walk starts at the specifiers the app's own sources import (plus the
+ones the platform always requires, such as `react-dom/client`) and follows each
+bundled file's own requires, across packages. Any other JavaScript file is
+listed by its size instead of its content, which is the dependency CDN's own
+form for a file it does not inline. The runtime still resolves such a file and
+fetches it on demand, so the cost of a file the walk missed is one network
+request when it is first required, not a missing module.
+
+Pruning leaves a package untouched when it cannot reason about it, and the
+summary line says so: the platform-injected packages (`core-js`,
+`react-refresh`, `react-error-boundary`), a package with no readable
+`package.json`, one that no import reaches, and one that uses `#imports`. It
+stands down for the whole zip when the app's import list is incomplete: with
+`--no-artifacts`, when a source file produced no artifact (a transform error or
+a dynamic import with a computed specifier), or when the app mounts a library
+through `resolveFromRegistry` or a git dependency. Pass `--no-prune-packages`
+to ship every package whole.
 
 ### Hosting & discovery
 
