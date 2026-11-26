@@ -178,7 +178,9 @@ export const isGitmodulesName = (component: string): boolean => {
  * Case folding, not `toLowerCase()`: lower-casing leaves `ſ` (long s), `µ` and
  * the final sigma `ς` alone, and APFS folds them to `s`, `μ` and `σ`, so
  * `ſrc/x` would write through a symlink `src`. NFKC, then upper- and
- * lower-casing, then `ς`→`σ` folds those. It may fold more than a given disk
+ * lower-casing twice, then `ς`→`σ` folds those; the second pass is for `ẞ`,
+ * which one pass leaves as `ß` while `ß` itself becomes `ss`. Checked over
+ * every code point: a character, its lower- and its upper-case fold alike. It may fold more than a given disk
  * does; for a refusal check that errs on the safe side.
  */
 export const foldPath = (path: string): string =>
@@ -188,6 +190,9 @@ export const foldPath = (path: string): string =>
       let name = component
         .replace(HFS_IGNORABLE, '')
         .normalize('NFKC')
+        .toUpperCase()
+        .toLowerCase()
+        // Twice: one pass takes `ẞ` only to `ß`, which the second takes to `ss`.
         .toUpperCase()
         .toLowerCase()
         .replace(/ς/g, 'σ')

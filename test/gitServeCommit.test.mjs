@@ -846,6 +846,18 @@ test('foldPath: the spellings a case-insensitive, normalizing checkout merges fo
   assert.equal(foldPath('a\u03c2/x'), foldPath('a\u03c3/x'), 'final sigma');
   assert.equal(foldPath('A\u03a3/x'), foldPath('a\u03c3/x'), 'capital sigma at a word end');
   assert.equal(foldPath('\u00b5/x'), foldPath('\u03bc/x'), 'micro sign');
+  assert.equal(foldPath('a\u1e9eets/x'), 'assets/x', 'capital sharp s');
+  assert.equal(foldPath('\u1e9e/x'), foldPath('\u00df/x'), 'capital and small sharp s');
+  assert.equal(foldPath('\u00df/x'), foldPath('ss/x'));
+  // Every code point: itself, its lower case and its upper case fold alike.
+  for (let cp = 0; cp < 0x110000; cp++) {
+    if (cp >= 0xd800 && cp < 0xe000) continue;
+    const c = String.fromCodePoint(cp);
+    const folded = foldPath(c);
+    if (folded.includes('/') || c === '.' || c === ' ' || c === ':') continue; // separators and NTFS trims
+    assert.equal(foldPath(c.toLowerCase()), folded, `U+${cp.toString(16)} lower`);
+    assert.equal(foldPath(c.toUpperCase()), folded, `U+${cp.toString(16)} upper`);
+  }
 });
 
 test('planCommit: modes come from the parent tree, never from the request', () => {
