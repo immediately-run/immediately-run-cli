@@ -482,14 +482,21 @@ export const startGitServe = (opts: GitServeOptions): Promise<GitServeHandle> =>
     // answer says `Connection: close`, so no client reuses the connection; it
     // is half-closed so the answer is read, then cut after a grace. A git
     // request piped to `http-backend` keeps its connection (git reuses it
-    // between rounds) and has its own idle bound.
+    // between rounds) and has its own idle bound. Whether a body is coming is
+    // read from the framing, not `req.complete`: a bodyless request (a CORS
+    // preflight, a GET) may not be `complete` yet when it is answered, and it
+    // must keep its connection. An unparsable Content-Length counts as a body.
+    const hasBody =
+      req.headers['transfer-encoding'] !== undefined ||
+      Number(req.headers['content-length'] ?? 0) !== 0;
+    const hasUnreadBody = () => hasBody && !req.complete;
     const writeHead = res.writeHead;
     res.writeHead = function (this: http.ServerResponse, ...args: unknown[]) {
-      if (!req.complete && !piped.has(res)) res.setHeader('Connection', 'close');
+      if (hasUnreadBody() && !piped.has(res)) res.setHeader('Connection', 'close');
       return (writeHead as (...a: unknown[]) => http.ServerResponse).apply(this, args);
     } as typeof res.writeHead;
     res.once('finish', () => {
-      if (req.complete) return;
+      if (!hasUnreadBody()) return;
       if (piped.has(res)) {
         // http-backend answered without reading the whole body: nothing more
         // can be said on this connection.

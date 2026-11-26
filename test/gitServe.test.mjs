@@ -58,13 +58,13 @@ const blobSha = (bytes) =>
     .digest('hex');
 
 /** A raw HTTP request, so the test controls every header (fetch forbids Host). */
-const request = (path, { method = 'GET', headers = {}, port = handle.port } = {}) =>
+const request = (path, { method = 'GET', headers = {}, port = handle.port, agent } = {}) =>
   new Promise((resolvePromise, reject) => {
-    const req = http.request({ host: '127.0.0.1', port, path, method, headers }, (res) => {
+    const req = http.request({ host: '127.0.0.1', port, path, method, headers, agent }, (res) => {
       const chunks = [];
       res.on('data', (c) => chunks.push(c));
       res.on('end', () =>
-        resolvePromise({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }),
+        resolvePromise({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks), reusedSocket: req.reusedSocket }),
       );
     });
     req.on('error', reject);
@@ -699,7 +699,8 @@ test('G-GS-12 on a tailnet: Origin required, no ?token=, preflight without a tok
     },
   });
   const hostHeader = `${HOST}:${tail.port}`;
-  const ask = (path, headers, method = 'GET') => request(path, { port: tail.port, method, headers });
+  const ask = (path, headers, method = 'GET', agent) => request(path, { port: tail.port, method, headers, agent });
+  const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
   try {
     const good = { Host: hostHeader, Origin: MEDIATOR, Authorization: `Bearer ${token}` };
     assert.equal((await ask('/meta', good)).status, 200);
@@ -709,9 +710,13 @@ test('G-GS-12 on a tailnet: Origin required, no ?token=, preflight without a tok
     // The token rides in Authorization only.
     assert.equal((await ask(`/meta?token=${token}`, { Host: hostHeader, Origin: MEDIATOR })).status, 401);
     // Preflight is answered without a token.
-    const preflight = await ask('/meta', { Host: hostHeader, Origin: MEDIATOR }, 'OPTIONS');
+    const preflight = await ask('/meta', { Host: hostHeader, Origin: MEDIATOR }, 'OPTIONS', agent);
     assert.equal(preflight.status, 204);
     assert.equal(preflight.headers['access-control-allow-origin'], MEDIATOR);
+    assert.equal(preflight.headers.connection, 'keep-alive');
+    const afterPreflight = await ask('/meta', good, 'GET', agent);
+    assert.equal(afterPreflight.status, 200);
+    assert.equal(afterPreflight.reusedSocket, true);
     // The Host pin is the MagicDNS name WITH its port; loopback names are not it.
     assert.equal((await ask('/meta', { ...good, Host: HOST })).status, 403, 'Host without the port');
     assert.equal((await ask('/meta', { ...good, Host: `${HOST}:${tail.port + 1}` })).status, 403);
@@ -721,6 +726,7 @@ test('G-GS-12 on a tailnet: Origin required, no ?token=, preflight without a tok
     // The session token of a loopback server means nothing here.
     assert.equal((await ask('/meta', { ...good, Authorization: `Bearer ${TOKEN}` })).status, 401);
   } finally {
+    agent.destroy();
     await tail.close();
   }
 });
