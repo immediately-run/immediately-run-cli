@@ -422,6 +422,7 @@ test('G-GS-14: the hostile-path table — each is a 400 naming the path, and the
       ['vendor/sub', 'under-submodule'],
       ['vendor/sub/file', 'under-submodule'],
       ['VENDOR/Sub/file', 'under-submodule'],
+      ['vendor/\u017fub/file', 'under-submodule'], // ſ (long s): APFS folds it to s
       ['dir', 'file-over-directory'],
       ['a.txt/child', 'directory-over-file'],
       ['/abs', 'path-malformed'],
@@ -840,6 +841,11 @@ test('foldPath: the spellings a case-insensitive, normalizing checkout merges fo
   assert.equal(foldPath('link. ./x'), 'link/x');
   assert.equal(foldPath('link::$DATA/x'), 'link/x');
   assert.notEqual(foldPath('link2/x'), foldPath('link/x'));
+  // Case FOLDING, not lower-casing: APFS folds these and toLowerCase() does not.
+  assert.equal(foldPath('\u017frc/x'), 'src/x', 'long s');
+  assert.equal(foldPath('a\u03c2/x'), foldPath('a\u03c3/x'), 'final sigma');
+  assert.equal(foldPath('A\u03a3/x'), foldPath('a\u03c3/x'), 'capital sigma at a word end');
+  assert.equal(foldPath('\u00b5/x'), foldPath('\u03bc/x'), 'micro sign');
 });
 
 test('planCommit: modes come from the parent tree, never from the request', () => {

@@ -171,15 +171,27 @@ export const isGitmodulesName = (component: string): boolean => {
 
 /**
  * A path as a case-insensitive, normalizing checkout (HFS+, APFS, NTFS) would
- * resolve it: each component without HFS-ignorable code points, NFC-normalized,
- * lower-cased, without an NTFS stream suffix or trailing dots and spaces. Two
- * paths that fold alike can land on the same file on such a disk.
+ * resolve it: each component without HFS-ignorable code points, case-folded,
+ * without an NTFS stream suffix or trailing dots and spaces. Two paths that fold
+ * alike can land on the same file on such a disk.
+ *
+ * Case folding, not `toLowerCase()`: lower-casing leaves `ſ` (long s), `µ` and
+ * the final sigma `ς` alone, and APFS folds them to `s`, `μ` and `σ`, so
+ * `ſrc/x` would write through a symlink `src`. NFKC, then upper- and
+ * lower-casing, then `ς`→`σ` folds those. It may fold more than a given disk
+ * does; for a refusal check that errs on the safe side.
  */
 export const foldPath = (path: string): string =>
   path
     .split('/')
     .map((component) => {
-      let name = component.replace(HFS_IGNORABLE, '').normalize('NFC').toLowerCase();
+      let name = component
+        .replace(HFS_IGNORABLE, '')
+        .normalize('NFKC')
+        .toUpperCase()
+        .toLowerCase()
+        .replace(/ς/g, 'σ')
+        .normalize('NFC');
       const stream = name.indexOf(':');
       if (stream !== -1) name = name.slice(0, stream);
       return name.replace(/[. ]+$/, '');

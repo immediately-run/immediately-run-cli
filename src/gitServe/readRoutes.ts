@@ -96,7 +96,6 @@ const servableRepos = async (ctx: ReadContext): Promise<string[]> => {
   return names;
 };
 
-/** Resolves the `repo` parameter to a servable SHA-1 repository, or the refusal. */
 /** A repository by name (R-GS-6), refused unless it is SHA-1: every route that
  *  names a repository opens it here, `/commit` included. */
 export const openRepo = async (
