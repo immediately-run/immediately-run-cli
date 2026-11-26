@@ -514,6 +514,16 @@ test('the state lock: processes that meet at a dead process\'s lock are never in
   assert.deepEqual(readdirSync(join(root, '.git-serve')).filter((n) => n.startsWith('.lock')), [], 'no lock and no takeover file is left');
 });
 
+// --- the commands ------------------------------------------------------------
+
+const cli = (args) => {
+  try {
+    return { code: 0, out: execFileSync(process.execPath, [CLI_ENTRY, ...args], { encoding: 'utf8', stdio: 'pipe' }) };
+  } catch (e) {
+    return { code: e.status, out: `${e.stdout}${e.stderr}` };
+  }
+};
+
 test('the state lock: a live lock is waited for by the commands', async () => {
   const root = freshRoot('live-lock');
   const lock = join(root, '.git-serve', '.lock');
