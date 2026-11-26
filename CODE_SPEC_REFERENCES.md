@@ -63,8 +63,10 @@ core_concepts §9).
   the parsed parts; push is the `--allow-push` flag's alone (`forcedConfig`, through
   `GIT_CONFIG_COUNT`, which outranks the repository's config), and it forces
   `receive.fsckObjects` so a pushed tree cannot hold `..` or `.git`; browser headers are
-  refused before the peer gate. `server.ts` sets `requestTimeout = 0` on the tailnet
-  server so a long pack upload is not cut.
+  refused before the peer gate. The child's environment is built from an allowlist (no
+  inherited CGI variable reaches it). `server.ts` sets `requestTimeout = 0` on the tailnet
+  server so a long pack upload is not cut; the git routes carry an idle bound instead.
+  Verified on 2026-11-25.
 - **`src/gitServe/commit.ts`** — `POST /commit`, R-GS-18 to R-GS-22. `planCommit` is the
   pure check against the parent tree; `applyCommit` builds the tree in a private index
   (`update-index --index-info`, `core.protectHFS`/`core.protectNTFS` forced on, never
