@@ -17,6 +17,7 @@ import http from 'node:http';
 
 import { checkPeer, normalizeAddress } from '../dist/gitServe/peerGate.js';
 import {
+  limitConcurrency,
   parseTailnetIdentity,
   parseWhois,
   resolveAllowLogins,
@@ -337,4 +338,42 @@ test('G-GS-7 in the server: a valid token does not stand in for the peer check, 
     await handle.close();
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('limitConcurrency: never more than max at once, waiters run in order, a rejecting task hands its slot on', async () => {
+  const limited = limitConcurrency(2);
+  let running = 0;
+  let peak = 0;
+  const started = [];
+  const gates = [];
+  const task = (i, fail = false) => () =>
+    new Promise((resolve, reject) => {
+      running++;
+      peak = Math.max(peak, running);
+      started.push(i);
+      gates[i] = () => {
+        running--;
+        if (fail) reject(new Error(`task ${i}`));
+        else resolve(i);
+      };
+    });
+  const results = [0, 1, 2, 3, 4].map((i) => limited(task(i, i === 0)).then((v) => v, (e) => e.message));
+  const tick = () => new Promise((r) => setImmediate(r));
+  await tick();
+  assert.deepEqual(started, [0, 1]);
+  gates[0](); // rejects: its slot still passes to the next waiter
+  await tick();
+  assert.deepEqual(started, [0, 1, 2]);
+  gates[1]();
+  await tick();
+  gates[2]();
+  await tick();
+  assert.deepEqual(started, [0, 1, 2, 3, 4]);
+  gates[3]();
+  gates[4]();
+  assert.deepEqual(await Promise.all(results), ['task 0', 1, 2, 3, 4]);
+  assert.equal(peak, 2);
+  // Every slot came back: two more run at once without waiting.
+  const again = [limited(async () => 'a'), limited(async () => 'b')];
+  assert.deepEqual(await Promise.all(again), ['a', 'b']);
 });

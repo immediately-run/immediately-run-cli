@@ -16,6 +16,7 @@ import http from 'node:http';
 import { startGitServe } from '../dist/gitServe/server.js';
 import {
   MAX_COMMIT_BODY_BYTES,
+  foldPath,
   parseAuthor,
   parseCommitRequest,
   planCommit,
@@ -118,13 +119,14 @@ const post = (port, path, { headers = {}, body } = {}) =>
   });
 
 /** A loopback server; its session credential carries `write` exactly when `allowCommit`. */
-const loopback = async (root, { allowCommit = true } = {}) => {
+const loopback = async (root, { allowCommit = true, commitBodyIdleMs } = {}) => {
   const handle = await startGitServe({
     root,
     origin: ORIGIN,
     token: TOKEN,
     port: 0,
     allowCommit,
+    commitBodyIdleMs,
     identity: IDENTITY,
     log: () => {},
   });
@@ -409,8 +411,17 @@ test('G-GS-14: the hostile-path table — each is a 400 naming the path, and the
       ['sub/dir/.GitModules', 'gitmodules'],
       ['link', 'under-symlink'], // the symlink entry itself
       ['link/inside', 'under-symlink'],
+      // Spellings a case-insensitive or normalizing checkout writes through the
+      // symlink `link` (HFS+, APFS, NTFS).
+      ['LINK/hooks/x', 'under-symlink'],
+      ['Link', 'under-symlink'],
+      ['li\u200cnk/x', 'under-symlink'],
+      ['link./x', 'under-symlink'],
+      ['link /x', 'under-symlink'],
+      ['link:s/x', 'under-symlink'],
       ['vendor/sub', 'under-submodule'],
       ['vendor/sub/file', 'under-submodule'],
+      ['VENDOR/Sub/file', 'under-submodule'],
       ['dir', 'file-over-directory'],
       ['a.txt/child', 'directory-over-file'],
       ['/abs', 'path-malformed'],
@@ -748,6 +759,52 @@ test('G-GS-15: a body one byte over the limit is a 413; one at the limit is read
   }
 });
 
+test('R-GS-6: a SHA-256 repository is refused by /commit as by the read routes, never answered 409', async (t) => {
+  const { root } = makeRoot();
+  const dir = join(root, 'wide.git');
+  try {
+    git(root, ['init', '--bare', '-q', '--object-format=sha256', dir]);
+  } catch {
+    t.skip('this git cannot create a SHA-256 repository');
+    return;
+  }
+  const s = await loopback(root);
+  try {
+    const res = await s.commit({ repo: 'wide', branch: 'main', expectedSha: 'a'.repeat(40), message: 'm', changes: [{ path: 'a', contentBase64: b64('x') }] });
+    assert.equal(res.status, 400, res.text);
+    assert.equal(res.body.reason, 'unsupported-object-format');
+  } finally {
+    await s.handle.close();
+  }
+});
+
+test('a stalled body is answered 408 idle and its connection cut; nothing lands', async () => {
+  const { root, bare, tip } = makeRoot();
+  const s = await loopback(root, { commitBodyIdleMs: 200 });
+  try {
+    const started = Date.now();
+    const answer = await new Promise((resolvePromise) => {
+      const req = http.request(
+        { host: '127.0.0.1', port: s.handle.port, path: '/commit', method: 'POST', headers: { Origin: MEDIATOR, Authorization: `Bearer ${TOKEN}`, 'Content-Length': 1000 } },
+        (res) => {
+          const chunks = [];
+          res.on('data', (c) => chunks.push(c));
+          res.on('end', () => resolvePromise({ status: res.statusCode, connection: res.headers.connection, body: JSON.parse(Buffer.concat(chunks).toString('utf8')) }));
+        },
+      );
+      req.on('error', (e) => resolvePromise({ status: 0, error: e.code }));
+      req.write('{"repo":"notes"'); // then nothing more
+    });
+    assert.equal(answer.status, 408, JSON.stringify(answer));
+    assert.equal(answer.body.reason, 'idle');
+    assert.equal(answer.connection, 'close');
+    assert.ok(Date.now() - started < 5000);
+    assert.equal(git(bare, ['rev-parse', 'refs/heads/main']), tip);
+  } finally {
+    await s.handle.close();
+  }
+});
+
 test('a body that is not JSON, or not an object, is a 400', async () => {
   const { root, tip } = makeRoot();
   const s = await loopback(root);
@@ -775,6 +832,15 @@ test('a body that is not JSON, or not an object, is a 400', async () => {
 });
 
 // --- units -------------------------------------------------------------------
+
+test('foldPath: the spellings a case-insensitive, normalizing checkout merges fold alike', () => {
+  assert.equal(foldPath('LINK/Hooks/x'), 'link/hooks/x');
+  assert.equal(foldPath('cafe\u0301/x'), foldPath('caf\u00e9/x'), 'NFD and NFC');
+  assert.equal(foldPath('li\u200cnk/x\ufeff'), 'link/x');
+  assert.equal(foldPath('link. ./x'), 'link/x');
+  assert.equal(foldPath('link::$DATA/x'), 'link/x');
+  assert.notEqual(foldPath('link2/x'), foldPath('link/x'));
+});
 
 test('planCommit: modes come from the parent tree, never from the request', () => {
   const parent = new Map([

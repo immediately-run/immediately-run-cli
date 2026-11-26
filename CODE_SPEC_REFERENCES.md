@@ -75,4 +75,9 @@ core_concepts §9).
   and refuses the request unless every planned path is there as planned. A new branch
   under an existing tag's name is refused; `withConnectionTrailer` adds the connection
   trailer to the message's own trailer block when it ends in one. The two gates of
-  R-GS-23 (`--allow-commit`, the `write` scope) are checked in `server.ts` on every request.
+  R-GS-23 (`--allow-commit`, the `write` scope) are checked in `server.ts` on every request. A path at or
+  under a parent symlink or submodule is refused under every spelling that folds to it
+  (`foldPath`: case, NFC, HFS-ignorable code points, NTFS trailing dots/spaces and stream
+  suffixes). The repository is opened with `readRoutes.openRepo`, so a SHA-256 repository
+  is a 400 as on the read routes. The body read has an idle bound (`COMMIT_BODY_IDLE_MS`,
+  408 `idle`), which the spec's error table does not list.

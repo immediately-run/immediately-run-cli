@@ -38,10 +38,9 @@ import { gitServeNamespace } from './namespace.js';
 import { exchangePairingCodeAsync } from './pairing.js';
 import { checkPeer, type PeerGateConfig } from './peerGate.js';
 import { GIT_SERVE_PROTOCOL, GIT_SERVE_SERVER, type RunGit } from './protocol.js';
-import { answerRead, type ReadAnswer } from './readRoutes.js';
+import { answerRead, openRepo, type ReadAnswer } from './readRoutes.js';
 import { runGit as realRunGit, spawnGit } from './runGit.js';
 import { hasBrowserHeaders, planGitRequest, runBackend } from './smartHttp.js';
-import { resolveRepo } from './repoName.js';
 import { loadInstanceId } from './state.js';
 
 /** How long a connection whose answer went out before its body was read stays
@@ -83,6 +82,8 @@ export interface GitServeOptions {
   identity?: CommitIdentity;
   /** The git routes' idle bound (default `GIT_IDLE_TIMEOUT_MS`); tests shorten it. */
   gitIdleTimeoutMs?: number;
+  /** `/commit`'s body idle bound (default `COMMIT_BODY_IDLE_MS`); tests shorten it. */
+  commitBodyIdleMs?: number;
   /** Tests inject a `runGit` to move a ref between two of the server's own git calls. */
   runGit?: RunGit;
   /** Where refusals are logged (default: stderr). Never receives a credential. */
@@ -133,34 +134,56 @@ const sendRefusal = (
 ): void =>
   sendJson(res, status, { server: GIT_SERVE_SERVER, protocol: GIT_SERVE_PROTOCOL, reason }, cors);
 
-/** Reads a request body, counting bytes as they arrive. Resolves null once the
- *  count passes `limit`; the rest of the body is then discarded, not buffered. */
-const readBody = (req: http.IncomingMessage, limit: number): Promise<Buffer | null> =>
+/** How long `/commit` waits for the next byte of its body. On a tailnet Node's
+ *  `requestTimeout` is off (for long pushes), so without this a stalled body
+ *  would hold its connection and buffered chunks for ever. */
+export const COMMIT_BODY_IDLE_MS = 30_000;
+
+/** Reads a request body, counting bytes as they arrive. Answers `too-large` once
+ *  the count passes `limit`, and `idle` when no byte arrives for `idleMs`; the
+ *  rest of the body is then discarded, not buffered. */
+const readBody = (
+  req: http.IncomingMessage,
+  limit: number,
+  idleMs: number,
+): Promise<Buffer | 'too-large' | 'idle'> =>
   new Promise((resolve, reject) => {
     const declared = Number(req.headers['content-length']);
     if (Number.isFinite(declared) && declared > limit) {
       req.resume();
-      resolve(null);
+      resolve('too-large');
       return;
     }
     const chunks: Buffer[] = [];
     let size = 0;
-    let over = false;
+    let done = false;
+    const finish = (answer: Buffer | 'too-large' | 'idle'): void => {
+      done = true;
+      clearTimeout(timer);
+      chunks.length = 0;
+      resolve(answer);
+    };
+    let timer = setTimeout(() => finish('idle'), idleMs);
     req.on('data', (chunk: Buffer) => {
-      if (over) return;
+      if (done) return;
+      clearTimeout(timer);
+      timer = setTimeout(() => finish('idle'), idleMs);
       size += chunk.length;
       if (size > limit) {
-        over = true;
-        chunks.length = 0;
-        resolve(null);
+        finish('too-large');
         return;
       }
       chunks.push(chunk);
     });
     req.on('end', () => {
-      if (!over) resolve(Buffer.concat(chunks));
+      if (done) return;
+      const body = Buffer.concat(chunks);
+      finish(body);
     });
-    req.on('error', reject);
+    req.on('error', (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
   });
 
 const sendBlob = (
@@ -211,6 +234,16 @@ const sendBlob = (
   res.on('close', () => {
     if (child.exitCode === null) child.kill();
   });
+};
+
+/** A read route's answer, JSON or blob. */
+const reply = (
+  res: http.ServerResponse,
+  answer: ReadAnswer,
+  cors: Record<string, string>,
+): void => {
+  if (answer.kind === 'json') sendJson(res, answer.status, answer.body, cors);
+  else sendBlob(res, answer, cors);
 };
 
 export const startGitServe = (opts: GitServeOptions): Promise<GitServeHandle> => {
@@ -410,9 +443,13 @@ export const startGitServe = (opts: GitServeOptions): Promise<GitServeHandle> =>
         refuse(403, 'scope', cors);
         return;
       }
-      const raw = await readBody(req, MAX_COMMIT_BODY_BYTES);
-      if (raw === null) {
+      const raw = await readBody(req, MAX_COMMIT_BODY_BYTES, opts.commitBodyIdleMs ?? COMMIT_BODY_IDLE_MS);
+      if (raw === 'too-large') {
         refuse(413, 'too-large', cors);
+        return;
+      }
+      if (raw === 'idle') {
+        refuse(408, 'idle', cors);
         return;
       }
       const sendCommitRefusal = (refusal: CommitRefusal): void => {
@@ -432,10 +469,11 @@ export const startGitServe = (opts: GitServeOptions): Promise<GitServeHandle> =>
         sendCommitRefusal(parsed.refusal);
         return;
       }
-      // R-GS-6, the same rule as every other route that names a repository.
-      const repo = resolveRepo(root, parsed.request.repo);
+      // R-GS-6 and the object-format check, opened as every other route that
+      // names a repository opens it.
+      const repo = await openRepo({ root, runGit }, parsed.request.repo);
       if (!repo.ok) {
-        refuse(repo.reason === 'malformed' ? 400 : 404, repo.reason === 'malformed' ? 'malformed' : 'not-found', cors);
+        reply(res, repo.answer, cors);
         return;
       }
       const applied = await applyCommit(repo.dir, parsed.request, {
@@ -471,8 +509,7 @@ export const startGitServe = (opts: GitServeOptions): Promise<GitServeHandle> =>
       allowCommit,
       runGit,
     });
-    if (answer.kind === 'json') sendJson(res, answer.status, answer.body, cors);
-    else sendBlob(res, answer, cors);
+    reply(res, answer, cors);
   };
 
   const handler: http.RequestListener = (req, res) => {

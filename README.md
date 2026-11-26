@@ -216,9 +216,10 @@ endpoint and no credential.
   token its pairing produced. The server prints no token on a tailnet.
 - **A code** works once, for ten minutes, and dies after five wrong guesses from
   anyone. `pair --scope write` grants the `write` scope; the default is `read`.
-- While `pair` or `connections` is writing the state files, the server answers
-  a pairing request with 503 (reason `busy`, `Retry-After: 1`). Nothing is
-  counted against the code; enter it again.
+- While `pair` or `connections` is writing the state files, a pairing request
+  waits for them (they take milliseconds). If they are still held after five
+  seconds the request fails with a 500; nothing is counted against the code, so
+  enter it again.
 - **`git-serve connections <root>`** lists the browsers that have paired, and
   `--revoke <id>` removes one: its next request fails. Tokens are stored hashed
   in `<root>/.git-serve/`.

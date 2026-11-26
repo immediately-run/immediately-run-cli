@@ -169,6 +169,23 @@ export const isGitmodulesName = (component: string): boolean => {
   return name === '.gitmodules' || /^gitmod~[1-4]$/.test(name) || /^gi7eba~?/.test(name) || /^gi7eb~/.test(name);
 };
 
+/**
+ * A path as a case-insensitive, normalizing checkout (HFS+, APFS, NTFS) would
+ * resolve it: each component without HFS-ignorable code points, NFC-normalized,
+ * lower-cased, without an NTFS stream suffix or trailing dots and spaces. Two
+ * paths that fold alike can land on the same file on such a disk.
+ */
+export const foldPath = (path: string): string =>
+  path
+    .split('/')
+    .map((component) => {
+      let name = component.replace(HFS_IGNORABLE, '').normalize('NFC').toLowerCase();
+      const stream = name.indexOf(':');
+      if (stream !== -1) name = name.slice(0, stream);
+      return name.replace(/[. ]+$/, '');
+    })
+    .join('/');
+
 /** Every proper directory prefix of a path: `a/b/c` → `a`, `a/b`. */
 const prefixes = (path: string): string[] => {
   const parts = path.split('/');
@@ -189,6 +206,13 @@ export const planCommit = (
   // The directories of the parent tree: every prefix of every entry.
   const parentDirs = new Set<string>();
   for (const path of parentTree.keys()) for (const dir of prefixes(path)) parentDirs.add(dir);
+  // The parent's symlinks and submodules, by folded path: on a case-insensitive
+  // checkout `LINK/hooks/x` is written through a symlink named `link`.
+  const links = new Map<string, 'under-symlink' | 'under-submodule'>();
+  for (const [path, entry] of parentTree) {
+    if (entry.mode === '120000') links.set(foldPath(path), 'under-symlink');
+    else if (entry.mode === '160000') links.set(foldPath(path), 'under-submodule');
+  }
 
   const seen = new Set<string>();
   const plan: CommitPlan = { writes: [], deletes: [] };
@@ -205,11 +229,11 @@ export const planCommit = (
     // `.gitmodules` decides where a submodule is fetched from. Refused under
     // every spelling, at any depth.
     if (path.split('/').some(isGitmodulesName)) return bad('gitmodules', path);
-    // At or under a symlink or a submodule of the parent tree.
+    // At or under a symlink or a submodule of the parent tree, in any spelling
+    // that folds to it.
     for (const at of [...prefixes(path), path]) {
-      const mode = parentTree.get(at)?.mode;
-      if (mode === '120000') return bad('under-symlink', path);
-      if (mode === '160000') return bad('under-submodule', path);
+      const link = links.get(foldPath(at));
+      if (link !== undefined) return bad(link, path);
     }
     const existing = parentTree.get(path);
     if ('delete' in change) {

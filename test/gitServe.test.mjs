@@ -870,6 +870,23 @@ const spawnCli = (args) => {
   return { child, firstLine };
 };
 
+test('cli: --allow-commit --author makes --json and /meta report allowCommit true', async () => {
+  const { child, firstLine } = spawnCli(['git-serve', root, '--port', '0', '--json', '--origin', ORIGIN, '--allow-commit', '--author', 'Dev <dev@example.com>']);
+  try {
+    const info = JSON.parse(await firstLine);
+    assert.equal(info.allowCommit, true);
+    const res = await request('/meta', {
+      port: info.port,
+      headers: { Origin: MEDIATOR, Authorization: `Bearer ${info.token}` },
+    });
+    assert.equal(res.status, 200);
+    assert.equal(JSON.parse(res.body).allowCommit, true);
+  } finally {
+    child.kill('SIGTERM');
+    await new Promise((r) => child.on('exit', r));
+  }
+});
+
 test('cli: git-serve --json prints one line with a deep link per repository, and serves it', async () => {
   const { child, firstLine } = spawnCli(['git-serve', root, '--port', '0', '--json', '--origin', ORIGIN]);
   try {
