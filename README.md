@@ -149,10 +149,15 @@ npx @immediately-run/cli git-serve ~/repos
 | `--host` | this node's MagicDNS name | Hostname for `--bind tailscale` |
 | `--cert` | `<host>.crt` in `<root>/.git-serve/`, `<root>` or the current directory, else minted into `<root>/.git-serve/` by `tailscale cert` | TLS certificate for `--bind tailscale`; its `.key` sibling is the key |
 | `--allow-login` | none | With `--bind tailscale`, also serve devices of this tailnet user (repeatable) |
-| `--allow-push` | off | With `--bind tailscale`, let git clients push branches (fast-forward only, no branch deletes; tags and other refs cannot be pushed) |
+| `--allow-push` | off | With `--bind tailscale`, let git clients push (fast-forward only, no branch deletes) |
+| `--allow-commit` | off | Let the browser commit through `POST /commit` (below) |
+| `--author` | this machine's git `user.name` and `user.email` | With `--allow-commit`, the author and committer of browser commits, as `"Name <email>"` |
 | `--origin` | `https://immediately.run` | Allowed browser origin and deep-link base; the site's local-development mediator origin is admitted with it |
 | `--origin-unsafe` | off | Allow an `--origin` outside the recognized set |
 | `--json` | off | One JSON line on stdout: `{ endpoint, namespace, port, protocol, allowPush, allowCommit, links: [{ repo, url }] }`, plus `token` on `localhost` only |
+
+With `--allow-commit` it also takes one write, `POST /commit` (see
+"Committing from the browser").
 
 What it serves, to a request that carries the session token:
 
@@ -169,6 +174,12 @@ GET /blob?repo=<r>&sha=<blobSha>   one blob's bytes
   `objects/info/alternates` are not served.
 - A **ref is a branch, a tag or a 40-hex commit**, looked up exactly. No
   revision expression (`HEAD~1`, `a..b`, `x^{tree}`) is evaluated.
+- A **name that is both a branch and a tag** is not resolved: the answer is
+  400 with reason `ambiguous`. The server does not pick one for you. Both are
+  still listed, and each commit opens by its SHA. Rename or delete one of the
+  two on the serving machine to use the name again.
+- A **tree with a path segment `.`, `..` or `.git`** (in any case) is not
+  listed: `/tree` answers 500. git itself never writes such a tree.
 - The **namespace** in the link (`localhost-<20 hex>`) is derived from an id
   kept in `<root>/.git-serve/`. Deleting that directory gives the root's
   repositories a new namespace on the host, with new grants and a fresh overlay.
@@ -205,6 +216,10 @@ endpoint and no credential.
   token its pairing produced. The server prints no token on a tailnet.
 - **A code** works once, for ten minutes, and dies after five wrong guesses from
   anyone. `pair --scope write` grants the `write` scope; the default is `read`.
+- While `pair` or `connections` is writing the state files, a pairing request
+  waits for them (they take milliseconds). If they are still held after five
+  seconds the request fails with a 500; nothing is counted against the code, so
+  enter it again.
 - **`git-serve connections <root>`** lists the browsers that have paired, and
   `--revoke <id>` removes one: its next request fails. Tokens are stored hashed
   in `<root>/.git-serve/`.
@@ -213,6 +228,35 @@ endpoint and no credential.
   changing the port or the machine name makes a new one.
 - Peer identity is device identity: every process and every OS user on a device
   signed in as you can reach the server.
+
+### Committing from the browser
+
+```sh
+npx @immediately-run/cli git-serve ~/repos --allow-commit
+```
+
+With `--allow-commit` the page can commit the edits made in its editor. The
+server writes the commit; the browser sends only file contents and a message.
+
+- **One commit, on one branch, as a compare-and-swap.** The request names the
+  branch tip the browser saw. If the branch moved meanwhile, nothing is written
+  and the browser is told the current tip (409). A new branch names its parent
+  commit instead. A tag is never written, and a branch is never rewound. A new
+  branch cannot take the name of an existing tag.
+- **Paths are checked by git itself**, with its HFS and NTFS protections forced
+  on: nothing can be written under `.git` in any spelling. A change to
+  `.gitmodules`, and to or under a symlink or a submodule, is refused as well.
+- **File modes are never the request's.** A new file is `100644`; a changed file
+  keeps its mode.
+- **The author is this machine's** git identity, or `--author`. The request
+  carries none. Each commit ends with a `Git-Serve-Connection:` trailer naming
+  the connection that made it (`loopback` on localhost). When the message
+  already ends in trailers (`Signed-off-by:`), the line joins them.
+- **Two gates on a tailnet.** The server must run with `--allow-commit`, and the
+  browser's connection must have been paired with `pair --scope write`. On
+  localhost the flag is the one gate.
+- **About 3 MiB of file content per commit**, across all files (4 MiB of request
+  body). A larger change is a job for `git push`.
 
 ### Plain git against the same server
 
@@ -225,17 +269,20 @@ git clone https://<machine>.<tailnet>.ts.net:7701/notes.git
 
 - `git clone` and `git fetch` are always on for your own devices (the peer
   check above is the whole gate; there is no token on these routes).
-- `git push` needs the server started with `--allow-push`. A push must be a
-  fast-forward and cannot delete a branch. Rewriting a branch means doing it on
-  the serving machine's disk.
-- A push can only update branches (`refs/heads/`). Tags and every other ref
-  are hidden from push, so `git push --tags` (or `push.followTags`) fails with
-  "deny updating a hidden ref"; create tags on the serving machine. git's
-  fast-forward and delete rules cover branches only, so without this a pushed
-  tag could be moved or deleted.
-- A repository's own config cannot turn push on, or force-pushes and deletes
-  back on: the server sets `http.receivepack`, `receive.denyNonFastForwards`,
-  `receive.denyDeletes` and `receive.hideRefs` itself for every request.
+- `git push` needs the server started with `--allow-push`. A push can only
+  touch branches: it must be a fast-forward and cannot delete one, and a tag
+  (or any other ref) cannot be pushed, moved or deleted. Rewriting a branch or
+  tagging means doing it on the serving machine's disk.
+- Every pushed object is checked (`receive.fsckObjects`). A push that carries
+  a tree entry named `.`, `..` or `.git`, or any other object `git fsck`
+  refuses, is rejected whole. History that already has such objects (some old
+  imported repositories do) has to be pushed to the path on the serving machine.
+- A repository's own config cannot turn push on, or force-pushes, deletes and
+  unchecked objects back on: the server sets `http.receivepack`,
+  `receive.denyNonFastForwards`, `receive.denyDeletes` and
+  `receive.hideRefs` and `receive.fsckObjects` itself for every request.
+- On a tailnet, git requests have an idle timeout and can keep uploading as
+  long as progress continues.
 - Only `/<name>.git/info/refs?service=…`, `/<name>.git/git-upload-pack` and
   `/<name>.git/git-receive-pack` are served. The file routes of the older
   "dumb" protocol are not.

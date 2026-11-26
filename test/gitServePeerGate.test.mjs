@@ -9,7 +9,7 @@
 // what the gate does with such an answer, not that the daemon gives it.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -17,9 +17,11 @@ import http from 'node:http';
 
 import { checkPeer, normalizeAddress } from '../dist/gitServe/peerGate.js';
 import {
+  limitConcurrency,
   parseTailnetIdentity,
   parseWhois,
   resolveAllowLogins,
+  tailscaleWhois,
 } from '../dist/gitServe/tailscaleWhois.js';
 import { startGitServe } from '../dist/gitServe/server.js';
 import { addConnection } from '../dist/gitServe/connections.js';
@@ -247,6 +249,30 @@ test('parseTailnetIdentity refuses a status it cannot use', () => {
   }
 });
 
+test('at most eight `tailscale whois` processes run at once; the rest wait and are all answered', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ir-git-serve-whois-'));
+  try {
+    // A stand-in for the tailscale binary. Each run leaves a file while it is
+    // alive, and records how many such files it saw when it started.
+    const bin = join(dir, 'tailscale');
+    writeFileSync(
+      bin,
+      '#!/bin/sh\nd="$(dirname "$0")"\nmkdir -p "$d/live"\n: > "$d/live/$$"\nsleep 0.3\n' +
+        'ls "$d/live" | wc -l >> "$d/seen"\nrm "$d/live/$$"\necho "peer not found" >&2\nexit 1\n',
+    );
+    chmodSync(bin, 0o755);
+    const whois = tailscaleWhois(bin);
+    const answers = await Promise.all(Array.from({ length: 20 }, (_, i) => whois(`100.64.0.${i + 1}`)));
+    assert.equal(answers.length, 20);
+    for (const answer of answers) assert.deepEqual(answer, { kind: 'unknown' });
+    const seen = readFileSync(join(dir, 'seen'), 'utf8').trim().split('\n').map(Number);
+    assert.equal(seen.length, 20, 'every lookup ran');
+    assert.equal(Math.max(...seen), 8, `the most alive together: ${seen.join(' ')}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('normalizeAddress: an IPv4-mapped address is its IPv4 form', () => {
   assert.equal(normalizeAddress('::ffff:100.64.0.2'), '100.64.0.2');
   assert.equal(normalizeAddress('FD7A:115C:A1E0::2'), 'fd7a:115c:a1e0::2');
@@ -312,4 +338,42 @@ test('G-GS-7 in the server: a valid token does not stand in for the peer check, 
     await handle.close();
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('limitConcurrency: never more than max at once, waiters run in order, a rejecting task hands its slot on', async () => {
+  const limited = limitConcurrency(2);
+  let running = 0;
+  let peak = 0;
+  const started = [];
+  const gates = [];
+  const task = (i, fail = false) => () =>
+    new Promise((resolve, reject) => {
+      running++;
+      peak = Math.max(peak, running);
+      started.push(i);
+      gates[i] = () => {
+        running--;
+        if (fail) reject(new Error(`task ${i}`));
+        else resolve(i);
+      };
+    });
+  const results = [0, 1, 2, 3, 4].map((i) => limited(task(i, i === 0)).then((v) => v, (e) => e.message));
+  const tick = () => new Promise((r) => setImmediate(r));
+  await tick();
+  assert.deepEqual(started, [0, 1]);
+  gates[0](); // rejects: its slot still passes to the next waiter
+  await tick();
+  assert.deepEqual(started, [0, 1, 2]);
+  gates[1]();
+  await tick();
+  gates[2]();
+  await tick();
+  assert.deepEqual(started, [0, 1, 2, 3, 4]);
+  gates[3]();
+  gates[4]();
+  assert.deepEqual(await Promise.all(results), ['task 0', 1, 2, 3, 4]);
+  assert.equal(peak, 2);
+  // Every slot came back: two more run at once without waiting.
+  const again = [limited(async () => 'a'), limited(async () => 'b')];
+  assert.deepEqual(await Promise.all(again), ['a', 'b']);
 });

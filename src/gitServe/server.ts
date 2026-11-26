@@ -15,6 +15,8 @@
  *             smart-HTTP routes (`smartHttp.ts`).
  *
  * It reads committed objects only; there is no working tree and no stream route.
+ * Its one write is `POST /commit` (`commit.ts`), behind `--allow-commit` and the
+ * `write` scope, both checked on every request (R-GS-23).
  */
 
 import * as http from 'node:http';
@@ -24,12 +26,19 @@ import { realpathSync } from 'node:fs';
 
 import { LOOPBACK_HOSTS, admittedOrigins } from '../devServer.js';
 import { connectionLookup, type ConnectionScope } from './connections.js';
-import { READ_ROUTES, TAILNET_ROUTES, admit, authorize, sameSecret } from './guards.js';
+import {
+  MAX_COMMIT_BODY_BYTES,
+  applyCommit,
+  parseCommitRequest,
+  type CommitIdentity,
+  type CommitRefusal,
+} from './commit.js';
+import { LOOPBACK_ROUTES, TAILNET_ROUTES, admit, authorize, sameSecret } from './guards.js';
 import { gitServeNamespace } from './namespace.js';
 import { exchangePairingCodeAsync } from './pairing.js';
 import { checkPeer, type PeerGateConfig } from './peerGate.js';
 import { GIT_SERVE_PROTOCOL, GIT_SERVE_SERVER, type RunGit } from './protocol.js';
-import { answerRead, type ReadAnswer } from './readRoutes.js';
+import { answerRead, openRepo, type ReadAnswer } from './readRoutes.js';
 import { runGit as realRunGit, spawnGit } from './runGit.js';
 import { hasBrowserHeaders, planGitRequest, runBackend } from './smartHttp.js';
 import { loadInstanceId } from './state.js';
@@ -65,8 +74,16 @@ export interface GitServeOptions {
   /** `--allow-push`: git clients may push (fast-forward only, no deletes). It is
    *  the only thing that turns push on; a repository's own config cannot. */
   allowPush?: boolean;
+  /** `--allow-commit`: `POST /commit` is served to a connection that holds the
+   *  `write` scope. On loopback the session credential holds `write` exactly
+   *  when this is set. Requires `identity`. */
+  allowCommit?: boolean;
+  /** The author and committer of every browser commit (R-GS-22). */
+  identity?: CommitIdentity;
   /** The git routes' idle bound (default `GIT_IDLE_TIMEOUT_MS`); tests shorten it. */
   gitIdleTimeoutMs?: number;
+  /** `/commit`'s body idle bound (default `COMMIT_BODY_IDLE_MS`); tests shorten it. */
+  commitBodyIdleMs?: number;
   /** Tests inject a `runGit` to move a ref between two of the server's own git calls. */
   runGit?: RunGit;
   /** Where refusals are logged (default: stderr). Never receives a credential. */
@@ -116,6 +133,58 @@ const sendRefusal = (
   cors: Record<string, string>,
 ): void =>
   sendJson(res, status, { server: GIT_SERVE_SERVER, protocol: GIT_SERVE_PROTOCOL, reason }, cors);
+
+/** How long `/commit` waits for the next byte of its body. On a tailnet Node's
+ *  `requestTimeout` is off (for long pushes), so without this a stalled body
+ *  would hold its connection and buffered chunks for ever. */
+export const COMMIT_BODY_IDLE_MS = 30_000;
+
+/** Reads a request body, counting bytes as they arrive. Answers `too-large` once
+ *  the count passes `limit`, and `idle` when no byte arrives for `idleMs`; the
+ *  rest of the body is then discarded, not buffered. */
+const readBody = (
+  req: http.IncomingMessage,
+  limit: number,
+  idleMs: number,
+): Promise<Buffer | 'too-large' | 'idle'> =>
+  new Promise((resolve, reject) => {
+    const declared = Number(req.headers['content-length']);
+    if (Number.isFinite(declared) && declared > limit) {
+      req.resume();
+      resolve('too-large');
+      return;
+    }
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let done = false;
+    const finish = (answer: Buffer | 'too-large' | 'idle'): void => {
+      done = true;
+      clearTimeout(timer);
+      chunks.length = 0;
+      resolve(answer);
+    };
+    let timer = setTimeout(() => finish('idle'), idleMs);
+    req.on('data', (chunk: Buffer) => {
+      if (done) return;
+      clearTimeout(timer);
+      timer = setTimeout(() => finish('idle'), idleMs);
+      size += chunk.length;
+      if (size > limit) {
+        finish('too-large');
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      if (done) return;
+      const body = Buffer.concat(chunks);
+      finish(body);
+    });
+    req.on('error', (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
+  });
 
 const sendBlob = (
   res: http.ServerResponse,
@@ -167,9 +236,24 @@ const sendBlob = (
   });
 };
 
+/** A read route's answer, JSON or blob. */
+const reply = (
+  res: http.ServerResponse,
+  answer: ReadAnswer,
+  cors: Record<string, string>,
+): void => {
+  if (answer.kind === 'json') sendJson(res, answer.status, answer.body, cors);
+  else sendBlob(res, answer, cors);
+};
+
 export const startGitServe = (opts: GitServeOptions): Promise<GitServeHandle> => {
   if ((opts.token === undefined) === (opts.tailnet === undefined)) {
     throw new Error('startGitServe takes exactly one of `token` (loopback) and `tailnet`.');
+  }
+  const allowCommit = opts.allowCommit === true;
+  const identity = opts.identity;
+  if (allowCommit && identity === undefined) {
+    throw new Error('allowCommit needs the identity that browser commits are written under.');
   }
   // HTTPS on the tailnet address (R-GS-9): a binding without the certificate
   // pair may only listen on loopback, which is how the tests drive this entry.
@@ -187,7 +271,7 @@ export const startGitServe = (opts: GitServeOptions): Promise<GitServeHandle> =>
   const origins = admittedOrigins(opts.origin);
   const tailnet = opts.tailnet;
   const allowedHosts = tailnet ? new Set([tailnet.host.toLowerCase()]) : LOOPBACK_HOSTS;
-  const routes = tailnet ? TAILNET_ROUTES : READ_ROUTES;
+  const routes = tailnet ? TAILNET_ROUTES : LOOPBACK_ROUTES;
   // Set once the port is known; the handler runs only after that.
   let namespace = '';
 
@@ -201,8 +285,10 @@ export const startGitServe = (opts: GitServeOptions): Promise<GitServeHandle> =>
       const record = connections.find(bearer);
       return record === null ? null : { connectionId: record.id, scope: record.scope };
     }
+    // On loopback there are no connections: the session credential carries
+    // `write` exactly when the server was started with --allow-commit (R-GS-23).
     return sessionSecret !== undefined && sameSecret(bearer, sessionSecret)
-      ? { connectionId: 'loopback', scope: 'read' }
+      ? { connectionId: 'loopback', scope: allowCommit ? 'write' : 'read' }
       : null;
   };
 
@@ -338,19 +424,92 @@ export const startGitServe = (opts: GitServeOptions): Promise<GitServeHandle> =>
     }
 
     // Every other browser route needs a live credential.
-    if (callerOf(bearer) === null) {
+    const caller = callerOf(bearer);
+    if (caller === null) {
       refuse(401, 'token', cors);
+      return;
+    }
+
+    if (url.pathname === '/commit') {
+      // R-GS-23: two gates, both checked on every request. Neither stands in
+      // for the other, and the mediator relaying the route is not a gate.
+      if (!allowCommit || identity === undefined) {
+        req.resume();
+        refuse(403, 'commit-disabled', cors);
+        return;
+      }
+      if (caller.scope !== 'write') {
+        req.resume();
+        refuse(403, 'scope', cors);
+        return;
+      }
+      const raw = await readBody(req, MAX_COMMIT_BODY_BYTES, opts.commitBodyIdleMs ?? COMMIT_BODY_IDLE_MS);
+      if (raw === 'too-large') {
+        refuse(413, 'too-large', cors);
+        return;
+      }
+      if (raw === 'idle') {
+        refuse(408, 'idle', cors);
+        return;
+      }
+      const sendCommitRefusal = (refusal: CommitRefusal): void => {
+        const { status, ...rest } = refusal;
+        log(`git-serve: refused (${refusal.reason}) POST /commit by connection ${caller.connectionId}`);
+        sendJson(res, status, { server: GIT_SERVE_SERVER, protocol: GIT_SERVE_PROTOCOL, ...rest }, cors);
+      };
+      let body: unknown;
+      try {
+        body = JSON.parse(raw.toString('utf8'));
+      } catch {
+        sendCommitRefusal({ status: 400, reason: 'malformed' });
+        return;
+      }
+      const parsed = parseCommitRequest(body);
+      if (!parsed.ok) {
+        sendCommitRefusal(parsed.refusal);
+        return;
+      }
+      // R-GS-6 and the object-format check, opened as every other route that
+      // names a repository opens it.
+      const repo = await openRepo({ root, runGit }, parsed.request.repo);
+      if (!repo.ok) {
+        reply(res, repo.answer, cors);
+        return;
+      }
+      const applied = await applyCommit(repo.dir, parsed.request, {
+        runGit,
+        identity,
+        connectionId: caller.connectionId,
+      });
+      if (!applied.ok) {
+        sendCommitRefusal(applied.refusal);
+        return;
+      }
+      log(
+        `git-serve: commit ${applied.commitSha} on ${repo.name} ${parsed.request.branch} ` +
+          `by connection ${caller.connectionId}`,
+      );
+      sendJson(
+        res,
+        200,
+        {
+          server: GIT_SERVE_SERVER,
+          protocol: GIT_SERVE_PROTOCOL,
+          commitSha: applied.commitSha,
+          treeSha: applied.treeSha,
+        },
+        cors,
+      );
       return;
     }
 
     const answer = await answerRead(url.pathname, url.searchParams, {
       root,
       instanceId,
-      allowCommit: false,
+      allowCommit,
       runGit,
     });
-    if (answer.kind === 'json') sendJson(res, answer.status, answer.body, cors);
-    else sendBlob(res, answer, cors);
+    reply(res, answer, cors);
   };
 
   const handler: http.RequestListener = (req, res) => {
@@ -360,14 +519,33 @@ export const startGitServe = (opts: GitServeOptions): Promise<GitServeHandle> =>
     // answer says `Connection: close`, so no client reuses the connection; it
     // is half-closed so the answer is read, then cut after a grace. A git
     // request piped to `http-backend` keeps its connection (git reuses it
-    // between rounds) and has its own idle bound.
+    // between rounds) and has its own idle bound. Whether a body is coming is
+    // read from the framing, not `req.complete`: a bodyless request (a CORS
+    // preflight, a GET) may not be `complete` yet when it is answered, and it
+    // must keep its connection. An unparsable Content-Length counts as a body.
+    const hasBody =
+      req.headers['transfer-encoding'] !== undefined ||
+      Number(req.headers['content-length'] ?? 0) !== 0;
+    const hasUnreadBody = () => hasBody && !req.complete;
     const writeHead = res.writeHead;
     res.writeHead = function (this: http.ServerResponse, ...args: unknown[]) {
-      if (!req.complete && !piped.has(res)) res.setHeader('Connection', 'close');
+      if (hasUnreadBody() && !piped.has(res)) {
+        res.setHeader('Connection', 'close');
+        // With `Connection: close` Node calls `socket.destroySoon()` once the
+        // answer is written, which closes the socket with the unread body still
+        // in its receive buffer: the kernel then sends a reset that can discard
+        // the answer before the client reads it (G-GS-15's 413 came back as
+        // ECONNRESET). Only half-close here; the body keeps draining and the
+        // grace below cuts the connection.
+        const socket = req.socket;
+        socket.destroySoon = () => {
+          socket.end();
+        };
+      }
       return (writeHead as (...a: unknown[]) => http.ServerResponse).apply(this, args);
     } as typeof res.writeHead;
     res.once('finish', () => {
-      if (req.complete) return;
+      if (!hasUnreadBody()) return;
       if (piped.has(res)) {
         // http-backend answered without reading the whole body: nothing more
         // can be said on this connection.

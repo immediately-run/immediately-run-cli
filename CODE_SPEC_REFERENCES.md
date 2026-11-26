@@ -35,8 +35,10 @@ core_concepts §9).
   around the SDK catalog.
 - **`src/gitServe/`** — `immediately-run git-serve` (GIT_SERVE_SPEC §4, §5.1, §9, §10.1).
   `repoName.ts` is R-GS-6 (a repository is a name), `refs.ts` R-GS-3 (exact ref lookup,
-  no revision expression), `readRoutes.ts` the five read answers with R-GS-2's one
-  resolution, `namespace.ts` R-GS-8 (held equal to site-main by
+  no revision expression; a name that is both a branch and a tag is refused 400
+  `ambiguous` rather than read as the branch, a deviation from R-GS-3's stated order that
+  awaits a spec amendment), `readRoutes.ts` the five read answers with R-GS-2's one
+  resolution (`/tree` answers 500 for a tree with a `.`, `..` or `.git` path segment), `namespace.ts` R-GS-8 (held equal to site-main by
   `test/fixtures/git-serve-namespace-vectors.json`), `guards.ts` the browser-class guards
   of §10.1. The guards are deliberately not `devServer.ts`'s: `Origin` is required, the
   token rides in `Authorization` only, and the Host header must carry the port.
@@ -51,12 +53,31 @@ core_concepts §9).
   `test/fixtures/tailscale-whois/`). Verified on 2026-11-25.
 - **`src/gitServe/pairing.ts` / `connections.ts`** — R-GS-24: a 40-bit one-time code that
   dies on success, on the fifth failure from any caller, or at ten minutes; 256-bit
-  connection tokens stored hashed and revocable at the next request. Verified on 2026-11-25.
+  connection tokens stored hashed and revocable at the next request. One lock file guards
+  every read-modify-write of the state files across processes. The commands wait for it
+  (`withStateLock`); the server waits asynchronously (`withStateLockAsync`). A takeover
+  pins the candidate lock with a hard link so it can check the same inode before removal.
 - **`src/gitServe/smartHttp.ts`** — R-GS-14/15/17: git's HTTP protocol through
   `git http-backend`, with the CLI deciding what is served. `matchGitRoute` admits four
   shapes from the raw request line; the child's `PATH_INFO`/`QUERY_STRING` are rebuilt from
   the parsed parts; push is the `--allow-push` flag's alone (`forcedConfig`, through
-  `GIT_CONFIG_COUNT`, which outranks the repository's config); browser headers are refused
-  before the peer gate. The child's environment is built from an allowlist (no inherited CGI
-  variable reaches it); the git routes carry an idle bound, not Node's whole-request timeout.
+  `GIT_CONFIG_COUNT`, which outranks the repository's config), and it forces
+  `receive.fsckObjects` so a pushed tree cannot hold `..` or `.git`; browser headers are
+  refused before the peer gate. The child's environment is built from an allowlist (no
+  inherited CGI variable reaches it). `server.ts` sets `requestTimeout = 0` on the tailnet
+  server so a long pack upload is not cut; the git routes carry an idle bound instead.
   Verified on 2026-11-25.
+- **`src/gitServe/commit.ts`** — `POST /commit`, R-GS-18 to R-GS-22. `planCommit` is the
+  pure check against the parent tree; `applyCommit` builds the tree in a private index
+  (`update-index --index-info`, `core.protectHFS`/`core.protectNTFS` forced on, never
+  `mktree`) and moves the branch with `update-ref <ref> <new> <old>`. git keeps a refused
+  path out of the index by SKIPPING it with exit 0, so `applyCommit` reads the index back
+  and refuses the request unless every planned path is there as planned. A new branch
+  under an existing tag's name is refused; `withConnectionTrailer` adds the connection
+  trailer to the message's own trailer block when it ends in one. The two gates of
+  R-GS-23 (`--allow-commit`, the `write` scope) are checked in `server.ts` on every request. A path at or
+  under a parent symlink or submodule is refused under every spelling that folds to it
+  (`foldPath`: case, NFC, HFS-ignorable code points, NTFS trailing dots/spaces and stream
+  suffixes). The repository is opened with `readRoutes.openRepo`, so a SHA-256 repository
+  is a 400 as on the read routes. The body read has an idle bound (`COMMIT_BODY_IDLE_MS`,
+  408 `idle`), which the spec's error table does not list.
