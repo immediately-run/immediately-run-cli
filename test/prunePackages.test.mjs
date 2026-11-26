@@ -9,6 +9,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { encode as encodeMsgPack, decode as decodeMsgPack } from '@msgpack/msgpack';
+import { PLATFORM_CORE_JS_VERSION } from '@immediately-run/transpiler';
 
 import { pruneBundledPackages, PLATFORM_SPECIFIERS } from '../dist/prunePackages.js';
 import { encodePackageKey, bundledPackageFilename } from '../dist/lockset.js';
@@ -259,7 +260,7 @@ test('pruning is deterministic: the same input produces the same bytes, in the s
 const RESOLVED = [
   { n: 'dom', v: '1.0.0', d: 0 },
   { n: 'sched', v: '1.0.0', d: 1 },
-  { n: 'core-js', v: '3.22.7', d: 0 },
+  { n: 'core-js', v: PLATFORM_CORE_JS_VERSION, d: 0 },
   { n: 'react-error-boundary', v: '6.1.0', d: 0 },
   { n: 'react-refresh', v: '0.11.0', d: 0 },
 ];
@@ -423,7 +424,10 @@ test('two builds of the same commit bundle byte-identical pruned packages', asyn
   try {
     const read = (zip) =>
       RESOLVED.map(({ n, v }) =>
-        execFileSync('unzip', ['-p', zip, `${PACKAGES_DIR}/${bundledPackageFilename(n, v)}.msgpack`]).toString('base64'),
+        execFileSync('unzip', ['-p', zip, `${PACKAGES_DIR}/${bundledPackageFilename(n, v)}.msgpack`], {
+          // core-js 3.51.0's record is past execFileSync's 1 MiB default.
+          maxBuffer: 256 * 1024 * 1024,
+        }).toString('base64'),
       );
     const first = await buildCacheZip(zipOpts(root, { out: join(root, 'a.zip') }));
     const second = await buildCacheZip(zipOpts(root, { out: join(root, 'b.zip') }));

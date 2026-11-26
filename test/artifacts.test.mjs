@@ -646,7 +646,7 @@ test('the flag set without a usable package name warns and emits no variants (R3
 test('a variant-ONLY transform failure keeps the base and skips just the variant (real `using` input)', async () => {
   // Round 2 of the gate found the real-input route round 1 wrongly declared
   // unreachable: the /app refresh chain carries
-  // @babel/plugin-proposal-explicit-resource-management and the plain
+  // @babel/plugin-transform-explicit-resource-management and the plain
   // /node_modules chain does NOT — so a `using` declaration compiles at /app
   // (base artifact emits) and FAILS at the mounted shape (variant skipped alone).
   const USING_TSX = `export function Res() {

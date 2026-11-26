@@ -320,7 +320,8 @@ const resolveLockset = async (
     // `cdnError` belongs in the DURABLE record, not only on the console. Without it, an
     // HTTP 500 on every request reads in the manifest as "may not exist on the CDN's npm
     // mirror yet — try a lower version range in package.json", which advises lowering a
-    // range on a pinned `core-js@3.22.7` and sends the next reader after the wrong thing.
+    // range on the exactly-pinned platform `core-js` and sends the next reader after the
+    // wrong thing.
     // The CDN's OWN failure leads when there is one: the completeness guard's message
     // ends in "try a lower version range in package.json", which is advice for mirror lag
     // and actively misleading when every request 500'd — it sends the next reader to lower
