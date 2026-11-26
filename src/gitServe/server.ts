@@ -492,7 +492,19 @@ export const startGitServe = (opts: GitServeOptions): Promise<GitServeHandle> =>
     const hasUnreadBody = () => hasBody && !req.complete;
     const writeHead = res.writeHead;
     res.writeHead = function (this: http.ServerResponse, ...args: unknown[]) {
-      if (hasUnreadBody() && !piped.has(res)) res.setHeader('Connection', 'close');
+      if (hasUnreadBody() && !piped.has(res)) {
+        res.setHeader('Connection', 'close');
+        // With `Connection: close` Node calls `socket.destroySoon()` once the
+        // answer is written, which closes the socket with the unread body still
+        // in its receive buffer: the kernel then sends a reset that can discard
+        // the answer before the client reads it (G-GS-15's 413 came back as
+        // ECONNRESET). Only half-close here; the body keeps draining and the
+        // grace below cuts the connection.
+        const socket = req.socket;
+        socket.destroySoon = () => {
+          socket.end();
+        };
+      }
       return (writeHead as (...a: unknown[]) => http.ServerResponse).apply(this, args);
     } as typeof res.writeHead;
     res.once('finish', () => {
