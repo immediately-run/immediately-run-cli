@@ -59,9 +59,11 @@ import {
   resolveFromInstalledTree,
   resolvePackageDir,
 } from '../localPackageSource.js';
+import { pruneBundledPackages } from '../prunePackages.js';
 import { scanCjsModule } from '../vendor/cjsScan/scan.js';
 import { transformFile } from '@immediately-run/transpiler';
 import {
+  collectAppSpecifiers,
   emitArtifacts,
   emitMdxMetadata,
   type ArtifactEmission,
@@ -102,6 +104,10 @@ Options:
   --no-lockset              Skip embedding the resolved-dependency lockset
   --bundle-packages         Bundle resolved dependency CONTENT into the zip
                             (R3-49a; opt-in, requires the lockset)
+  --no-prune-packages       With --bundle-packages: ship every bundled package
+                            whole. By default a package file no import from the
+                            app reaches is listed by size instead of inlined,
+                            and the runtime fetches it only if it is required
   --cdn-root <url>          Module CDN root for lockset resolution
                             (default: ${DEFAULT_CDN_ROOT})
   -h, --help                Show this help`;
@@ -133,6 +139,12 @@ export interface CacheZipOptions {
   // size cap, and the content is inert until the sandbox consume-side + ZenFS
   // batch hydration (R3-49b) read it. See plans/dependency-loading-optimization.md.
   bundlePackages?: boolean;
+  // Demote bundled package files the app cannot reach to size-only entries (see
+  // `src/prunePackages.ts`). On by default wherever packages are bundled; opt out with
+  // --no-prune-packages. It needs the artifact emission (the app's import list), so
+  // --no-artifacts turns it off too, and it stands down by itself for an app whose
+  // imports this build cannot see whole.
+  prunePackages?: boolean;
 }
 
 export interface CacheZipResult {
@@ -572,6 +584,61 @@ const resolveBundledPackages = async (
   return outcome;
 };
 
+/**
+ * The pruning step and its one-line outcome. Every way it can stand down is named in the
+ * summary: a zip that ships whole packages must say why, or the day it starts doing so by
+ * accident reads exactly like the day before.
+ */
+const prunePackages = async (
+  repo: string,
+  opts: CacheZipOptions,
+  entries: RepoManifest['entries'],
+  emission: ArtifactEmission | undefined,
+  packages: BundledPackage[],
+  platformNames: ReadonlySet<string>,
+): Promise<{ packages: BundledPackage[]; summary: string }> => {
+  const whole = (reason: string) => ({ packages, summary: `not pruned (${reason})` });
+  if (opts.prunePackages === false) return whole('--no-prune-packages');
+  if (!emission) return whole('no artifacts, so the app import list is unknown');
+
+  // A library the app mounts at boot (`resolveFromRegistry`, or a git dependency) brings
+  // its own imports, which resolve against THIS app's packages and appear in no file this
+  // build reads. The SDK is the one exception: it is self-hosted for every app, and what it
+  // requires is seeded by name (`PLATFORM_SPECIFIERS`).
+  const { deps, registryResolved } = headDependencies(repo);
+  const mounted = [
+    ...registryResolved.filter((name) => name !== SELF_HOSTED_SDK),
+    ...Object.entries(deps)
+      .filter(([, range]) => NON_REGISTRY_RANGE.test(range))
+      .map(([name]) => name),
+  ];
+  if (mounted.length) {
+    return whole(`${[...new Set(mounted)].sort().join(', ')} resolved outside the lockset, imports unknown`);
+  }
+
+  const collected = await collectAppSpecifiers(repo, entries, emission);
+  if ('reason' in collected) return whole(collected.reason);
+
+  const result = pruneBundledPackages(packages, {
+    appSpecifiers: collected.specifiers,
+    neverPrune: new Set([...platformNames, ...CDN_INJECTED_HELPERS]),
+  });
+  if (!result.demotedFiles) return { packages, summary: 'pruning found nothing unreachable' };
+  return {
+    packages: result.packages,
+    summary:
+      `pruned ${formatBytes(result.bytesBefore)} → ${formatBytes(result.bytesAfter)} ` +
+      `(${result.demotedFiles} unreachable file(s) in ${result.prunedPackages} package(s) listed by size)`,
+  };
+};
+
+/** The one module every app resolves from the host rather than the lockset. */
+const SELF_HOSTED_SDK = '@immediately-run/sdk';
+
+/** A dependency range that is not a registry version: `github:o/r`, `o/r`, a URL, `file:`,
+ *  an `npm:` alias. Anything with a scheme or an owner/repo shape. */
+const NON_REGISTRY_RANGE = /^(?:[a-z][a-z+.-]*:|[\w.-]+\/[\w.-]+)/i;
+
 export const buildCacheZip = async (opts: CacheZipOptions): Promise<CacheZipResult> => {
   const repo = resolve(opts.repoPath);
   if (!isGitRepo(repo)) {
@@ -606,11 +673,9 @@ export const buildCacheZip = async (opts: CacheZipOptions): Promise<CacheZipResu
   const platformNames = new Set(
     lockset ? platformProvidedNames(headDependencies(repo).deps, lockset.dependencies) : [],
   );
-  const {
-    packages,
-    summary: bundledPackagesSummary,
-    closedOver = 0,
-  } = await resolveBundledPackages(opts, lockset, repo, platformNames);
+  const bundled = await resolveBundledPackages(opts, lockset, repo, platformNames);
+  const { closedOver = 0 } = bundled;
+  let { packages, summary: bundledPackagesSummary } = bundled;
 
   const manifest: RepoManifest = {
     schemaVersion: MANIFEST_SCHEMA_VERSION,
@@ -702,6 +767,15 @@ export const buildCacheZip = async (opts: CacheZipOptions): Promise<CacheZipResu
       : `no MDX frontmatter${skip}`;
   }
 
+  // 2c) Prune the bundled packages to what the app reaches (`src/prunePackages.ts`). After
+  //     the closure check, which must see every package whole, and after the artifact
+  //     emission, which is where the app's import list comes from.
+  if (packages && packages.length) {
+    const pruning = await prunePackages(repo, opts, entries, emission, packages, platformNames);
+    packages = pruning.packages;
+    bundledPackagesSummary += `; ${pruning.summary}`;
+  }
+
   // 3) Append the sidecar (+ artifacts) under .immediately.run/ in one zip call, with
   //    paths passed sorted so the appended set is reproducible run-to-run.
   const staging = mkdtempSync(join(tmpdir(), 'cache-zip-'));
@@ -791,6 +865,7 @@ export const runCacheZip = async (args: ParsedArgs): Promise<number> => {
     mdxMetadata: args.flags['no-mdx-metadata'] ? false : undefined,
     lockset: args.flags['no-lockset'] ? false : undefined,
     bundlePackages: args.flags['bundle-packages'] ? true : undefined,
+    prunePackages: args.flags['no-prune-packages'] ? false : undefined,
     cdnRoot: flagValue(args.flags, 'cdn-root'),
   });
   console.log(`Wrote ${result.outputPath}`);

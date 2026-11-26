@@ -12,7 +12,7 @@ import { existsSync, mkdirSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
 import { flagValue, type ParsedArgs } from '../args.js';
-import { buildProviderDeepLink } from '../deepLink.js';
+import { buildProviderDeepLink, buildProviderLink } from '../deepLink.js';
 import { DEFAULT_ORIGIN, runUntilShutdown } from '../devServer.js';
 import {
   isScope,
@@ -23,7 +23,8 @@ import {
 import { parseAuthor, type CommitIdentity } from '../gitServe/commit.js';
 import { PAIRING_TTL_MS, createPairingCode } from '../gitServe/pairing.js';
 import { DEFAULT_GIT_SERVE_PORT, GIT_SERVE_PROTOCOL } from '../gitServe/protocol.js';
-import { resolveRef } from '../gitServe/refs.js';
+import { objectFormat } from '../gitServe/readRoutes.js';
+import { headBranchOf, resolveRef } from '../gitServe/refs.js';
 import { REPO_DIR_SUFFIX, isRepoName, listRepos } from '../gitServe/repoName.js';
 import { gitEnv, runGit } from '../gitServe/runGit.js';
 import { startGitServe, type TailnetBinding } from '../gitServe/server.js';
@@ -86,7 +87,8 @@ Options:
                             browser commits (default: this machine's git
                             user.name and user.email).
   --allow-push              With --bind tailscale, let git clients push. A push
-                            must be a fast-forward and cannot delete a branch.
+                            must be a fast-forward and cannot delete a branch;
+                            only branches can be pushed (no tags or other refs).
                             Without the flag every push is refused, whatever a
                             repository's own config says. \`git clone\` and
                             \`git fetch\` need no flag.
@@ -187,13 +189,27 @@ export const runGitServeConnections = (
   return 0;
 };
 
-/** The default branch of a repository, when it names a commit; else null. */
-const defaultBranchOf = async (repoDir: string): Promise<string | null> => {
-  const head = await runGit(repoDir, ['symbolic-ref', '-q', '--short', 'HEAD']);
-  const branch = head.stdout.toString('utf8').trim();
-  if (head.code !== 0 || branch === '') return null;
+/**
+ * The default branch a repository's link opens, or why it gets no link: the
+ * line printed for an unlinked repository names the real cause, never a
+ * generic "no commit yet" for a repository that has commits.
+ */
+export const linkBranchOf = async (
+  repoDir: string,
+): Promise<{ ok: true; branch: string } | { ok: false; why: string }> => {
+  const format = await objectFormat(repoDir, runGit);
+  if (format !== 'sha1') {
+    // Left out exactly as /meta leaves it out (§2).
+    return { ok: false, why: `object format ${format ?? 'unknown'} is not served (SHA-1 only)` };
+  }
+  const branch = await headBranchOf(repoDir, runGit);
+  if (branch === null) return { ok: false, why: 'HEAD names no branch' };
   const resolved = await resolveRef(repoDir, branch, runGit);
-  return resolved.ok && resolved.refKind === 'branch' ? branch : null;
+  if (resolved.ok && resolved.refKind === 'branch') return { ok: true, branch };
+  if (!resolved.ok && resolved.reason === 'ambiguous') {
+    return { ok: false, why: `its default branch ${branch} is also a tag name, so a link to it would not resolve` };
+  }
+  return { ok: false, why: 'no commit on its default branch yet; push one, then restart for its link' };
 };
 
 /**
@@ -235,13 +251,16 @@ const commitIdentity = (authorFlag: string | undefined, root: string): CommitIde
 /** Each repository with the branch its link opens, and those with none yet. */
 const describeRepos = async (
   root: string,
-): Promise<{ linked: Array<{ repo: string; branch: string }>; unlinked: string[] }> => {
+): Promise<{
+  linked: Array<{ repo: string; branch: string }>;
+  unlinked: Array<{ repo: string; why: string }>;
+}> => {
   const linked: Array<{ repo: string; branch: string }> = [];
-  const unlinked: string[] = [];
+  const unlinked: Array<{ repo: string; why: string }> = [];
   for (const repo of listRepos(root)) {
-    const branch = await defaultBranchOf(repo.dir);
-    if (branch === null) unlinked.push(repo.name);
-    else linked.push({ repo: repo.name, branch });
+    const link = await linkBranchOf(repo.dir);
+    if (link.ok) linked.push({ repo: repo.name, branch: link.branch });
+    else unlinked.push({ repo: repo.name, why: link.why });
   }
   return { linked, unlinked };
 };
@@ -249,15 +268,13 @@ const describeRepos = async (
 const printRepoLines = (
   root: string,
   links: ReadonlyArray<{ repo: string; url: string }>,
-  unlinked: readonly string[],
+  unlinked: ReadonlyArray<{ repo: string; why: string }>,
 ): void => {
   if (links.length === 0 && unlinked.length === 0) {
     console.log(`No repositories yet. Create one with: immediately.run git-serve init ${root} <name>`);
   }
   for (const link of links) console.log(`immediately.run git URL (${link.repo}): ${link.url}`);
-  for (const name of unlinked) {
-    console.log(`${name}: no commit on its default branch yet; push one, then restart for its link.`);
-  }
+  for (const { repo, why } of unlinked) console.log(`${repo}: no link — ${why}.`);
 };
 
 /**
@@ -300,10 +317,9 @@ const serveTailnet = async (
   const repos = await describeRepos(handle.root);
   // A tailnet link carries no endpoint and no credential: the host finds both
   // in the connection the user made (R-GS-9).
-  const base = origin.replace(/\/+$/, '');
   const links = repos.linked.map(({ repo, branch }) => ({
     repo,
-    url: `${base}/edit/git/${handle.namespace}/${repo}/${encodeURIComponent(branch)}`,
+    url: buildProviderLink(origin, 'git', handle.namespace, repo, branch),
   }));
 
   if (args.flags.json === true) {
@@ -334,7 +350,7 @@ const serveTailnet = async (
     }
     console.log(
       allowPush
-        ? 'git clients may clone and push (fast-forward only, no branch deletes).'
+        ? 'git clients may clone and push branches (fast-forward only, no branch deletes, no tags).'
         : 'git clients may clone and fetch. Push is off (start with --allow-push to allow it).',
     );
     for (const repo of listRepos(handle.root)) {

@@ -277,6 +277,52 @@ export const emitArtifacts = async (
   };
 };
 
+/**
+ * Every specifier the app's own sources import, for the bundled-package pruner
+ * (`prunePackages.ts`) — or the reason they cannot be listed.
+ *
+ * The artifact index already holds the answer for every covered file: `deps` is the
+ * transpiler's own collected list, the same one the runtime wires the module graph from.
+ * Two gaps are closed here rather than left to the pruner:
+ *
+ *   · a covered file whose artifact was SKIPPED (a transform error, or a dynamic import
+ *     with a specifier the collector could not read) has imports nobody knows. One such
+ *     file makes the whole list incomplete, so the answer is a reason, not a short list;
+ *   · a file `isArtifactExcluded` drops (tests, `scripts/`) ships no artifact but is still
+ *     in the zip, and "a repo that does import one at runtime still works". Its imports are
+ *     therefore collected too, by the same transform. Over-inclusion is the cheap direction:
+ *     a test file's `react-dom/test-utils` keeps one extra file inlined. A failure here is
+ *     ignored, because a file that does not transpile at build cannot be a runtime import
+ *     that works either.
+ */
+export const collectAppSpecifiers = async (
+  repo: string,
+  entries: ManifestEntry[],
+  emission: ArtifactEmission,
+): Promise<{ specifiers: string[] } | { reason: string }> => {
+  if (emission.skipped.length) {
+    return {
+      reason: `${emission.skipped.length} source file(s) produced no artifact, so their imports are unknown`,
+    };
+  }
+  const specifiers = new Set<string>();
+  for (const entry of Object.values(emission.index.files)) {
+    for (const dep of entry.deps) specifiers.add(dep);
+    for (const dep of entry.library?.deps ?? []) specifiers.add(dep);
+  }
+  for (const entry of entries) {
+    if (entry.type !== 'blob') continue;
+    const rel = entry.path;
+    if (isExcluded(rel) || !isArtifactExcluded(rel)) continue;
+    const runtimePath = `${APP_ROOT}/${rel}`;
+    if (!isTransformable(runtimePath)) continue;
+    const result = await transformFile({ path: runtimePath, code: readBlob(repo, entry.sha) });
+    if ('error' in result) continue;
+    for (const dep of result.deps) if (typeof dep === 'string') specifiers.add(dep);
+  }
+  return { specifiers: [...specifiers].sort() };
+};
+
 // The sidecar's SCHEMA is owned by `@immediately-run/platform-constants` (R3-275):
 // this writer and the sandbox's reader used to describe the format independently,
 // which is how a reader can tighten a check the writer never learns about — and every

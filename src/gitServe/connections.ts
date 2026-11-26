@@ -24,6 +24,7 @@ import {
   rmSync,
   statSync,
   writeFileSync,
+  writeSync,
 } from 'node:fs';
 import { join } from 'node:path';
 
@@ -71,86 +72,122 @@ export const writeStateFile = (root: string, name: string, content: string): voi
 
 const LOCK_FILE = '.lock';
 const LOCK_WAIT_MS = 5000;
-/** A lock older than this was left by a process that died holding it. */
+/** A lock in the old format (no holder pid) is stale after this long. */
 const LOCK_STALE_MS = 30_000;
+/** A live holder never holds the lock this long; past it, a reused pid is assumed. */
+const LOCK_ABANDONED_MS = 10 * 60_000;
 
 const sleepSync = (ms: number): void => {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 };
 
-const errorCode = (e: unknown): string | undefined => (e as NodeJS.ErrnoException).code;
+/** A lock file's content, or null when it is gone or unreadable. */
+const readLock = (path: string): string | null => {
+  try {
+    return readFileSync(path, 'utf8');
+  } catch {
+    return null;
+  }
+};
+
+const processAlive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === 'EPERM';
+  }
+};
 
 /**
- * Removes a lock whose holder died. Returns true when the caller should try
- * for the lock again at once, false when it should wait.
- *
- * Two waiters that both saw the dead lock must not each remove "the lock file":
- * the second would remove the lock the first has taken since, and both would be
- * inside. Renaming the lock away has the same flaw, because a rename also acts
- * on whatever file carries the name at that moment. So a takeover first makes a
- * hard link to the lock under one fixed name:
- *
- *   - making the link fails while the name exists, so one process at a time is
- *     taking over;
- *   - the link pins the file it was made from, so the age that is read and the
- *     file that is removed are the same file. A lock taken since is seen to be
- *     new, and is left alone.
+ * Whether a lock was left by a holder that can no longer release it. A lock
+ * holds `<pid> <nonce>`; it is stale when that process is gone (the state
+ * directory is local, so the pid is this machine's). Age alone never makes a
+ * live holder's lock stale: a slow holder could release it and another take it
+ * between the judgement and the removal (cli#63 review, round 2).
  */
-const takeOverDeadLock = (lock: string): boolean => {
+const isStale = (content: string, mtimeMs: number): boolean => {
+  const age = Date.now() - mtimeMs;
+  const m = /^(\d+) [0-9a-f]+$/.exec(content);
+  if (m === null) return age > LOCK_STALE_MS; // the old format, or a half-written lock
+  return !processAlive(Number(m[1])) || age > LOCK_ABANDONED_MS;
+};
+
+/** Creates `path` exclusively with this holder's line; the line, or null if taken. */
+const createLock = (path: string): string | null => {
+  const line = `${process.pid} ${randomBytes(16).toString('hex')}`;
+  let fd: number;
+  try {
+    fd = openSync(path, 'wx', FILE_MODE);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'EEXIST') return null;
+    throw e;
+  }
+  try {
+    writeSync(fd, line);
+  } finally {
+    closeSync(fd);
+  }
+  return line;
+};
+
+/** Releases a lock only if it still holds this holder's line. */
+const unlock = (path: string, held: string): void => {
+  if (readLock(path) === held) rmSync(path, { force: true });
+};
+
+/** Whether `path` exists and is stale. */
+const staleAt = (path: string): boolean => {
+  const content = readLock(path);
+  if (content === null) return false;
+  try {
+    return isStale(content, statSync(path).mtimeMs);
+  } catch {
+    return false;
+  }
+};
+
+/** Pin the candidate inode while checking staleness so a competing takeover
+ * cannot remove a replacement lock on the strength of the old lock's age. */
+const takeOver = (lock: string): boolean => {
   const guard = `${lock}.takeover`;
   try {
     linkSync(lock, guard);
   } catch (e) {
-    if (errorCode(e) === 'ENOENT') return true; // released meanwhile
-    if (errorCode(e) === 'EEXIST') {
-      // Another process is taking over; that takes microseconds. A guard this
-      // old was left by one that died there. (The link set the file's ctime.)
-      try {
-        if (Date.now() - statSync(guard).ctimeMs > LOCK_STALE_MS) rmSync(guard, { force: true });
-      } catch {
-        /* gone already */
-      }
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') return true;
+    if (code !== 'EEXIST') throw e;
+    try {
+      if (Date.now() - statSync(guard).ctimeMs > LOCK_STALE_MS) rmSync(guard);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e;
     }
     return false;
   }
   try {
     const pinned = statSync(guard, { bigint: true });
-    if (Date.now() - Number(pinned.mtimeMs) <= LOCK_STALE_MS) return false; // a live lock
+    const content = readLock(guard);
+    if (content === null || !isStale(content, Number(pinned.mtimeMs))) return false;
     if (statSync(lock, { bigint: true }).ino === pinned.ino) rmSync(lock);
     return true;
-  } catch {
-    return true; // the lock went away under us; try for it
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e;
+    return true;
   } finally {
     rmSync(guard, { force: true });
   }
 };
 
-/** Takes the lock. With `waitMs` 0 it never sleeps: it answers false at once
- *  when the lock is held. Otherwise it waits that long, then answers false. */
-const acquireStateLock = (lock: string, waitMs: number): boolean => {
-  const deadline = Date.now() + waitMs;
-  for (let tries = 1; ; tries++) {
-    try {
-      closeSync(openSync(lock, 'wx', FILE_MODE));
-      return true;
-    } catch (e) {
-      if (errorCode(e) !== 'EEXIST') throw e;
-    }
-    // A caller that does not wait still retries, a bounded number of times,
-    // after a lock that was released or taken over under it.
-    const retryNow = waitMs > 0 || tries < 3;
-    let dead: boolean;
-    try {
-      dead = Date.now() - statSync(lock).mtimeMs > LOCK_STALE_MS;
-    } catch {
-      if (retryNow) continue; // released between the open and the stat
-      return false;
-    }
-    if (dead && takeOverDeadLock(lock) && retryNow) continue;
-    if (Date.now() >= deadline) return false;
-    sleepSync(10);
-  }
+/** One attempt at the lock: the holder's line when taken, else whether to wait. */
+const tryLock = (lock: string): { held: string } | 'retry' | 'wait' => {
+  const held = createLock(lock);
+  if (held !== null) return { held };
+  if (!staleAt(lock)) return 'wait';
+  return takeOver(lock) ? 'retry' : 'wait';
 };
+
+const busy = (lock: string): Error =>
+  new Error(`${lock} is held by another git-serve process; try again.`);
 
 /**
  * Runs `fn` holding the state directory's lock. The server, `git-serve pair`
@@ -158,37 +195,45 @@ const acquireStateLock = (lock: string, waitMs: number): boolean => {
  * file, change it and write it back; without a lock the last writer wins, and a
  * pairing racing a revocation could write the revoked connection back.
  * Not re-entrant: a function that holds the lock calls the unlocked forms.
- *
- * This form WAITS for a held lock, sleeping synchronously. It is for the
- * commands (`pair`, `connections`), never for the server's request path.
+ * The two CLI commands use this blocking form; the server uses
+ * `withStateLockAsync`, so a held lock never stalls its other requests.
  */
 export const withStateLock = <T>(root: string, fn: () => T): T => {
   const lock = join(ensureStateDir(root), LOCK_FILE);
-  if (!acquireStateLock(lock, LOCK_WAIT_MS)) {
-    throw new Error(`${lock} is held by another git-serve process; try again.`);
-  }
-  try {
-    return fn();
-  } finally {
-    rmSync(lock, { force: true });
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  for (;;) {
+    const got = tryLock(lock);
+    if (typeof got === 'object') {
+      try {
+        return fn();
+      } finally {
+        unlock(lock, got.held);
+      }
+    }
+    if (got === 'wait') {
+      if (Date.now() > deadline) throw busy(lock);
+      sleepSync(10);
+    }
   }
 };
 
-/**
- * The same, for the server: it tries once and never sleeps, because a sleep
- * here would stop every other request the process is serving. `ran: false`
- * means the lock is held and `fn` was not called.
- */
-export const tryWithStateLock = <T>(
-  root: string,
-  fn: () => T,
-): { ran: true; value: T } | { ran: false } => {
+/** `withStateLock` for the server: it waits without blocking the event loop. */
+export const withStateLockAsync = async <T>(root: string, fn: () => T): Promise<T> => {
   const lock = join(ensureStateDir(root), LOCK_FILE);
-  if (!acquireStateLock(lock, 0)) return { ran: false };
-  try {
-    return { ran: true, value: fn() };
-  } finally {
-    rmSync(lock, { force: true });
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  for (;;) {
+    const got = tryLock(lock);
+    if (typeof got === 'object') {
+      try {
+        return fn();
+      } finally {
+        unlock(lock, got.held);
+      }
+    }
+    if (got === 'wait') {
+      if (Date.now() > deadline) throw busy(lock);
+      await new Promise((r) => setTimeout(r, 10));
+    }
   }
 };
 

@@ -24,7 +24,7 @@ import {
   GIT_SERVE_SERVER,
   type RunGit,
 } from './protocol.js';
-import { peelToCommit, resolveRef, type RefKind } from './refs.js';
+import { headBranchOf, peelToCommit, resolveRef, type RefKind } from './refs.js';
 import { listRepos, resolveRepo } from './repoName.js';
 
 export interface ReadContext {
@@ -82,7 +82,7 @@ const onlyParams = (query: URLSearchParams, allowed: readonly string[]): boolean
 };
 
 /** `sha1`, another format name, or null when git could not say. */
-const objectFormat = async (repoDir: string, runGit: RunGit): Promise<string | null> => {
+export const objectFormat = async (repoDir: string, runGit: RunGit): Promise<string | null> => {
   const r = await runGit(repoDir, ['rev-parse', '--show-object-format']);
   return r.code === 0 ? text(r.stdout) : null;
 };
@@ -118,9 +118,8 @@ const openRepo = async (
 };
 
 const repoMeta = async (ctx: ReadContext, name: string, dir: string): Promise<ReadAnswer> => {
-  const head = await ctx.runGit(dir, ['symbolic-ref', '-q', '--short', 'HEAD']);
   // A detached HEAD has no default branch; the host then needs a ref in the URL.
-  const defaultBranch = head.code === 0 && text(head.stdout) !== '' ? text(head.stdout) : null;
+  const defaultBranch = await headBranchOf(dir, ctx.runGit);
 
   const listed = await ctx.runGit(dir, [
     'for-each-ref',
@@ -170,7 +169,7 @@ const resolveCommit = async (
       answer:
         resolved.reason === 'unknown'
           ? refusal(404, 'not-found')
-          : refusal(400, resolved.reason), // `malformed`, `ambiguous`
+          : refusal(400, resolved.reason), // 'malformed' or 'ambiguous' (R-GS-3)
     };
   }
   const tree = await ctx.runGit(dir, [
@@ -187,18 +186,8 @@ const resolveCommit = async (
   return { ok: true, refKind: resolved.refKind, commitSha: resolved.commitSha, treeSha };
 };
 
-/** True when a tree path has a segment no checkout could hold: an empty one,
- *  `.`, `..`, or `.git` in any case. git never writes such a tree, but
- *  `git mktree` does, and the host would mount the path as a file name. */
-const isUnsafeTreePath = (path: string): boolean =>
-  path
-    .split('/')
-    .some((part) => part === '' || part === '.' || part === '..' || part.toLowerCase() === '.git');
-
 /** Every blob entry of the commit's tree, or null when the listing is not whole
- *  (R-GS-4: the tree is complete or the request fails). A tree with an unsafe
- *  path is not listed at all: leaving the entry out would show a tree that is
- *  not the commit's. */
+ *  (R-GS-4: the tree is complete or the request fails). */
 const listTree = async (
   ctx: ReadContext,
   dir: string,
@@ -228,7 +217,6 @@ const listTree = async (
     return null;
   }
   for (const entry of entries) {
-    if (isUnsafeTreePath(entry.path)) return null;
     if (entry.mode === SUBMODULE_MODE) continue; // left out (R-GS-4)
     if (entry.type !== 'blob' || !FILE_MODES.has(entry.mode) || entry.size === undefined) {
       return null;

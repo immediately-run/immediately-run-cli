@@ -40,9 +40,32 @@ npx @immediately-run/cli cache-zip \
 | `--ref` | current branch | Ref to cache; also the default output filename |
 | `--default-branch` | `origin/HEAD` | Repository default branch |
 | `--out` | `public/cached_repositories/<owner>/<repo>/<ref>.zip` | Output zip path |
+| `--bundle-packages` | off | Bundle the resolved dependency content into the zip (requires the lockset) |
+| `--no-prune-packages` | pruning on | With `--bundle-packages`: ship every bundled package whole |
 
 The zip's contents are exactly `git archive HEAD` (the tracked tree) plus the
 manifest sidecar.
+
+#### Bundled packages are pruned to what the app reaches
+
+With `--bundle-packages`, a package file is inlined only if an import can reach
+it: the walk starts at the specifiers the app's own sources import (plus the
+ones the platform always requires, such as `react-dom/client`) and follows each
+bundled file's own requires, across packages. Any other JavaScript file is
+listed by its size instead of its content, which is the dependency CDN's own
+form for a file it does not inline. The runtime still resolves such a file and
+fetches it on demand, so the cost of a file the walk missed is one network
+request when it is first required, not a missing module.
+
+Pruning leaves a package untouched when it cannot reason about it, and the
+summary line says so: the platform-injected packages (`core-js`,
+`react-refresh`, `react-error-boundary`), a package with no readable
+`package.json`, one that no import reaches, and one that uses `#imports`. It
+stands down for the whole zip when the app's import list is incomplete: with
+`--no-artifacts`, when a source file produced no artifact (a transform error or
+a dynamic import with a computed specifier), or when the app mounts a library
+through `resolveFromRegistry` or a git dependency. Pass `--no-prune-packages`
+to ship every package whole.
 
 ### Hosting & discovery
 
@@ -124,7 +147,7 @@ npx @immediately-run/cli git-serve ~/repos
 | `--port` | `7701` | Port to listen on (differs from `dev`'s, so both can run) |
 | `--bind` | `localhost` | `tailscale` serves HTTPS on this node's tailnet address to your own devices (below) |
 | `--host` | this node's MagicDNS name | Hostname for `--bind tailscale` |
-| `--cert` | `<host>.crt` beside the root, else minted by `tailscale cert` | TLS certificate for `--bind tailscale`; its `.key` sibling is the key |
+| `--cert` | `<host>.crt` in `<root>/.git-serve/`, `<root>` or the current directory, else minted into `<root>/.git-serve/` by `tailscale cert` | TLS certificate for `--bind tailscale`; its `.key` sibling is the key |
 | `--allow-login` | none | With `--bind tailscale`, also serve devices of this tailnet user (repeatable) |
 | `--allow-push` | off | With `--bind tailscale`, let git clients push (fast-forward only, no branch deletes) |
 | `--allow-commit` | off | Let the browser commit through `POST /commit` (below) |
@@ -256,9 +279,9 @@ git clone https://<machine>.<tailnet>.ts.net:7701/notes.git
 - A repository's own config cannot turn push on, or force-pushes, deletes and
   unchecked objects back on: the server sets `http.receivepack`,
   `receive.denyNonFastForwards`, `receive.denyDeletes` and
-  `receive.fsckObjects` itself for every request.
-- A push is not cut off for taking long: on a tailnet the server sets no time
-  limit on a request's body.
+  `receive.hideRefs` and `receive.fsckObjects` itself for every request.
+- On a tailnet, git requests have an idle timeout and can keep uploading as
+  long as progress continues.
 - Only `/<name>.git/info/refs?service=…`, `/<name>.git/git-upload-pack` and
   `/<name>.git/git-receive-pack` are served. The file routes of the older
   "dumb" protocol are not.

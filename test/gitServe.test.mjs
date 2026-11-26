@@ -32,7 +32,7 @@ import { guardRequest, classify, isPinnedHost, TAILNET_ROUTES } from '../dist/gi
 import { addConnection } from '../dist/gitServe/connections.js';
 import { parseTailnetIdentity, parseWhois } from '../dist/gitServe/tailscaleWhois.js';
 import { GIT_SERVE_PROTOCOL, GIT_SERVE_SERVER } from '../dist/gitServe/protocol.js';
-import { runGitServeInit } from '../dist/commands/gitServe.js';
+import { runGitServeInit, linkBranchOf } from '../dist/commands/gitServe.js';
 import { parseLsTreeLong, treeEntries } from '../dist/git.js';
 import { buildProviderDeepLink, locatorFragment } from '../dist/deepLink.js';
 
@@ -437,6 +437,47 @@ test('G-GS-3: a ref is looked up exactly — a branch named refs/heads/x does no
   }
 });
 
+test('R-GS-3: a name that is both a branch and a tag is 400 ambiguous on /meta and /tree, never the branch', async () => {
+  const bare = join(root, 'notes.git');
+  const tagSha = git(bare, ['rev-parse', 'refs/tags/v1^{commit}']);
+  const branchSha = git(bare, ['rev-parse', 'refs/heads/feature-x']);
+  assert.notEqual(tagSha, branchSha, 'the two refs must name different commits');
+  // A push creating a branch under an existing tag's name — the case the rule exists for.
+  git(bare, ['update-ref', 'refs/heads/v1', branchSha]);
+  // A branch beside a tag that peels to no commit: that tag is not listed, so the
+  // name is not ambiguous and the branch answers.
+  git(bare, ['update-ref', 'refs/heads/blob-tag', branchSha]);
+  try {
+    for (const route of ['/meta', '/tree']) {
+      const answer = await json(`${route}?repo=notes&ref=v1`);
+      assert.equal(answer.status, 400, route);
+      assert.equal(answer.body.reason, 'ambiguous', route);
+      assert.equal(answer.body.commit, undefined, `${route} names no commit`);
+    }
+    // Each commit stays reachable by its SHA, and the listing still shows both refs.
+    assert.equal((await json(`/meta?repo=notes&ref=${tagSha}`)).status, 200);
+    const listing = (await json('/meta?repo=notes')).body;
+    assert.ok(listing.branches.some((b) => b.name === 'v1'));
+    assert.ok(listing.tags.some((t) => t.name === 'v1'));
+    const notAmbiguous = await json('/meta?repo=notes&ref=blob-tag');
+    assert.equal(notAmbiguous.status, 200);
+    assert.equal(notAmbiguous.body.refKind, 'branch');
+    assert.deepEqual(await resolveRef(bare, 'v1', runGit), { ok: false, reason: 'ambiguous' });
+    // A default branch whose name is also a tag gets no link, and says why.
+    git(bare, ['symbolic-ref', 'HEAD', 'refs/heads/v1']);
+    // /meta names the branch itself, never git's disambiguated `heads/v1` (review 2-r2-0),
+    // so the host's request for it gets R-GS-3's 400 ambiguous, not a 404.
+    assert.equal((await json('/meta?repo=notes')).body.defaultBranch, 'v1');
+    const link = await linkBranchOf(bare);
+    assert.equal(link.ok, false);
+    assert.match(link.why, /also a tag name/);
+  } finally {
+    git(bare, ['symbolic-ref', 'HEAD', 'refs/heads/main']);
+    git(bare, ['update-ref', '-d', 'refs/heads/v1']);
+    git(bare, ['update-ref', '-d', 'refs/heads/blob-tag']);
+  }
+});
+
 test('G-GS-3: a repository is a name — a path, a nested name, a symlink and a borrower are refused', async () => {
   const calls = [];
   const recordingRunGit = async (repoDir, args) => {
@@ -530,6 +571,10 @@ test('a SHA-256 repository is left out of the list and refused by name', async (
     assert.equal(meta.status, 400);
     assert.equal(meta.body.reason, 'unsupported-object-format');
     assert.equal((await json('/tree?repo=sha256repo&ref=main')).body.reason, 'unsupported-object-format');
+    // The startup link list names the format, never "no commit yet" (review A3).
+    const link = await linkBranchOf(dir);
+    assert.equal(link.ok, false);
+    assert.match(link.why, /object format sha256 is not served/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -735,6 +780,19 @@ test('parseLsTreeLong is the parser treeEntries uses', () => {
   );
   assert.deepEqual(parsed.find((e) => e.path === 'dir/run.sh').mode, '100755');
   assert.throws(() => parseLsTreeLong('not a record\0'));
+});
+
+test('linkBranchOf: a linkable repository gives its default branch; an empty one says no commit yet', async () => {
+  assert.deepEqual(await linkBranchOf(join(root, 'notes.git')), { ok: true, branch: 'main' });
+  const empty = join(root, 'empty-link.git');
+  execFileSync('git', ['init', '--bare', '-q', '--initial-branch=main', empty], { stdio: 'pipe' });
+  try {
+    const link = await linkBranchOf(empty);
+    assert.equal(link.ok, false);
+    assert.match(link.why, /no commit on its default branch yet/);
+  } finally {
+    rmSync(empty, { recursive: true, force: true });
+  }
 });
 
 test('resolveRef unit: the reasons', async () => {

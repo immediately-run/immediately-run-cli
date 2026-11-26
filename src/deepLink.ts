@@ -27,6 +27,23 @@ export const buildLocatorLink = (
   token: string,
 ): string => `${trimOrigin(origin)}/${path}${locatorFragment(endpoint, token)}`;
 
+/** The editor route of a provider mount, with no leading slash. */
+const providerPath = (provider: string, namespace: string, repository: string, ref: string): string =>
+  `edit/${provider}/${namespace}/${repository}/${encodeURIComponent(ref)}`;
+
+/**
+ * A provider link with NO fragment, for a server that hands the page no
+ * locator: on a tailnet the host finds the endpoint and credential in the
+ * connection the user made (GIT_SERVE_SPEC R-GS-9).
+ */
+export const buildProviderLink = (
+  origin: string,
+  provider: string,
+  namespace: string,
+  repository: string,
+  ref: string,
+): string => `${trimOrigin(origin)}/${providerPath(provider, namespace, repository, ref)}`;
+
 /**
  * A link that opens a provider mount in the editor:
  * `<origin>/edit/<provider>/<namespace>/<repository>/<ref>`. The ref is
@@ -41,9 +58,4 @@ export const buildProviderDeepLink = (
   endpoint: string,
   token: string,
 ): string =>
-  buildLocatorLink(
-    origin,
-    `edit/${provider}/${namespace}/${repository}/${encodeURIComponent(ref)}`,
-    endpoint,
-    token,
-  );
+  buildLocatorLink(origin, providerPath(provider, namespace, repository, ref), endpoint, token);

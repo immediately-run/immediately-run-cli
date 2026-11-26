@@ -10,6 +10,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile, execFileSync } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -44,9 +45,10 @@ const git = (cwd, args, opts = {}) =>
  * output. Asynchronous on purpose: the server under test lives in this process,
  * so a synchronous child would stop the event loop it needs to answer.
  */
-const tryGit = (cwd, args) =>
+const tryGit = (cwd, args, env) =>
   new Promise((resolvePromise) => {
-    execFile('git', ['-C', cwd, ...args], { encoding: 'utf8' }, (error, stdout, stderr) => {
+    const opts = { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, ...(env ? { env: { ...process.env, ...env } } : {}) };
+    execFile('git', ['-C', cwd, ...args], opts, (error, stdout, stderr) => {
       resolvePromise({ code: error === null ? 0 : (typeof error.code === 'number' ? error.code : -1), out: `${stdout}${stderr}` });
     });
   });
@@ -74,13 +76,14 @@ const makeRoot = () => {
   return { dir, root, bare, work };
 };
 
-const serve = async (root, { allowPush = false, whois = async () => sameUser } = {}) => {
+const serve = async (root, { allowPush = false, whois = async () => sameUser, gitIdleTimeoutMs } = {}) => {
   const logs = [];
   const handle = await startGitServe({
     root,
     origin: ORIGIN,
     port: 0,
     allowPush,
+    gitIdleTimeoutMs,
     log: (line) => logs.push(line),
     tailnet: {
       host: HOST,
@@ -454,6 +457,13 @@ test('the forced config: push is the flag\'s alone, and never the request\'s', (
   process.env.GIT_CONFIG_KEY_0 = 'http.receivepack';
   process.env.GIT_CONFIG_VALUE_0 = 'true';
   process.env.GIT_DIR = '/elsewhere';
+  // CGI meta-variables in the CLI's own environment would be read by
+  // http-backend as the request's: an inherited CONTENT_LENGTH hangs a chunked push.
+  process.env.CONTENT_LENGTH = '100';
+  process.env.CONTENT_TYPE = 'text/plain';
+  process.env.HTTP_CONTENT_ENCODING = 'gzip';
+  process.env.REMOTE_USER = 'someone-else';
+  process.env.SOME_SECRET = 'x';
   try {
     const env = backendEnv({
       root: '/srv/repos',
@@ -464,6 +474,19 @@ test('the forced config: push is the flag\'s alone, and never the request\'s', (
       remoteUser: 'owner@example.com',
     });
     assert.equal(env.GIT_DIR, undefined, 'an inherited GIT_DIR is dropped');
+    for (const name of ['CONTENT_LENGTH', 'CONTENT_TYPE', 'HTTP_CONTENT_ENCODING', 'SOME_SECRET']) {
+      assert.equal(env[name], undefined, `an inherited ${name} is dropped`);
+    }
+    assert.equal(env.REMOTE_USER, 'owner@example.com', 'REMOTE_USER is the peer gate\'s, never inherited');
+    assert.equal(env.PATH, process.env.PATH, 'PATH passes, so git finds its helpers');
+    // Windows spells it `Path`; there the allowlist ignores case. Elsewhere it does not.
+    const route = { repo: 'notes', service: 'git-upload-pack', phase: 'rpc' };
+    const req = { root: '/srv/repos', route, method: 'POST', allowPush: false, remoteAddress: '', remoteUser: '' };
+    const win = backendEnv(req, { Path: 'C:\\Windows', SystemRoot: 'C:\\Windows', CONTENT_LENGTH: '1' }, 'win32');
+    assert.equal(win.Path, 'C:\\Windows');
+    assert.equal(win.SystemRoot, 'C:\\Windows');
+    assert.equal(win.CONTENT_LENGTH, undefined);
+    assert.equal(backendEnv(req, { Path: '/x' }, 'linux').Path, undefined);
     const count = Number(env.GIT_CONFIG_COUNT);
     const forced = {};
     for (let i = 0; i < count; i++) forced[env[`GIT_CONFIG_KEY_${i}`]] = env[`GIT_CONFIG_VALUE_${i}`];
@@ -475,6 +498,7 @@ test('the forced config: push is the flag\'s alone, and never the request\'s', (
     delete process.env.GIT_CONFIG_KEY_0;
     delete process.env.GIT_CONFIG_VALUE_0;
     delete process.env.GIT_DIR;
+    for (const name of ['CONTENT_LENGTH', 'CONTENT_TYPE', 'HTTP_CONTENT_ENCODING', 'REMOTE_USER', 'SOME_SECRET']) delete process.env[name];
   }
 });
 
@@ -546,6 +570,161 @@ test('an rpc with the wrong media type, or an unknown content encoding, never re
     await refusedHere({ 'Content-Type': 'application/x-git-receive-pack-request' }, 'content-type');
     await refusedHere({ 'Content-Type': 'application/x-git-upload-pack-request', 'Content-Encoding': 'br' }, 'content-encoding');
   } finally {
+    await s.handle.close();
+  }
+});
+
+// --- bodies a real client sends: chunked, gzipped, and stalled ---------------
+
+test('a push larger than git\'s postBuffer goes up chunked and lands', async () => {
+  const { root, bare, work } = makeRoot();
+  const s = await serve(root, { allowPush: true });
+  try {
+    // 3 MiB that does not compress: over the client's 1 MiB postBuffer, so git
+    // sends the pack with Transfer-Encoding: chunked and no Content-Length.
+    writeFileSync(join(work, 'big.bin'), randomBytes(3 * 1024 * 1024));
+    git(work, ['add', 'big.bin']);
+    git(work, ['commit', '-q', '-m', 'big']);
+    const pushed = git(work, ['rev-parse', 'HEAD']);
+    // The server's own environment carries a stray CGI variable: the child
+    // must not take it for the request's (before the fix, this push hung).
+    process.env.CONTENT_LENGTH = '100';
+    let res;
+    try {
+      res = await tryGit(work, [...s.client, 'push', s.url('notes'), 'main:main'], { GIT_TRACE_CURL: '1', GIT_TRACE_CURL_NO_DATA: '1', CONTENT_LENGTH: '' });
+    } finally {
+      delete process.env.CONTENT_LENGTH;
+    }
+    assert.equal(res.code, 0, res.out.slice(-2000));
+    assert.match(res.out, /Transfer-Encoding: chunked/i, 'the client sent the pack chunked');
+    assert.equal(git(bare, ['rev-parse', 'refs/heads/main']), pushed);
+    assert.equal(git(bare, ['cat-file', '-s', `${pushed}:big.bin`]), String(3 * 1024 * 1024));
+  } finally {
+    await s.handle.close();
+  }
+});
+
+test('a fetch with many haves goes up gzipped and is answered', async () => {
+  const { dir, root, bare, work } = makeRoot();
+  const s = await serve(root);
+  try {
+    const clone = join(dir, 'clone');
+    const cloned = await tryGit(dir, [...s.client, 'clone', '-q', s.url('notes'), clone]);
+    assert.equal(cloned.code, 0, cloned.out);
+    // Local commits the server has never seen: each is a `have` line. git
+    // gzips a request body over 1 KiB; 60 haves stayed under it on git 2.56,
+    // 300 do not. Made in one fast-import rather than 300 commits.
+    const tip = git(clone, ['rev-parse', 'HEAD']);
+    // Dated after the clone's tip: git walks haves newest first, and the tip
+    // (which the server has) would otherwise end the negotiation at once.
+    const now = Math.floor(Date.now() / 1000) + 3600;
+    let stream = '';
+    for (let i = 0; i < 300; i++) {
+      const msg = `local ${i}\n`;
+      stream += `commit refs/heads/main\ncommitter Test <test@example.com> ${now + i} +0000\ndata ${msg.length}\n${msg}`;
+      if (i === 0) stream += `from ${tip}\n`;
+      stream += '\n';
+    }
+    execFileSync('git', ['-C', clone, 'fast-import', '--quiet'], { input: stream });
+    git(clone, ['reset', '-q', '--hard', 'main']);
+    // And a commit on the server the clone does not have.
+    writeFileSync(join(work, 'a.txt'), 'three\n');
+    git(work, ['commit', '-q', '-am', 'three']);
+    git(work, ['push', '-q', bare, 'main:main']);
+    const wanted = git(bare, ['rev-parse', 'refs/heads/main']);
+    const res = await tryGit(clone, [...s.client, 'fetch', s.url('notes'), 'main'], { GIT_TRACE_CURL: '1', GIT_TRACE_CURL_NO_DATA: '1' });
+    assert.equal(res.code, 0, res.out.slice(-2000));
+    assert.match(res.out, /Content-Encoding: gzip/i, 'the client sent its request gzipped');
+    assert.equal(git(clone, ['rev-parse', 'FETCH_HEAD']), wanted);
+  } finally {
+    await s.handle.close();
+  }
+});
+
+test('the git routes have an idle bound, not a total one: a stalled upload is cut and its child killed', async () => {
+  const { root } = makeRoot();
+  const s = await serve(root, { allowPush: true, gitIdleTimeoutMs: 300 });
+  try {
+    // Node's whole-request timeout would cut a long push; it is off on a tailnet.
+    assert.equal(s.handle.server.requestTimeout, 0);
+    // `git http-backend` sends its header block before receive-pack reads a
+    // byte, so the stall is past the status line: the connection is cut.
+    const started = Date.now();
+    const outcome = await new Promise((resolvePromise) => {
+      const req = http.request({
+        host: '127.0.0.1',
+        port: s.handle.port,
+        path: '/notes.git/git-receive-pack',
+        method: 'POST',
+        headers: { Host: `${HOST}:${s.handle.port}`, 'Content-Type': 'application/x-git-receive-pack-request', 'Content-Length': '100000' },
+      }, (res) => {
+        res.resume();
+        res.on('end', () => resolvePromise('ended'));
+        res.on('error', () => resolvePromise('cut'));
+      });
+      req.on('error', () => resolvePromise('cut'));
+      req.write('0000'); // and then nothing more
+    });
+    assert.equal(outcome, 'cut');
+    assert.ok(Date.now() - started < 5000, 'cut by the idle bound, not a later timeout');
+    assert.ok(s.logs.some((l) => l === 'git-serve: cut (git-idle) POST /notes.git'), s.logs.join('\n'));
+  } finally {
+    await s.handle.close();
+  }
+});
+
+test('the child\'s stderr reaches the server log, never the client', async () => {
+  const { root } = makeRoot();
+  const s = await serve(root);
+  try {
+    const res = await s.raw('/notes.git/git-upload-pack', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-git-upload-pack-request' },
+      body: 'this is not a pkt-line stream',
+    });
+    // The line is written when the child exits, which can follow the end of
+    // the response the client read.
+    const logged = () => s.logs.some((l) => l.startsWith('git-serve: git http-backend (notes): '));
+    for (let i = 0; i < 100 && !logged(); i++) await new Promise((r) => setTimeout(r, 20));
+    assert.ok(logged(), s.logs.join('\n'));
+    assert.doesNotMatch(res.body.toString('latin1'), /fatal:/);
+  } finally {
+    await s.handle.close();
+  }
+});
+
+test('a refused request\'s unread body cannot hold the connection open: it is closed after the answer', async () => {
+  const { root } = makeRoot();
+  const unknown = JSON.parse(readFileSync(join(FIXTURES, 'unknown.json'), 'utf8'));
+  const s = await serve(root, { allowPush: true, whois: async () => parseWhois(unknown.exitCode, unknown.stdout, unknown.stderr) });
+  let trickle;
+  try {
+    const started = Date.now();
+    const outcome = await new Promise((resolvePromise) => {
+      let status;
+      let connection;
+      const req = http.request({
+        host: '127.0.0.1',
+        port: s.handle.port,
+        path: '/notes.git/git-receive-pack',
+        method: 'POST',
+        headers: { Host: `${HOST}:${s.handle.port}`, 'Content-Type': 'application/x-git-receive-pack-request', 'Content-Length': '1000000000' },
+      }, (res) => {
+        status = res.statusCode;
+        connection = res.headers.connection;
+        res.resume();
+      });
+      req.on('error', () => {});
+      req.on('socket', (socket) => socket.on('close', () => resolvePromise({ status, connection, closedAfter: Date.now() - started })));
+      // One byte every 100 ms, forever: only the server can end this.
+      trickle = setInterval(() => req.write('0'), 100);
+    });
+    assert.equal(outcome.status, 403, 'the refusal is read before the connection closes');
+    assert.equal(outcome.connection, 'close', 'no client reuses the connection');
+    assert.ok(outcome.closedAfter < 10000, `closed after ${outcome.closedAfter} ms`);
+    assert.ok(s.logs.some((l) => l.includes('(unknown-peer)')), s.logs.join('\n'));
+  } finally {
+    clearInterval(trickle);
     await s.handle.close();
   }
 });

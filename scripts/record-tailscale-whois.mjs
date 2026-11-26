@@ -18,9 +18,11 @@
 // Sanitizing keeps structure, key names, value types and array lengths, and
 // every value that is not an identifier. Identifiers (tailnet name, logins,
 // node keys, addresses, ids) become fixed placeholders, the same placeholder
-// for the same role every time, so the relations a peer gate reads survive: a
-// same-user peer keeps the serving node's user id, another user's device gets a
-// different one, and every node id differs. The script refuses to write a file
+// for the same role every time. The placeholders are written per role, so the
+// relations a peer gate reads (a same-user peer has the serving node's user id,
+// another user's device a different one, Node.User equals UserProfile.ID, the
+// node's own address is Self) are checked on the RAW answer first, by
+// checkRelations, and a recording that breaks its role's relation is refused. The script refuses to write a file
 // that still holds an address-like or login-like string it did not place.
 import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdirSync, writeFileSync } from 'node:fs';
@@ -45,6 +47,35 @@ const NODES = {
 const tailscale = (args) => {
   const r = spawnSync('tailscale', args, { encoding: 'utf8' });
   return { code: r.status ?? -1, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
+};
+
+/**
+ * The relations a peer gate reads, checked on the RAW answer before any value
+ * is replaced: the placeholders are written per role, so a recording whose raw
+ * fields broke the role's relation would otherwise come out looking right.
+ * `self` is `tailscale status --json`'s Self.
+ */
+export const checkRelations = (raw, role, self) => {
+  const d = JSON.parse(raw);
+  const n = d.Node;
+  const u = d.UserProfile;
+  const fail = (what) => {
+    throw new Error(`refusing to record ${role}: ${what}`);
+  };
+  const tags = Array.isArray(n.Tags) ? n.Tags : [];
+  if (role === 'tagged') {
+    if (tags.length === 0) fail('the node has no Node.Tags');
+    return;
+  }
+  if (tags.length !== 0) fail('the node is tagged');
+  if (n.User !== u.ID) fail('Node.User differs from UserProfile.ID');
+  if (role === 'other-user') {
+    if (u.ID === self.UserID) fail("UserProfile.ID is the serving node's own user");
+    return;
+  }
+  if (u.ID !== self.UserID) fail("UserProfile.ID is not the serving node's own user");
+  if (role === 'self' && n.StableID !== self.ID) fail('Node.StableID is not Self.ID');
+  if (role === 'same-user' && n.StableID === self.ID) fail('the address is the serving node itself');
 };
 
 export const sanitizeWhois = (raw, role) => {
@@ -123,12 +154,22 @@ const whoisRaw = (address) => {
   return r.stdout;
 };
 
+const statusSelf = () =>
+  JSON.parse(execFileSync('tailscale', ['status', '--json'], { encoding: 'utf8' })).Self;
+
+/** Records one role: the raw relations are checked first, then sanitized. */
+const recordRole = (role, address, self) => {
+  const raw = whoisRaw(address);
+  checkRelations(raw, role, self);
+  write(`${role}.json`, sanitizeWhois(raw, role));
+};
+
 const record = (peerAddress) => {
   const status = JSON.parse(execFileSync('tailscale', ['status', '--json'], { encoding: 'utf8' }));
   const self = status.Self;
   const selfAddress = self.TailscaleIPs.find((ip) => ip.startsWith('100.'));
-  write('same-user.json', sanitizeWhois(whoisRaw(peerAddress), 'same-user'));
-  write('self.json', sanitizeWhois(whoisRaw(selfAddress), 'self'));
+  recordRole('same-user', peerAddress, self);
+  recordRole('self', selfAddress, self);
 
   // An address the daemon does not know. The CLI prints no JSON for it, so the
   // fixture records what it did print.
@@ -191,7 +232,7 @@ const [command, a, b] = process.argv.slice(2);
 if (command === 'record' && a) {
   record(a);
 } else if (command === 'sanitize' && a && b) {
-  write(`${a}.json`, sanitizeWhois(whoisRaw(b), a));
+  recordRole(a, b, statusSelf());
 } else if (command !== undefined) {
   console.error('Usage: record-tailscale-whois.mjs record <same-user peer address>');
   console.error('       record-tailscale-whois.mjs sanitize <other-user|tagged|same-user|self> <address>');
