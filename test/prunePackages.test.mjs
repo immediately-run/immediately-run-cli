@@ -328,12 +328,12 @@ const zipOpts = (root, extra = {}) => ({
   ...extra,
 });
 
-const bundledFiles = (zipPath, name) =>
-  decodeMsgPack(
-    execFileSync('unzip', ['-p', zipPath, `${PACKAGES_DIR}/${bundledPackageFilename(name, '1.0.0')}.msgpack`], {
-      maxBuffer: 64 * 1024 * 1024,
-    }),
-  ).f;
+// A bundled package record can be far past execFileSync's 1 MiB default (the platform core-js is).
+const ZIP_ENTRY_MAX_BUFFER = 256 * 1024 * 1024;
+const readZipEntry = (zipPath, entry) => execFileSync('unzip', ['-p', zipPath, entry], { maxBuffer: ZIP_ENTRY_MAX_BUFFER });
+const bundledEntry = (name, version) => `${PACKAGES_DIR}/${bundledPackageFilename(name, version)}.msgpack`;
+
+const bundledFiles = (zipPath, name) => decodeMsgPack(readZipEntry(zipPath, bundledEntry(name, '1.0.0'))).f;
 
 const APP = { 'index.tsx': 'import { createRoot } from "dom/client";\nexport const root = createRoot;\n' };
 
@@ -351,8 +351,7 @@ test('cache-zip prunes bundled packages by the app import list, and reports the 
     const whole = await buildCacheZip(zipOpts(root, { prunePackages: false, out: join(root, 'whole.zip') }));
     for (const name of ['core-js', 'react-refresh', 'react-error-boundary']) {
       const version = RESOLVED.find((r) => r.n === name).v;
-      const entry = `${PACKAGES_DIR}/${bundledPackageFilename(name, version)}.msgpack`;
-      const read = (zip) => execFileSync('unzip', ['-p', zip, entry], { maxBuffer: 256 * 1024 * 1024 });
+      const read = (zip) => readZipEntry(zip, bundledEntry(name, version));
       assert.ok(read(result.outputPath).equals(read(whole.outputPath)), `${name} must ship verbatim`);
     }
   } finally {
@@ -422,13 +421,7 @@ test('pruning stands down, by name, when the app import list is incomplete', asy
 test('two builds of the same commit bundle byte-identical pruned packages', async () => {
   const root = makeRepo(APP);
   try {
-    const read = (zip) =>
-      RESOLVED.map(({ n, v }) =>
-        execFileSync('unzip', ['-p', zip, `${PACKAGES_DIR}/${bundledPackageFilename(n, v)}.msgpack`], {
-          // core-js 3.51.0's record is past execFileSync's 1 MiB default.
-          maxBuffer: 256 * 1024 * 1024,
-        }).toString('base64'),
-      );
+    const read = (zip) => RESOLVED.map(({ n, v }) => readZipEntry(zip, bundledEntry(n, v)).toString('base64'));
     const first = await buildCacheZip(zipOpts(root, { out: join(root, 'a.zip') }));
     const second = await buildCacheZip(zipOpts(root, { out: join(root, 'b.zip') }));
     assert.deepEqual(read(first.outputPath), read(second.outputPath));
