@@ -12,6 +12,7 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { encode as encodeMsgPack } from '@msgpack/msgpack';
+import { PLATFORM_CORE_JS_VERSION } from '@immediately-run/transpiler';
 
 import { bareDependencyName, closureFindings, closureFailureMessage } from '../dist/closureConsistency.js';
 import { encodePackageKey } from '../dist/lockset.js';
@@ -194,7 +195,7 @@ test('undecodable or non-module bytes are an import-source finding naming the pa
 // / react-error-boundary / react-refresh) so the lockset embeds.
 const RESOLVED = [
   { n: 'react', v: '18.3.1', d: 0 },
-  { n: 'core-js', v: '3.22.7', d: 0 },
+  { n: 'core-js', v: PLATFORM_CORE_JS_VERSION, d: 0 },
   { n: 'react-error-boundary', v: '6.1.0', d: 0 },
   { n: 'react-refresh', v: '0.11.0', d: 0 },
 ];
@@ -380,7 +381,7 @@ test('end-to-end warn: an m-only miss resolves the build and warns, naming the p
 // (`dist/webapi/jwt/encrypt.js`, 8 of 80 files on the live CDN).
 const BATON_PACKAGE_JSON = { dependencies: { jose: '^6.2.12' } };
 const BATON_TREE = [
-  { n: 'core-js', v: '3.22.7', d: 0 },
+  { n: 'core-js', v: PLATFORM_CORE_JS_VERSION, d: 0 },
   { n: 'jose', v: '6.2.14', d: 0 },
   { n: 'react-error-boundary', v: '6.1.0', d: 0 },
   { n: 'react-refresh', v: '0.11.0', d: 0 },

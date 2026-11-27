@@ -8,6 +8,7 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { encode as encodeMsgPack, decode as decodeMsgPack } from '@msgpack/msgpack';
+import { PLATFORM_CORE_JS_VERSION } from '@immediately-run/transpiler';
 
 import {
   LOCKSET_CDN_VERSION,
@@ -22,7 +23,7 @@ import { buildCacheZip } from '../dist/commands/cacheZip.js';
 // passes and the lockset embeds; @scope/pkg is the scoped-name `/`-escape case.
 const RESOLVED = [
   { n: 'react', v: '18.3.1', d: 0 },
-  { n: 'core-js', v: '3.22.7', d: 0 },
+  { n: 'core-js', v: PLATFORM_CORE_JS_VERSION, d: 0 },
   { n: 'react-error-boundary', v: '6.1.0', d: 0 },
   { n: 'react-refresh', v: '0.11.0', d: 0 },
   { n: '@scope/pkg', v: '1.0.0', d: 1 }, // scoped name: exercises the `/` escape

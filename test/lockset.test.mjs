@@ -8,6 +8,7 @@ import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { encode as encodeMsgPack } from '@msgpack/msgpack';
+import { PLATFORM_CORE_JS_VERSION } from '@immediately-run/transpiler';
 
 import {
   LOCKSET_CDN_VERSION,
@@ -30,7 +31,7 @@ test('computeInputDepMap augments react deps, filters build deps, sorts keys', (
     '@babel/preset-env': '^7.0.0', // build dep (regex): filtered
   });
   assert.deepEqual(result, {
-    'core-js': '3.22.7',
+    'core-js': PLATFORM_CORE_JS_VERSION,
     react: '^18.2.0',
     'react-error-boundary': '^6.1.0',
     'react-refresh': '^0.11.0',
@@ -72,7 +73,7 @@ test('encodeDepTreePayload matches the runtime payload format', () => {
 // check (assertLocksetResolves) passes for the `{ react }` inputs below.
 const RESOLVED = [
   { n: 'react', v: '18.3.1', d: 0 },
-  { n: 'core-js', v: '3.22.7', d: 0 },
+  { n: 'core-js', v: PLATFORM_CORE_JS_VERSION, d: 0 },
   { n: 'react-error-boundary', v: '6.1.0', d: 0 },
   { n: 'react-refresh', v: '0.11.0', d: 0 },
 ];
