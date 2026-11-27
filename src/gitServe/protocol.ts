@@ -13,8 +13,21 @@ export const GIT_SERVE_PROTOCOL = 1;
 /** The default port. It differs from `dev`'s (7700) so both can run at once. */
 export const DEFAULT_GIT_SERVE_PORT = 7701;
 
+/** What a git call may add to its child: bytes for stdin, and environment
+ *  variables set AFTER the inherited `GIT_*` ones were dropped. */
+export interface RunGitOptions {
+  input?: Buffer;
+  env?: Readonly<Record<string, string>>;
+  /** How long the call may take before git is killed (tests shorten it). */
+  timeoutMs?: number;
+}
+
 /** Runs git against one repository: `git --git-dir <repoDir> <args…>`. */
-export type RunGit = (repoDir: string, args: readonly string[]) => Promise<GitResult>;
+export type RunGit = (
+  repoDir: string,
+  args: readonly string[],
+  options?: RunGitOptions,
+) => Promise<GitResult>;
 
 export interface GitResult {
   /** The exit code; a spawn failure or a signal is reported as -1. */

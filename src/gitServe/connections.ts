@@ -17,6 +17,7 @@ import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import {
   closeSync,
   existsSync,
+  linkSync,
   openSync,
   readFileSync,
   renameSync,
@@ -146,32 +147,35 @@ const staleAt = (path: string): boolean => {
   }
 };
 
-/**
- * Removes a stale lock. Only the holder of `<lock>.takeover` may, and it judges
- * the lock again while holding it. While the stale lock exists no one can create
- * a fresh one, and its dead holder cannot remove it, so what is judged stale is
- * what is removed. Returns true when this waiter held the takeover, whether or
- * not it removed anything.
- *
- * Residual, accepted: a takeover lock whose holder DIED is removed by judging
- * and then removing, with no guard, so another waiter's live takeover lock
- * could be removed in between. That needs a process killed inside the
- * takeover section (a few microseconds), and then a second takeover racing
- * through the same gap; the result would be two holders of the state lock.
- */
+/** Pin the candidate inode while checking staleness so a competing takeover
+ * cannot remove a replacement lock on the strength of the old lock's age. */
 const takeOver = (lock: string): boolean => {
-  const takeover = `${lock}.takeover`;
-  const mine = createLock(takeover);
-  if (mine === null) {
-    if (staleAt(takeover)) rmSync(takeover, { force: true });
+  const guard = `${lock}.takeover`;
+  try {
+    linkSync(lock, guard);
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') return true;
+    if (code !== 'EEXIST') throw e;
+    try {
+      if (Date.now() - statSync(guard).ctimeMs > LOCK_STALE_MS) rmSync(guard);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e;
+    }
     return false;
   }
   try {
-    if (staleAt(lock)) rmSync(lock, { force: true });
+    const pinned = statSync(guard, { bigint: true });
+    const content = readLock(guard);
+    if (content === null || !isStale(content, Number(pinned.mtimeMs))) return false;
+    if (statSync(lock, { bigint: true }).ino === pinned.ino) rmSync(lock);
+    return true;
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e;
+    return true;
   } finally {
-    unlock(takeover, mine);
+    rmSync(guard, { force: true });
   }
-  return true;
 };
 
 /** One attempt at the lock: the holder's line when taken, else whether to wait. */

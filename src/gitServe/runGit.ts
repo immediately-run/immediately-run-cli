@@ -22,6 +22,12 @@ import type { GitResult, RunGit } from './protocol.js';
 /** Room for the long listing of a very large tree; past this `/tree` answers 500. */
 export const MAX_GIT_OUTPUT_BYTES = 512 * 1024 * 1024;
 
+/** How long one plumbing call may run. A git that hangs (a dead NFS mount, a
+ *  held lock) is killed and reported as any other failure, so its request ends.
+ *  It does not apply to `git http-backend` or to a streamed blob: a clone or a
+ *  push of a large repository is not bounded by time. */
+export const GIT_TIMEOUT_MS = 60_000;
+
 export const gitEnv = (base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv => {
   const env: NodeJS.ProcessEnv = {};
   for (const [k, v] of Object.entries(base)) {
@@ -39,12 +45,18 @@ const gitArgs = (repoDir: string, args: readonly string[]): string[] => [
   ...args,
 ];
 
-export const runGit: RunGit = (repoDir, args) =>
+export const runGit: RunGit = (repoDir, args, options = {}) =>
   new Promise<GitResult>((resolve) => {
-    execFile(
+    const child = execFile(
       'git',
       gitArgs(repoDir, args),
-      { encoding: 'buffer', maxBuffer: MAX_GIT_OUTPUT_BYTES, env: gitEnv() },
+      {
+        encoding: 'buffer',
+        maxBuffer: MAX_GIT_OUTPUT_BYTES,
+        timeout: options.timeoutMs ?? GIT_TIMEOUT_MS,
+        // The caller's variables are set after the inherited GIT_* were dropped.
+        env: { ...gitEnv(), ...(options.env ?? {}) },
+      },
       (error, stdout, stderr) => {
         const code =
           error === null
@@ -55,6 +67,10 @@ export const runGit: RunGit = (repoDir, args) =>
         resolve({ code, stdout, stderr: stderr.toString('utf8') });
       },
     );
+    // A git that exits before reading its input closes the pipe; the exit code
+    // above already reports that failure.
+    child.stdin?.on('error', () => {});
+    child.stdin?.end(options.input);
   });
 
 /** Starts git with its stdout left as a stream, for a body too large to buffer. */

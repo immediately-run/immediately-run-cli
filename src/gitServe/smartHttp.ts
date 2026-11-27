@@ -19,6 +19,9 @@
  *    a ref deletion are forced off the same way (D-GS-10), and every ref
  *    outside `refs/heads/` is hidden from receive-pack, so a push can neither
  *    create, move nor delete a tag.
+ *  - Every pushed object is checked (`receive.fsckObjects`), forced the same
+ *    way. Without it a client can push a tree no checkout could make: one with
+ *    a `..` or a `.git` entry.
  *
  * A browser cannot use these routes: a request that carries `Origin` or any
  * `Sec-Fetch-*` header is refused before anything else, and no CORS header is
@@ -91,6 +94,11 @@ export const forcedConfig = (allowPush: boolean): Array<[string, string]> => [
   // receive-pack makes it refuse any update outside them (R-GS-14, R-GS-19).
   ['receive.hideRefs', 'refs/'],
   ['receive.hideRefs', '!refs/heads/'],
+  // receive-pack then checks every pushed object and refuses the push when one
+  // fails: a tree entry named `..`, `.` or `.git` (in any case or HFS/NTFS
+  // spelling), a malformed commit. A stock client never makes such a tree, but
+  // `git mktree` does, and nothing else on this path would stop it.
+  ['receive.fsckObjects', 'true'],
   ...(allowPush
     ? ([
         ['receive.denyNonFastForwards', 'true'],

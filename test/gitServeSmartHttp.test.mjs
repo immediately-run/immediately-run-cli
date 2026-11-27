@@ -374,6 +374,62 @@ test('G-GS-13: with --allow-push a fast-forward lands; a forced rewrite and a de
   }
 });
 
+test('G-GS-13: a pushed tree that holds `..` or `.git` is refused and its branch is not created; an ordinary push lands', async () => {
+  const { root, bare, work } = makeRoot();
+  // Trees no checkout could make: `git mktree` checks no entry name.
+  const blob = git(work, ['rev-parse', 'HEAD:a.txt']);
+  const inner = git(work, ['mktree'], { input: `100644 blob ${blob}\tconfig\n` });
+  const hostile = {
+    dotdot: `100644 blob ${blob}\t..\n`,
+    dotgit: `040000 tree ${inner}\t.git\n`,
+    'dotgit-case': `040000 tree ${inner}\t.GIT\n`,
+    nested: `040000 tree ${git(work, ['mktree'], { input: `040000 tree ${inner}\t.git\n` })}\tdir\n`,
+  };
+  for (const [name, entries] of Object.entries(hostile)) {
+    const tree = git(work, ['mktree'], { input: entries });
+    git(work, ['update-ref', `refs/heads/${name}`, git(work, ['commit-tree', tree, '-p', 'HEAD', '-m', name])]);
+  }
+  const s = await serve(root, { allowPush: true });
+  try {
+    const refsBefore = git(bare, ['for-each-ref', '--format=%(refname) %(objectname)']);
+    for (const name of Object.keys(hostile)) {
+      const res = await tryGit(work, [...s.client, 'push', s.url('notes'), `${name}:${name}`]);
+      assert.notEqual(res.code, 0, `${name}\n${res.out}`);
+      assert.equal((await tryGit(bare, ['rev-parse', '--verify', '-q', `refs/heads/${name}`])).code, 1, `${name} was created`);
+      // Nor onto an existing branch, as a fast-forward of it.
+      const onto = await tryGit(work, [...s.client, 'push', s.url('notes'), `${name}:main`]);
+      assert.notEqual(onto.code, 0, `${name} onto main\n${onto.out}`);
+      assert.equal(git(bare, ['for-each-ref', '--format=%(refname) %(objectname)']), refsBefore, name);
+    }
+    // An ordinary commit still lands, on an existing branch and as a new one.
+    writeFileSync(join(work, 'a.txt'), 'ordinary\n');
+    git(work, ['commit', '-q', '-am', 'ordinary']);
+    const pushed = git(work, ['rev-parse', 'HEAD']);
+    const ok = await tryGit(work, [...s.client, 'push', s.url('notes'), 'main:main', 'main:fresh']);
+    assert.equal(ok.code, 0, ok.out);
+    assert.equal(git(bare, ['rev-parse', 'refs/heads/main']), pushed);
+    assert.equal(git(bare, ['rev-parse', 'refs/heads/fresh']), pushed);
+    git(bare, ['fsck', '--strict']);
+  } finally {
+    await s.handle.close();
+  }
+});
+
+test('a push upload is not cut by a request timeout: the tailnet server has none, and keeps its header timeout', async () => {
+  const { root } = makeRoot();
+  const s = await serve(root, { allowPush: true });
+  const loopback = await startGitServe({ root, origin: ORIGIN, port: 0, token: 'session-token-for-tests', log: () => {} });
+  try {
+    assert.equal(s.handle.server.requestTimeout, 0, 'no limit on how long a request body may take');
+    assert.equal(s.handle.server.headersTimeout, 60_000, 'a connection that never sends its headers is still dropped');
+    // Loopback serves no git route, so it keeps Node's limit.
+    assert.equal(loopback.server.requestTimeout, 300_000);
+  } finally {
+    await s.handle.close();
+    await loopback.close();
+  }
+});
+
 test('G-GS-13: nothing is created by pushing to a name that does not exist', async () => {
   const { root, work } = makeRoot();
   const s = await serve(root, { allowPush: true });
@@ -393,6 +449,8 @@ test('the forced config: push is the flag\'s alone, and never the request\'s', (
   assert.equal(on['http.receivepack'], 'true');
   assert.equal(on['receive.denyNonFastForwards'], 'true');
   assert.equal(on['receive.denyDeletes'], 'true');
+  // Every pushed object is checked, whatever the repository's config says.
+  assert.equal(on['receive.fsckObjects'], 'true');
   assert.deepEqual(forcedConfig(true).filter(([k]) => k === 'receive.hideRefs').map(([, v]) => v), ['refs/', '!refs/heads/']);
   // The child's environment carries exactly these, and nothing inherited.
   process.env.GIT_CONFIG_COUNT = '1';

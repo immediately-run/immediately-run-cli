@@ -34,6 +34,7 @@ const BOOLEAN_FLAGS = new Set([
   'json',
   'fresh',
   'allow-push',
+  'allow-commit',
 ]);
 
 export const parseArgs = (argv: string[]): ParsedArgs => {

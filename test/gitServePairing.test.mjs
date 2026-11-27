@@ -58,7 +58,7 @@ before(() => {
 after(() => rmSync(tmp, { recursive: true, force: true }));
 
 /** Start the tailnet configuration on loopback. `clock.t` is the server's time. */
-const start = async (root, clock = { t: Date.now() }) => {
+const start = async (root, clock = { t: Date.now() }, whois = async () => sameUser) => {
   const logs = [];
   const handle = await startGitServe({
     root,
@@ -69,7 +69,7 @@ const start = async (root, clock = { t: Date.now() }) => {
     tailnet: {
       host: HOST,
       address: '127.0.0.1',
-      peerGate: { self: identity.self, allowUserIds: new Set(), whois: async () => sameUser },
+      peerGate: { self: identity.self, allowUserIds: new Set(), whois },
     },
   });
   const request = (path, { method = 'GET', bearer, headers = {}, localAddress } = {}) =>
@@ -190,6 +190,35 @@ test('G-GS-11: four failures leave the code alive; the count is kept across them
     const res = await s.pair(code);
     assert.equal(res.status, 200);
     assert.equal(res.body.scope, 'write', 'the scope is the one `pair` was given');
+  } finally {
+    await s.handle.close();
+  }
+});
+
+test('G-GS-11: a request the peer gate refuses never reaches the code — no failure is counted against it', async () => {
+  const root = freshRoot('gate-first');
+  const failures = () => JSON.parse(readFileSync(join(root, '.git-serve', 'pairing.json'), 'utf8')).failures;
+  // A peer the daemon does not know.
+  const refused = await start(root, undefined, async () => ({ kind: 'unknown' }));
+  let code;
+  try {
+    ({ code } = createPairingCode(root, 'read', refused.clock.t));
+    // More wrong guesses than the code survives, and the right code too.
+    for (const presented of ['ZZZZ-ZZZZ', 'YYYY-YYYY', 'XXXX-XXXX', 'WWWW-WWWW', 'VVVV-VVVV', 'TTTT-TTTT', code]) {
+      const res = await refused.pair(presented);
+      assert.equal(res.status, 403, presented === code ? 'the right code' : presented);
+      assert.equal(res.body.reason, 'unknown-peer');
+      assert.equal(res.body.token, undefined);
+    }
+    assert.equal(failures(), 0, 'the count is unchanged');
+    assert.equal(readConnections(root).length, 0);
+  } finally {
+    await refused.handle.close();
+  }
+  // The code is alive and unspent: an admitted peer exchanges it.
+  const s = await start(root, refused.clock);
+  try {
+    assert.equal((await s.pair(code)).status, 200);
   } finally {
     await s.handle.close();
   }
@@ -392,7 +421,17 @@ test('the state lock: a revocation and a pairing in two processes never undo eac
   assert.equal(existsSync(join(root, '.git-serve', '.lock')), false, 'the lock is released');
 });
 
-test('the state lock: a lock left by a dead process is taken over; a live one is waited for', () => {
+const CONNECTIONS_URL = new URL('../dist/gitServe/connections.js', import.meta.url).href;
+
+/** Runs `source` as a module in another node process; resolves with its stdout, parsed. */
+const inChild = (source, args) =>
+  new Promise((resolvePromise, reject) => {
+    execFile(process.execPath, ['--input-type=module', '-e', source, ...args], { encoding: 'utf8' }, (error, stdout, stderr) =>
+      error ? reject(new Error(`${error.message}\n${stderr}`)) : resolvePromise(JSON.parse(stdout)),
+    );
+  });
+
+test('the state lock: a lock left by a dead process is taken over', () => {
   const root = freshRoot('stale-lock');
   const lock = join(root, '.git-serve', '.lock');
   addConnection(root, 'read');
@@ -400,6 +439,79 @@ test('the state lock: a lock left by a dead process is taken over; a live one is
   utimesSync(lock, new Date(Date.now() - 60_000), new Date(Date.now() - 60_000));
   assert.equal(addConnection(root, 'read').record.scope, 'read');
   assert.equal(readConnections(root).length, 2);
+  assert.deepEqual(readdirSync(join(root, '.git-serve')).filter((n) => n.startsWith('.lock')), [], 'no lock and no takeover file is left');
+});
+
+test('the state lock: processes that meet at a dead process\'s lock are never inside together', async () => {
+  const root = freshRoot('stale-race');
+  const lock = join(root, '.git-serve', '.lock');
+  const signals = join(tmp, 'stale-race-signals');
+  mkdirSync(signals);
+  addConnection(root, 'read'); // makes the state directory
+  const CHILDREN = 4;
+  // Each child waits (spinning, so that all of them start within microseconds)
+  // for the round's signal, then takes the lock the way the commands do. Inside
+  // it, it creates one marker file exclusively: if the file is already there,
+  // another process is inside at the same time.
+  const child = `
+    import { closeSync, existsSync, openSync, rmSync, writeFileSync } from 'node:fs';
+    import { withStateLock } from ${JSON.stringify(CONNECTIONS_URL)};
+    const [root, signals, me] = process.argv.slice(1);
+    const inside = signals + '/inside';
+    const report = { rounds: 0, overlaps: 0, errors: [] };
+    for (let round = 0; ; round++) {
+      while (!existsSync(signals + '/go-' + round)) {
+        if (existsSync(signals + '/stop')) {
+          console.log(JSON.stringify(report));
+          process.exit(0);
+        }
+      }
+      try {
+        withStateLock(root, () => {
+          try {
+            closeSync(openSync(inside, 'wx'));
+          } catch {
+            report.overlaps++;
+            return;
+          }
+          const until = performance.now() + 1;
+          while (performance.now() < until);
+          rmSync(inside);
+        });
+      } catch (e) {
+        report.errors.push(String(e));
+      }
+      report.rounds++;
+      writeFileSync(signals + '/done-' + round + '-' + me, '');
+    }
+  `;
+  const children = Array.from({ length: CHILDREN }, (_, i) => inChild(child, [root, signals, String(i)]));
+  const long = new Date(Date.now() - 60_000);
+  const deadline = Date.now() + 5000;
+  let rounds = 0;
+  try {
+    for (; rounds < 400 && Date.now() < deadline; rounds++) {
+      // The lock of a process that died a minute ago; then everyone goes.
+      writeFileSync(lock, '');
+      utimesSync(lock, long, long);
+      writeFileSync(join(signals, `go-${rounds}`), '');
+      const finished = () => Array.from({ length: CHILDREN }, (_, i) => existsSync(join(signals, `done-${rounds}-${i}`))).every(Boolean);
+      while (!finished()) {
+        assert.ok(Date.now() < deadline + 20_000, `round ${rounds} did not finish`);
+        await new Promise((r) => setImmediate(r));
+      }
+    }
+  } finally {
+    writeFileSync(join(signals, 'stop'), '');
+  }
+  const reports = await Promise.all(children);
+  assert.ok(rounds >= 40, `only ${rounds} rounds ran`);
+  for (const [i, report] of reports.entries()) {
+    assert.deepEqual(report.errors, [], `child ${i}`);
+    assert.equal(report.rounds, rounds, `child ${i} took the lock in every round`);
+  }
+  assert.equal(reports.reduce((n, r) => n + r.overlaps, 0), 0, `two processes were inside together (in ${rounds} rounds)`);
+  assert.deepEqual(readdirSync(join(root, '.git-serve')).filter((n) => n.startsWith('.lock')), [], 'no lock and no takeover file is left');
 });
 
 // --- the commands ------------------------------------------------------------
@@ -411,6 +523,38 @@ const cli = (args) => {
     return { code: e.status, out: `${e.stdout}${e.stderr}` };
   }
 };
+
+test('the state lock: a live lock is waited for by the commands', async () => {
+  const root = freshRoot('live-lock');
+  const lock = join(root, '.git-serve', '.lock');
+  // Another process holds the lock for 600 ms and reports when it let go.
+  const holder = inChild(
+    `
+    import { withStateLock } from ${JSON.stringify(CONNECTIONS_URL)};
+    withStateLock(process.argv[1], () => {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 600);
+      console.log(JSON.stringify({ releasedAt: Date.now() }));
+    });
+  `,
+    [root],
+  );
+  const appeared = Date.now() + 10_000;
+  while (!existsSync(lock)) {
+    assert.ok(Date.now() < appeared, 'the holder never took the lock');
+    await new Promise((r) => setTimeout(r, 2));
+  }
+  // `git-serve pair` in a third process. No server is running in this test, so
+  // waiting for the command synchronously stops nothing.
+  const printed = cli(['git-serve', 'pair', root]);
+  const finishedAt = Date.now();
+  assert.equal(printed.code, 0, printed.out);
+  const { releasedAt } = await holder;
+  assert.ok(finishedAt >= releasedAt, `pair finished ${releasedAt - finishedAt} ms before the lock was released`);
+  // What it wrote is whole: the printed code is the live one.
+  const code = /Pairing code: (\S+)/.exec(printed.out)[1];
+  assert.equal(exchangePairingCode(root, code).ok, true);
+  assert.equal(existsSync(lock), false);
+});
 
 test('cli: `git-serve pair` prints a code the server accepts; `connections` lists and revokes', async () => {
   const root = freshRoot('cli');
